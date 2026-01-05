@@ -38,6 +38,7 @@ static mut STATIC_TCB_MASTER: Master = Master {
     offset: 0,
 };
 
+#[cfg_attr(target_os = "nto", expect(dead_code))]
 #[inline(never)]
 pub fn static_init(
     sp: &'static Stack,
@@ -133,7 +134,7 @@ pub fn static_init(
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "redox"))]
+#[cfg(any(target_os = "linux", target_os = "redox", target_os = "nto"))]
 pub unsafe fn init(
     sp: &'static Stack,
     #[cfg(target_os = "redox")] thr_fd: redox_rt::proc::FdGuardUpper,
@@ -190,7 +191,13 @@ pub unsafe fn init(
         );
     }
 
+    #[cfg(target_os = "nto")]
+    let tp = crate::platform::sys::own_thread_pointer(tp);
+
     if tp == 0 {
+        #[cfg(target_os = "nto")]
+        crate::platform::sys::static_init(sp);
+        #[cfg(not(target_os = "nto"))]
         static_init(
             sp,
             #[cfg(target_os = "redox")]

@@ -14,7 +14,7 @@ use crate::{
 
 pub use self::sys::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "nto"))]
 #[path = "linux.rs"]
 pub mod sys;
 
@@ -41,6 +41,10 @@ pub const MREMAP_MAYMOVE: c_int = 1;
 pub const MS_ASYNC: c_int = 0x0001;
 pub const MS_INVALIDATE: c_int = 0x0002;
 pub const MS_SYNC: c_int = 0x0004;
+/// QNX extension: makes the instruction cache coherent with memory over the
+/// range, after code has been written to it. Same value as QNX's own libc.
+#[cfg(target_os = "nto")]
+pub const MS_INVALIDATE_ICACHE: c_int = 0x0100_0000;
 
 pub const MCL_CURRENT: c_int = 1;
 pub const MCL_FUTURE: c_int = 2;
@@ -145,6 +149,9 @@ pub unsafe extern "C" fn munmap(addr: *mut c_void, len: size_t) -> c_int {
 
 #[cfg(target_os = "linux")]
 static SHM_PATH: &'static [u8] = b"/dev/shm/";
+
+#[cfg(target_os = "nto")]
+static SHM_PATH: &[u8] = b"/dev/shmem/";
 
 #[cfg(target_os = "redox")]
 static SHM_PATH: &'static [u8] = b"/scheme/shm/";

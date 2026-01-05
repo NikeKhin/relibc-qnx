@@ -1,0 +1,41 @@
+# Arm GNU aarch64-none-elf-gcc/g++ driver, with relibc as libc. GCC's link
+# modes, each with the start objects and libc it needs:
+#
+#   (default), -static  static executable (ET_EXEC, fixed address); libc.a,
+#                       and aarch64-qnx-static.ld so GNU ld emits PT_PHDR
+#   -static-pie         static position-independent executable, which
+#                       relocates itself (rcrt1.o); libc.a. With -rdynamic
+#                       it can dlopen
+#   -pie                dynamically linked PIE; libc.so, with relibc's
+#                       libc.so as interpreter at /usr/lib/ld-relibc.so.1
+#                       (another path: -Wl,-dynamic-linker,PATH)
+#   -shared             shared library or plugin; libc.so
+#   -p, -pg             profiled for gprof: gcrt1.o (grcrt1.o with
+#                       -static-pie) starts gprof, _mcleanup writes gmon.out
+#
+# Compile with -fPIC or -fPIE for -static-pie, -pie and -shared. GCC's
+# bare-metal toolchain has no crtbeginS.o; relibc's is used instead. The
+# sysroot's library directory is searched first, so that -lm, -lpthread,
+# -lsocket and the rest find relibc's empty archives, not newlib's.
+#
+#   export RELIBC_OUT=.../target/aarch64-unknown-nto-qnx710/release
+#   aarch64-none-elf-g++ -specs=thisfile ...
+#   aarch64-none-elf-g++ -fPIE -pie -specs=thisfile ...
+#
+# CodeLite libraries: empty (no c, no stdc++). -lc can still pick up newlib.
+
+*startfile:
+%{shared: %:getenv(RELIBC_OUT /crti.o) %:getenv(RELIBC_OUT /crtbeginS.o); static-pie: %{p|pg: %:getenv(RELIBC_OUT /grcrt1.o); : %:getenv(RELIBC_OUT /rcrt1.o)} %:getenv(RELIBC_OUT /crti.o) %:getenv(RELIBC_OUT /crtbeginS.o); pie: %{p|pg: %:getenv(RELIBC_OUT /gcrt1.o); : %:getenv(RELIBC_OUT /Scrt1.o)} %:getenv(RELIBC_OUT /crti.o) %:getenv(RELIBC_OUT /crtbeginS.o); : %{p|pg: %:getenv(RELIBC_OUT /gcrt1.o); : %:getenv(RELIBC_OUT /crt1.o)} crti%O%s crtbegin%O%s}
+
+*endfile:
+%{shared|static-pie|pie: crtend%O%s %:getenv(RELIBC_OUT /crtn.o); : crtend%O%s crtn%O%s}
+
+*libstdc++:
+-lsupc++
+
+*link_gcc_c_sequence:
+%{shared|pie: --start-group %G -lsupc++ %:getenv(RELIBC_OUT /libc.so) %G --end-group; : --start-group %G -lsupc++ %:getenv(RELIBC_OUT /libc.a) %G --end-group}
+
+%rename link old_link
+*link:
+-L %:getenv(RELIBC_OUT /sysroot/aarch64le/lib) %{static-pie: -static -pie --no-dynamic-linker -z text; pie: -pie -dynamic-linker /usr/lib/ld-relibc.so.1; shared: -shared; : %{!T: -T %:getenv(RELIBC_OUT /../../../targets/aarch64-qnx-static.ld)}} %{rdynamic:--export-dynamic} %(old_link)

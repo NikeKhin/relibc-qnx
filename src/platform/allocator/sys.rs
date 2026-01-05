@@ -64,7 +64,8 @@ unsafe impl Allocator for System {
     }
 
     fn can_release_part(&self, _flags: u32) -> bool {
-        true
+        // Neutrino has no mremap, and page rounding makes partial munmaps unsafe.
+        !cfg!(target_os = "nto")
     }
 
     fn allocates_zeros(&self) -> bool {

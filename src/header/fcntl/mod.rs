@@ -19,7 +19,7 @@ pub use self::sys::*;
 
 use super::errno::EINVAL;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "nto"))]
 #[path = "linux.rs"]
 pub mod sys;
 

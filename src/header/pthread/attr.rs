@@ -205,6 +205,14 @@ pub unsafe extern "C" fn pthread_getattr_np(
     }
     attr.stack = thread.stack_base as usize;
     attr.stacksize = thread.stack_size;
+    // relibc doesn't own the main thread's stack, so its `Pthread` has none;
+    // report the bounds the platform recorded at start-up instead.
+    #[cfg(target_os = "nto")]
+    if attr.stack == 0 {
+        let (base, size) = crate::platform::sys::main_thread_stack();
+        attr.stack = base as usize;
+        attr.stacksize = size;
+    }
     //TODO: more values?
     0
 }

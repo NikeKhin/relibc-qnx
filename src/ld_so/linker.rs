@@ -572,6 +572,46 @@ impl Linker {
         }
     }
 
+    /// The load address of every object currently loaded.
+    ///
+    /// Used by `dl_iterate_phdr`, which an unwinder calls to find the exception
+    /// tables covering a faulting address.
+    #[cfg(target_os = "nto")]
+    pub fn loaded_object_bases(&self) -> impl Iterator<Item = *const u8> + '_ {
+        self.objects.values().map(|obj| obj.base)
+    }
+
+    /// Makes the running program, which `me` describes, the root object, so
+    /// that a statically linked program can `dlopen`. The program is already
+    /// relocated and initialised, its TLS is the first module of every
+    /// thread's static block, and it contains libc, so a library's
+    /// `DT_NEEDED` of libc resolves to it.
+    #[cfg(target_os = "nto")]
+    pub fn adopt_static_program(&mut self) {
+        let (me, master) = DSO::from_raw(
+            self.me.base,
+            self.me.dyns,
+            self.me.phdrs,
+            self.next_object_id,
+            self.next_tls_module_id,
+            0,
+        );
+        self.tls_size = master.offset;
+        self.next_tls_module_id += 1;
+        self.next_object_id += 1;
+
+        let obj = Arc::new(me);
+        GLOBAL_SCOPE.write().add(&obj);
+        let mut scope = Scope::local();
+        scope.set_owner(Arc::downgrade(&obj));
+        obj.scope.call_once(|| scope);
+        // SAFETY: the program is running, so it is loaded and relocated.
+        unsafe { obj.mark_ready() };
+        self.name_to_object_id_map
+            .insert(String::from("libc.so"), obj.id);
+        self.register_object(obj);
+    }
+
     fn load_object(
         &mut self,
         path: &str,

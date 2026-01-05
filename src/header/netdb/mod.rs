@@ -36,7 +36,7 @@ use crate::{
     raw_cell::RawCell,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "nto"))]
 #[path = "linux.rs"]
 pub mod sys;
 

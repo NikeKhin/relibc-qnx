@@ -15,6 +15,7 @@
 #![feature(allocator_api)]
 #![feature(asm_const)]
 #![feature(c_variadic)]
+#![cfg_attr(target_os = "nto", feature(f128))]
 #![feature(core_intrinsics)]
 #![feature(f128)]
 #![feature(macro_derive)]

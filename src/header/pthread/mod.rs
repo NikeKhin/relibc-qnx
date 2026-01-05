@@ -236,6 +236,45 @@ pub unsafe extern "C" fn pthread_self() -> pthread_t {
     pthread::current_thread().unwrap_unchecked() as *const _ as *mut _
 }
 
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/pthread_setname_np.3.html>.
+///
+/// Names `thread`. QNX names only the calling thread this way, so any other
+/// thread fails with `ENOTSUP`; a name longer than `_NTO_THREAD_NAME_MAX`
+/// (100) bytes fails with `ERANGE`.
+#[cfg(target_os = "nto")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_setname_np(
+    thread: pthread_t,
+    name: *const crate::platform::types::c_char,
+) -> c_int {
+    if thread != unsafe { pthread_self() } {
+        return crate::header::errno::ENOTSUP;
+    }
+    let name = unsafe { core::ffi::CStr::from_ptr(name) };
+    e(crate::platform::sys::thread_set_name(name.to_bytes()))
+}
+
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/pthread_getname_np.3.html>.
+///
+/// Copies the name of `thread`, which must be the calling thread as for
+/// [`pthread_setname_np`], into `buf`; `ERANGE` if `len` bytes can't hold it.
+#[cfg(target_os = "nto")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pthread_getname_np(
+    thread: pthread_t,
+    buf: *mut crate::platform::types::c_char,
+    len: size_t,
+) -> c_int {
+    if thread != unsafe { pthread_self() } {
+        return crate::header::errno::ENOTSUP;
+    }
+    if buf.is_null() || len == 0 {
+        return crate::header::errno::ERANGE;
+    }
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf.cast::<u8>(), len) };
+    e(crate::platform::sys::thread_get_name(buf).map(|_| ()))
+}
+
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_setcancelstate.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pthread_setcancelstate(state: c_int, oldstate: *mut c_int) -> c_int {
