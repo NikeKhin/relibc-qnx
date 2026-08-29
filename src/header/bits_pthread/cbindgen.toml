@@ -1,53 +1,34 @@
-sys_includes = ["bits/sched.h"]
+# POSIX header spec: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_types.h.html
+#
+# These types are split out to prevent importing all of sys/types.h into other headers.
+#
+# POSIX headers that require them:
+# - aio.h (pthread_attr_t only)
+# - pthread.h (all of them)
+# - signal.h (pthread_t and pthread_attr_t only)
+# - sys/types.h (where they should be defined)
 include_guard = "_RELIBC_BITS_PTHREAD_H"
 language = "C"
 style = "type"
 no_includes = true
 cpp_compat = true
-# TODO: Any better way to implement pthread_cleanup_push/pthread_cleanup_pop?
 after_includes = """
-#define PTHREAD_COND_INITIALIZER ((pthread_cond_t){0})
-#define PTHREAD_MUTEX_INITIALIZER ((pthread_mutex_t){0})
-#define PTHREAD_ONCE_INIT ((pthread_once_t){0})
-#define PTHREAD_RWLOCK_INITIALIZER ((pthread_rwlock_t){0})
-
-#define pthread_cleanup_push(ROUTINE, ARG) do { \\
-  struct { \\
-    void (*routine)(void *); \\
-    void *arg; \\
-    void *prev; \\
-  } __relibc_internal_pthread_ll_entry = { \\
-    .routine = (void (*)(void *))(ROUTINE), \\
-    .arg = (void *)(ARG), \\
-  }; \\
-  __relibc_internal_pthread_cleanup_push(&__relibc_internal_pthread_ll_entry);
-
-#define pthread_cleanup_pop(EXECUTE) \\
-  __relibc_internal_pthread_cleanup_pop((EXECUTE)); \\
-} while(0)
+#include <bits/pthread-t.h>     // for pthread_t from sys/types.h
+#include <bits/pthreadattr-t.h> // for pthread_attr_t from sys/types.h
+#include <bits/pthreadonce-t.h> // for pthread_once_t from sys/types.h
+#include <bits/threads.h>       // for pthread_{key|mutex|cond}_t from sys/types.h
 
 """
 
-[export.rename]
-"sched_param" = "struct sched_param"
-"AtomicInt" = "int"
-"AtomicUint" = "unsigned"
-
 [export]
 include = [
-  "pthread_attr_t",
   "pthread_rwlockattr_t",
   "pthread_rwlock_t",
   "pthread_barrier_t",
   "pthread_barrierattr_t",
-  "pthread_mutex_t",
   "pthread_mutexattr_t",
   "pthread_condattr_t",
-  "pthread_cond_t",
   "pthread_spinlock_t",
-  "pthread_once_t",
-  "pthread_t",
-  "pthread_key_t",
 ]
 
 [enum]

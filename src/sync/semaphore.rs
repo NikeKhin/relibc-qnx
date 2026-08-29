@@ -2,8 +2,16 @@
 //TODO: improve implementation
 
 use crate::{
-    header::time::{CLOCK_MONOTONIC, clock_gettime, timespec},
-    platform::types::{c_uint, clockid_t},
+    error::{Errno, Result},
+    header::{
+        errno,
+        time::{CLOCK_MONOTONIC, CLOCK_REALTIME, timespec, timespec_realtime_to_monotonic},
+    },
+    platform::{
+        Pal, Sys,
+        types::{c_uint, clockid_t},
+    },
+    sync::FutexAtomicTy,
 };
 
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -27,64 +35,43 @@ impl Semaphore {
         crate::sync::futex_wake(&self.count, i32::MAX);
     }
 
-    pub fn try_wait(&self) -> u32 {
+    pub fn try_wait(&self) -> bool {
         loop {
             let value = self.count.load(Ordering::SeqCst);
 
             if value == 0 {
-                return 0;
+                return false;
             }
 
-            match self.count.compare_exchange_weak(
-                value,
-                value - 1,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => {
-                    // Acquired
-                    return value;
-                }
-                Err(_) => (),
+            if self
+                .count
+                .compare_exchange_weak(value, value - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                // Acquired
+                return true;
             }
             // Try again (as long as value > 0)
         }
     }
 
-    pub fn wait(&self, timeout_opt: Option<&timespec>, clock_id: clockid_t) -> Result<(), ()> {
+    pub fn wait(&self, timeout_opt: Option<&timespec>, clock_id: clockid_t) -> Result<()> {
         loop {
-            let value = self.try_wait();
-
-            if value == 0 {
+            if self.try_wait() {
                 return Ok(());
             }
-
+            // value must be zero
             if let Some(timeout) = timeout_opt {
-                let mut time = timespec::default();
-                unsafe { clock_gettime(clock_id, &mut time) };
-                if (time.tv_sec > timeout.tv_sec)
-                    || (time.tv_sec == timeout.tv_sec && time.tv_nsec >= timeout.tv_nsec)
-                {
-                    //Timeout happened, return error
-                    return Err(());
-                } else {
-                    // Use futex to wait for the next change, with a relative timeout
-                    let mut relative = timespec {
-                        tv_sec: timeout.tv_sec,
-                        tv_nsec: timeout.tv_nsec,
-                    };
-                    while relative.tv_nsec < time.tv_nsec {
-                        relative.tv_sec -= 1;
-                        relative.tv_nsec += 1_000_000_000;
-                    }
-                    relative.tv_sec -= time.tv_sec;
-                    relative.tv_nsec -= time.tv_nsec;
-
-                    crate::sync::futex_wait(&self.count, value, Some(&relative));
-                }
+                let relative = match clock_id {
+                    // FUTEX expect monotonic clock
+                    CLOCK_MONOTONIC => timeout.clone(),
+                    CLOCK_REALTIME => timespec_realtime_to_monotonic(timeout)?,
+                    _ => return Err(Errno(errno::EINVAL)),
+                };
+                unsafe { Sys::futex_wait(self.count.ptr(), 0, Some(&relative))? };
             } else {
                 // Use futex to wait for the next change, without a timeout
-                crate::sync::futex_wait(&self.count, value, None);
+                unsafe { Sys::futex_wait(self.count.ptr(), 0, None)? };
             }
         }
     }

@@ -2,44 +2,43 @@
 //!
 //! See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/grp.h.html>.
 
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use core::{
     cell::SyncUnsafeCell,
-    convert::{TryFrom, TryInto},
+    convert::TryInto,
     mem::{self, MaybeUninit},
     num::ParseIntError,
     ops::{Deref, DerefMut},
     pin::Pin,
-    primitive::str,
     ptr, slice,
-    str::Matches,
 };
 
-use alloc::{
-    borrow::ToOwned,
-    string::{FromUtf8Error, String},
-};
+use alloc::string::{FromUtf8Error, String};
 
 use crate::{
-    c_str::CStr,
+    error::ResultExt,
     fs::File,
-    header::{errno, fcntl, limits, string::strlen, unistd},
-    io,
-    io::{BufReader, Lines, prelude::*},
-    platform,
-    platform::types::{c_char, c_int, c_void, gid_t, size_t},
-    sync::Mutex,
+    header::{errno, fcntl, limits, string::strlen},
+    io::{self, BufReader, Lines, prelude::*},
+    platform::{
+        self, Pal, Sys,
+        types::{c_char, c_int, c_void, gid_t, size_t},
+    },
 };
 
-use super::{errno::*, string::strncmp};
+use super::{
+    errno::{EINVAL, EIO, ENOENT, ERANGE},
+    string::strncmp,
+};
 
+/// cbindgen:ignore
 #[cfg(target_os = "linux")]
 const SEPARATOR: char = ':';
 
+/// cbindgen:ignore
 #[cfg(target_os = "redox")]
 const SEPARATOR: char = ';';
 
+/// cbindgen:ignore
 const GROUP_FILE: &core::ffi::CStr = c"/etc/group";
 
 #[derive(Clone, Copy, Debug)]
@@ -77,7 +76,9 @@ impl DerefMut for MaybeAllocated {
     }
 }
 
+/// cbindgen:ignore
 static mut GROUP_BUF: Option<MaybeAllocated> = None;
+/// cbindgen:ignore
 static mut GROUP: group = group {
     gr_name: ptr::null_mut(),
     gr_passwd: ptr::null_mut(),
@@ -85,26 +86,36 @@ static mut GROUP: group = group {
     gr_mem: ptr::null_mut(),
 };
 
+/// cbindgen:ignore
 static LINE_READER: SyncUnsafeCell<Option<Lines<BufReader<File>>>> = SyncUnsafeCell::new(None);
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/grp.h.html>.
+#[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Debug)]
 pub struct group {
+    /// The name of the group.
     pub gr_name: *mut c_char,
+    /// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getgrnam.3.html>.
+    ///
+    /// Group password.
     pub gr_passwd: *mut c_char,
+    /// Numerical group ID.
     pub gr_gid: gid_t,
+    /// Pointer to a null-terminated array of character pointers to member
+    /// names.
     pub gr_mem: *mut *mut c_char,
 }
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug)]
 enum Error {
     EOF,
-    SyntaxError,
+    Syntax,
     BufTooSmall,
     Misc(io::Error),
-    FromUtf8Error(FromUtf8Error),
-    ParseIntError(ParseIntError),
+    FromUtf8(FromUtf8Error),
+    ParseInt(ParseIntError),
     Other,
 }
 
@@ -127,7 +138,7 @@ impl OwnedGrp {
 fn split(buf: &mut [u8]) -> Option<group> {
     let gr_gid = match buf[0..mem::size_of::<gid_t>()].try_into() {
         Ok(buf) => gid_t::from_ne_bytes(buf),
-        Err(err) => return None,
+        Err(_) => return None,
     };
 
     // Get address of buffer for fixing up gr_mem
@@ -135,9 +146,9 @@ fn split(buf: &mut [u8]) -> Option<group> {
 
     // We moved the gid to the beginning of the byte buffer so we can do this.
     let mut parts = buf[mem::size_of::<gid_t>()..].split_mut(|&c| c == b'\0');
-    let gr_name = parts.next()?.as_mut_ptr() as *mut c_char;
-    let gr_passwd = parts.next()?.as_mut_ptr() as *mut c_char;
-    let gr_mem = parts.next()?.as_mut_ptr() as *mut usize;
+    let gr_name = parts.next()?.as_mut_ptr().cast::<c_char>();
+    let gr_passwd = parts.next()?.as_mut_ptr().cast::<c_char>();
+    let gr_mem = parts.next()?.as_mut_ptr().cast::<usize>();
 
     // Adjust gr_mem address by buffer base address
     // TODO: max group members length?
@@ -155,30 +166,29 @@ fn split(buf: &mut [u8]) -> Option<group> {
         gr_name,
         gr_passwd,
         gr_gid,
-        gr_mem: gr_mem as *mut *mut c_char,
+        gr_mem: gr_mem.cast::<*mut c_char>(),
     })
 }
 
 fn parse_grp(line: String, destbuf: Option<DestBuffer>) -> Result<OwnedGrp, Error> {
-    let mut buffer = line.to_owned().into_bytes();
+    let buffer = line.clone().into_bytes();
 
     let mut buffer = buffer
         .into_iter()
         .map(|i| if i == SEPARATOR as u8 { b'\0' } else { i })
-        .chain([b'\0'])
+        .chain(*b"\0")
         .collect::<Vec<_>>();
     let mut buffer = buffer.split_mut(|i| *i == b'\0');
 
-    let mut gr_gid: gid_t = 0;
     let strings = {
         let mut vec: Vec<u8> = Vec::new();
 
         let gr_name = buffer.next().ok_or(Error::EOF)?.to_vec();
         let gr_passwd = buffer.next().ok_or(Error::EOF)?.to_vec();
-        gr_gid = String::from_utf8(buffer.next().ok_or(Error::EOF)?.to_vec())
-            .map_err(|err| Error::FromUtf8Error(err))?
+        let gr_gid = String::from_utf8(buffer.next().ok_or(Error::EOF)?.to_vec())
+            .map_err(Error::FromUtf8)?
             .parse::<gid_t>()
-            .map_err(|err| Error::ParseIntError(err))?;
+            .map_err(Error::ParseInt)?;
 
         // Place the gid at the beginning of the byte buffer to make getting it back out again later, much faster.
 
@@ -254,6 +264,8 @@ fn parse_grp(line: String, destbuf: Option<DestBuffer>) -> Result<OwnedGrp, Erro
 /// MT-Unsafe race:grgid locale
 ///
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getgrgid.html>.
+///
+/// Searches the group database for an entry with a matching `gid`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getgrgid(gid: gid_t) -> *mut group {
     let Ok(db) = File::open(GROUP_FILE.into(), fcntl::O_RDONLY) else {
@@ -279,6 +291,8 @@ pub unsafe extern "C" fn getgrgid(gid: gid_t) -> *mut group {
 /// MT-Unsafe race:grnam locale
 ///
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getgrnam.html>.
+///
+/// Searches the group database for an entry with a matching `name`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getgrnam(name: *const c_char) -> *mut group {
     let Ok(db) = File::open(GROUP_FILE.into(), fcntl::O_RDONLY) else {
@@ -312,12 +326,15 @@ pub unsafe extern "C" fn getgrnam(name: *const c_char) -> *mut group {
 /// MT-Safe locale
 ///
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getgrgid_r.html>.
+///
+/// Updates the `group` structure pointed to by `result_buf` and store a
+/// pointer to that structure at the location pointed to by `result`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getgrgid_r(
     gid: gid_t,
     result_buf: *mut group,
     buffer: *mut c_char,
-    buflen: usize,
+    buflen: size_t,
     result: *mut *mut group,
 ) -> c_int {
     // In case of error or the requested entry is not found.
@@ -334,7 +351,7 @@ pub unsafe extern "C" fn getgrgid_r(
         let grp = match parse_grp(
             line,
             Some(DestBuffer {
-                ptr: buffer as *mut u8,
+                ptr: buffer.cast::<u8>(),
                 len: buflen,
             }),
         ) {
@@ -343,9 +360,9 @@ pub unsafe extern "C" fn getgrgid_r(
                 return match err {
                     Error::BufTooSmall => ERANGE,
                     Error::EOF
-                    | Error::SyntaxError
-                    | Error::FromUtf8Error(_)
-                    | Error::ParseIntError(_)
+                    | Error::Syntax
+                    | Error::FromUtf8(_)
+                    | Error::ParseInt(_)
                     | Error::Other => EINVAL,
                     Error::Misc(io_err) => match io_err.kind() {
                         io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => EINVAL,
@@ -373,12 +390,15 @@ pub unsafe extern "C" fn getgrgid_r(
 /// MT-Safe locale
 ///
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getgrnam_r.html>.
+///
+/// Updates the `group` structure pointed to by `result_buf` and store a
+/// pointer to that structure at the location pointed to by `result`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getgrnam_r(
     name: *const c_char,
     result_buf: *mut group,
     buffer: *mut c_char,
-    buflen: usize,
+    buflen: size_t,
     result: *mut *mut group,
 ) -> c_int {
     let Ok(db) = File::open(GROUP_FILE.into(), fcntl::O_RDONLY) else {
@@ -387,10 +407,10 @@ pub unsafe extern "C" fn getgrnam_r(
 
     for line in BufReader::new(db).lines() {
         let Ok(line) = line else { return EINVAL };
-        let Ok(mut grp) = parse_grp(
+        let Ok(grp) = parse_grp(
             line,
             Some(DestBuffer {
-                ptr: buffer as *mut u8,
+                ptr: buffer.cast::<u8>(),
                 len: buflen,
             }),
         ) else {
@@ -402,7 +422,7 @@ pub unsafe extern "C" fn getgrnam_r(
                 grp.reference.gr_name,
                 name,
                 strlen(grp.reference.gr_name).min(strlen(name)),
-            ) > 0
+            ) == 0
         } {
             unsafe {
                 *result_buf = grp.reference;
@@ -419,6 +439,9 @@ pub unsafe extern "C" fn getgrnam_r(
 /// MT-Unsafe race:grent race:grentbuf locale
 ///
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endgrent.html>.
+///
+/// Returns a pointer to a structure containing the broken-out fields of an
+/// entry in the group database.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getgrent() -> *mut group {
     let mut line_reader = unsafe { &mut *LINE_READER.get() };
@@ -451,37 +474,43 @@ pub unsafe extern "C" fn getgrent() -> *mut group {
 /// MT-Unsafe race:grent locale
 ///
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endgrent.html>.
+///
+/// Closes the group database.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn endgrent() {
     unsafe {
-        *(&mut *LINE_READER.get()) = None;
+        *LINE_READER.get() = None;
     }
 }
 
 /// MT-Unsafe race:grent locale
 ///
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endgrent.html>.
+///
+/// Rewinds the group database so that the next `getgrent()` call returns the
+/// first entry, allowing repeated searches.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setgrent() {
-    let mut line_reader = unsafe { &mut *LINE_READER.get() };
+    let line_reader = unsafe { &mut *LINE_READER.get() };
     let Ok(db) = File::open(GROUP_FILE.into(), fcntl::O_RDONLY) else {
         return;
     };
     *line_reader = Some(BufReader::new(db).lines());
 }
 
+// TODO should be guarded by `_DEFAULT_SOURCE`
 /// MT-Safe locale
-/// Not POSIX
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getgrouplist.3.html>.
 ///
-/// See <https://www.man7.org/linux/man-pages/man3/getgrouplist.3.html>.
+/// Get a list of groups to which a user belongs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getgrouplist(
     user: *const c_char,
-    group: gid_t,
+    _group: gid_t,
     groups: *mut gid_t,
     ngroups: *mut c_int,
 ) -> c_int {
-    let mut grps = unsafe {
+    let grps = unsafe {
         slice::from_raw_parts_mut(groups.cast::<MaybeUninit<gid_t>>(), ngroups.read() as usize)
     };
 
@@ -505,8 +534,8 @@ pub unsafe extern "C" fn getgrouplist(
 
         let mut parts = line.split(SEPARATOR);
 
-        let group_name = parts.next().unwrap_or("");
-        let group_password = parts.next().unwrap_or("");
+        let _group_name = parts.next().unwrap_or("");
+        let _group_password = parts.next().unwrap_or("");
         let group_id = parts.next().unwrap_or("-1").parse::<c_int>().unwrap();
         let members = parts
             .next()
@@ -515,7 +544,7 @@ pub unsafe extern "C" fn getgrouplist(
             .map(|i| i.trim())
             .collect::<Vec<_>>();
 
-        if !members.iter().any(|i| *i == user) {
+        if !members.contains(&user) {
             continue;
         }
 
@@ -540,16 +569,28 @@ pub unsafe extern "C" fn getgrouplist(
     }
 }
 
+// TODO should be guarded by `_DEFAULT_SOURCE`
 /// MT-Safe locale
-/// Not POSIX
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/initgroups.3.html>.
 ///
-/// See <https://www.man7.org/linux/man-pages/man3/initgroups.3.html>.
+/// Initialize the supplementary group access list.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn initgroups(user: *const c_char, gid: gid_t) -> c_int {
     let mut groups = [0; limits::NGROUPS_MAX];
-    let mut count = groups.len() as c_int;
-    if unsafe { getgrouplist(user, gid, groups.as_mut_ptr(), &mut count) < 0 } {
+    let mut count = c_int::try_from(groups.len()).expect("NGROUPS_MAX below i32::MAX");
+    if unsafe { getgrouplist(user, gid, groups.as_mut_ptr(), &raw mut count) < 0 } {
         return -1;
     }
-    unsafe { unistd::setgroups(count as size_t, groups.as_ptr()) }
+    unsafe { setgroups(count as size_t, groups.as_ptr()) }
+}
+
+// TODO should be guarded by `_DEFAULT_SOURCE`
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man2/setgroups.2.html>.
+///
+/// Set a list of supplementary group IDs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn setgroups(size: size_t, list: *const gid_t) -> c_int {
+    unsafe { Sys::setgroups(size, list) }
+        .map(|()| 0)
+        .or_minus_one_errno()
 }

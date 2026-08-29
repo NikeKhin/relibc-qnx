@@ -27,15 +27,20 @@ impl<T> RawCell<T> {
     }
     #[inline]
     pub unsafe fn unsafe_ref(&self) -> &T {
-        &*self.inner.get()
+        unsafe { &*self.inner.get() }
     }
     #[inline]
     pub unsafe fn unsafe_set(&self, t: T) {
-        *self.inner.get() = t;
+        unsafe { *self.inner.get() = t };
     }
+    /// # Safety
+    /// This allows creation of multiple mutable references from an immutable
+    /// reference. Caller must ensure this is not called on the same `RawCell`
+    /// multiple times.
+    #[expect(clippy::mut_from_ref, reason = "documented safety usage")]
     #[inline]
     pub unsafe fn unsafe_mut(&self) -> &mut T {
-        &mut *self.inner.get()
+        unsafe { &mut *self.inner.get() }
     }
 }
 

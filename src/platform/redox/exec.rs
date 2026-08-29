@@ -5,13 +5,11 @@ use core::{
 
 use crate::{
     c_str::{CStr, CString},
+    casting::CCharPtrToU8Ptr,
     fs::File,
     header::{limits::PATH_MAX, string::strlen},
     io::{BufReader, SeekFrom, prelude::*},
-    platform::{
-        sys::{S_ISGID, S_ISUID},
-        types::*,
-    },
+    platform::types::*,
 };
 
 use redox_rt::{
@@ -34,24 +32,29 @@ fn fexec_impl(
         interp_override: new_interp_override,
     } = redox_rt::proc::fexec_impl(
         exec_file,
-        &RtTcb::current().thread_fd(),
+        RtTcb::current().thread_fd(),
         redox_rt::current_proc_fd(),
         path,
         args,
         envs,
         extrainfo,
         interp_override,
-    )?;
+    )?
+    .unwrap();
+
+    if let Some(filetable_fd) = extrainfo.filetable_fd {
+        let _ = redox_rt::sys::close(filetable_fd);
+    }
 
     // According to elf(5), PT_INTERP requires that the interpreter path be
     // null-terminated. Violating this should therefore give the "format error" ENOEXEC.
     let path_cstr = CStr::from_bytes_with_nul(&path).map_err(|_| Error::new(ENOEXEC))?;
 
-    return execve(
+    execve(
         Executable::AtPath(path_cstr),
         ArgEnv::Parsed { args, envs },
         Some(new_interp_override),
-    );
+    )
 }
 
 pub enum ArgEnv<'a> {
@@ -77,12 +80,22 @@ pub fn execve(
 ) -> Result<Infallible> {
     // NOTE: We must omit O_CLOEXEC and close manually, otherwise it will be closed before we
     // have even read it!
-    let (mut image_file, arg0) = match exec {
-        Executable::AtPath(path) => (
-            File::open(path, O_RDONLY as c_int).map_err(|_| Error::new(ENOENT))?,
-            path.to_bytes(),
-        ),
-        Executable::InFd { file, arg0 } => (file, arg0),
+    let (mut image_file, stat, arg0) = match exec {
+        Executable::AtPath(path) => {
+            let Ok(src_fd) = File::open(path, O_RDONLY as c_int) else {
+                return Err(Error::new(ENOENT));
+            };
+
+            let mut src_stat = Stat::default();
+            redox_rt::sys::fstat(*src_fd as usize, &mut src_stat)?;
+
+            (src_fd, src_stat, path.to_bytes())
+        }
+        Executable::InFd { file, arg0 } => {
+            let mut stat = Stat::default();
+            redox_rt::sys::fstat(*file as usize, &mut stat)?;
+            (file, stat, arg0)
+        }
     };
 
     // With execve now being implemented in userspace, we need to check ourselves that this
@@ -96,14 +109,12 @@ pub fn execve(
     // TODO: At some point we might have capabilities limiting the ability to allocate
     // executable memory.
 
-    let mut stat = Stat::default();
-    syscall::fstat(*image_file as usize, &mut stat)?;
     let Resugid { ruid, rgid, .. } = redox_rt::sys::posix_getresugid();
 
     let mode = if ruid == stat.st_uid {
-        (stat.st_mode >> 3 * 2) & 0o7
+        (stat.st_mode >> (3 * 2)) & 0o7
     } else if rgid == stat.st_gid {
-        (stat.st_mode >> 3 * 1) & 0o7
+        (stat.st_mode >> 3) & 0o7
     } else {
         stat.st_mode & 0o7
     };
@@ -112,7 +123,7 @@ pub fn execve(
         return Err(Error::new(EPERM));
     }
 
-    let cwd: Box<[u8]> = super::path::clone_cwd().unwrap_or_default().into();
+    let cwd = super::path::clone_cwd().unwrap_or_default();
 
     // Path to interpreter binary and args if found
     let (interpreter_path, interpreter_args) = { parse_interpreter(&mut image_file)? };
@@ -127,18 +138,32 @@ pub fn execve(
     }
 
     // Count arguments for `exec` which is different from the interpreter's args
+    //
+    // When there's an interpreter, we skip the original `argv[0]` and replace it with the script
+    // path (`arg0`).
     match arg_env {
         ArgEnv::C { argv, .. } => unsafe {
-            while !(*argv.add(len)).is_null() {
-                len += 1;
+            let mut count = 0;
+            let ptr = if interpreter_path.is_some() && !(*argv).is_null() {
+                argv.add(1)
+            } else {
+                argv
+            };
+
+            while !(*ptr.add(count)).is_null() {
+                count += 1;
             }
+            len += count;
         },
-        ArgEnv::Parsed { args, .. } => len = args.len(),
+        ArgEnv::Parsed { args, .. } => {
+            let skip = if interpreter_path.is_some() { 1 } else { 0 };
+            len += args.len().saturating_sub(skip);
+        }
     }
     let mut args: Vec<&[u8]> = Vec::with_capacity(len);
 
     if let Some(interpreter) = &interpreter_path {
-        image_file = File::open(CStr::borrow(&interpreter), O_RDONLY as c_int)
+        image_file = File::open(CStr::borrow(interpreter), O_RDONLY as c_int)
             .map_err(|_| Error::new(ENOENT))?;
 
         // Push interpreter to arguments
@@ -157,11 +182,21 @@ pub fn execve(
     let (args, envs): (Vec<_>, Vec<_>) = match arg_env {
         ArgEnv::C { mut argv, mut envp } => unsafe {
             // Arguments
+            if interpreter_path.is_some() {
+                args.push(arg0);
+                if !(*argv).is_null() {
+                    argv = argv.add(1);
+                }
+            }
+
             while !argv.read().is_null() {
                 let arg = argv.read();
 
                 let len = strlen(arg);
-                args.push(core::slice::from_raw_parts(arg as *const u8, len));
+                args.push(core::slice::from_raw_parts(
+                    CCharPtrToU8Ptr::cast_const(arg),
+                    len,
+                ));
                 argv = argv.add(1);
             }
 
@@ -176,7 +211,10 @@ pub fn execve(
                 let env = envp.read();
 
                 let len = strlen(env);
-                envs.push(core::slice::from_raw_parts(env as *const u8, len));
+                envs.push(core::slice::from_raw_parts(
+                    CCharPtrToU8Ptr::cast_const(env),
+                    len,
+                ));
                 envp = envp.add(1);
             }
             (args, envs)
@@ -185,8 +223,12 @@ pub fn execve(
             args: new_args,
             envs,
         } => {
-            let prev_size: usize = args.iter().map(|a| a.len()).sum();
-            args.extend(new_args);
+            if interpreter_path.is_some() {
+                args.push(arg0);
+                args.extend(new_args.iter().skip(1));
+            } else {
+                args.extend(new_args);
+            }
             (args, Vec::from(envs))
         }
     };
@@ -197,14 +239,24 @@ pub fn execve(
 
     let sigprocmask = redox_rt::signal::get_sigmask().unwrap();
 
+    let filetable_binary_fd = RtTcb::current()
+        .thread_fd()
+        .dup_into_upper(b"filetable-binary")?;
     let extrainfo = ExtraInfo {
-        cwd: Some(&cwd),
+        cwd: Some(cwd.as_bytes()),
         sigignmask: redox_rt::signal::get_sigignmask_to_inherit(),
         sigprocmask,
         umask: redox_rt::sys::get_umask(),
         thr_fd: RtTcb::current().thread_fd().as_raw_fd(),
         proc_fd: redox_rt::current_proc_fd().as_raw_fd(),
+        ns_fd: redox_rt::current_namespace_fd().ok(),
+        cwd_fd: super::path::current_dir()
+            .ok()
+            .map(|fd| fd.as_ref().unwrap().fd.as_raw_fd()),
+        filetable_fd: Some(filetable_binary_fd.as_raw_fd()),
+        same_process: true,
     };
+
     fexec_impl(
         exec_fd_guard,
         arg0,
@@ -341,21 +393,29 @@ where
         args_offset.map(NonZeroUsize::get),
         args_offset_u64.map(NonZeroU64::get),
     ) {
-        let len = offset - interp_offset - 1;
-        let len_u64 = offset_u64 - interp_offset_u64 - 1;
+        let len = offset - interp_offset;
+        let len_u64 = offset_u64 - interp_offset_u64;
         let mut args = Vec::with_capacity(len);
 
-        // Eat initial whitespace
-        reader.consume(1);
         reader
             .take(len_u64)
             .read_to_end(&mut args)
             .map_err(|_| Error::new(E2BIG))?;
+
         // Eat '\n'
         reader.consume(1);
 
-        let args = CString::new(args).map_err(|_| Error::new(ENOEXEC))?;
-        Some(args)
+        let mut arg_start = 0;
+        while arg_start < args.len() && (args[arg_start] == b' ' || args[arg_start] == b'\t') {
+            arg_start += 1;
+        }
+
+        if arg_start < args.len() {
+            let args = CString::new(&args[arg_start..]).map_err(|_| Error::new(ENOEXEC))?;
+            Some(args)
+        } else {
+            None
+        }
     } else {
         None
     };

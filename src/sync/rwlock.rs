@@ -1,11 +1,18 @@
 use core::{
     cell::UnsafeCell,
     fmt, ops,
-    ptr::NonNull,
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::{header::time::timespec, pthread::Pshared};
+use crate::{
+    error::{Errno, Result},
+    header::{
+        errno::{EINVAL, ETIMEDOUT},
+        time::{CLOCK_MONOTONIC, CLOCK_REALTIME, timespec, timespec_realtime_to_monotonic},
+    },
+    platform::types::clockid_t,
+    pthread::Pshared,
+};
 
 pub struct InnerRwLock {
     state: AtomicU32,
@@ -26,7 +33,23 @@ impl InnerRwLock {
             state: AtomicU32::new(0),
         }
     }
-    pub fn acquire_write_lock(&self, deadline: Option<&timespec>) {
+    fn translate_timeout(deadline: Option<(&timespec, i32)>) -> Result<Option<timespec>, Errno> {
+        let relative = match deadline {
+            // FUTEX expect monotonic clock
+            Some((abstime, CLOCK_MONOTONIC)) => Some(abstime.clone()),
+            Some((abstime, CLOCK_REALTIME)) => Some(timespec_realtime_to_monotonic(abstime)?),
+            None => None,
+            _ => {
+                return Err(Errno(EINVAL));
+            }
+        };
+        Ok(relative)
+    }
+    pub fn acquire_write_lock(
+        &self,
+        deadline: Option<(&timespec, clockid_t)>,
+    ) -> Result<(), Errno> {
+        let relative = Self::translate_timeout(deadline)?;
         let mut waiting_wr = self.state.load(Ordering::Relaxed) & WAITING_WR;
 
         loop {
@@ -36,9 +59,8 @@ impl InnerRwLock {
                 Ordering::Acquire,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return,
+                Ok(_) => break,
                 Err(actual) => {
-                    let expected = actual;
                     let expected = if actual & COUNT_MASK != EXCLUSIVE {
                         // Set the exclusive bit, but only if we're waiting for readers, to avoid
                         // reader starvation by overprioritizing write locks.
@@ -51,7 +73,11 @@ impl InnerRwLock {
                     waiting_wr = expected & WAITING_WR;
 
                     if actual & COUNT_MASK > 0 {
-                        let _ = crate::sync::futex_wait(&self.state, expected, deadline);
+                        if crate::sync::futex_wait(&self.state, expected, relative.as_ref())
+                            == super::FutexWaitResult::TimedOut
+                        {
+                            return Err(Errno(ETIMEDOUT));
+                        }
                     } else {
                         // We must avoid blocking indefinitely in our `futex_wait()`, in this case
                         // where it's possible that `self.state == expected` but our futex might
@@ -62,12 +88,20 @@ impl InnerRwLock {
                 }
             }
         }
+
+        Ok(())
     }
-    pub fn acquire_read_lock(&self, deadline: Option<&timespec>) {
-        // TODO: timeout
+    pub fn acquire_read_lock(&self, deadline: Option<(&timespec, clockid_t)>) -> Result<(), Errno> {
+        let relative = Self::translate_timeout(deadline)?;
         while let Err(old) = self.try_acquire_read_lock() {
-            crate::sync::futex_wait(&self.state, old, deadline);
+            if crate::sync::futex_wait(&self.state, old, relative.as_ref())
+                == super::FutexWaitResult::TimedOut
+            {
+                return Err(Errno(ETIMEDOUT));
+            }
         }
+
+        Ok(())
     }
     pub fn try_acquire_read_lock(&self) -> Result<(), u32> {
         let mut cached = self.state.load(Ordering::Acquire);
@@ -168,12 +202,12 @@ impl<T> RwLock<T> {
 
 impl<T: ?Sized> RwLock<T> {
     pub fn read(&self) -> ReadGuard<'_, T> {
-        self.inner.acquire_read_lock(None);
+        let _ = self.inner.acquire_read_lock(None);
         unsafe { ReadGuard::new(self) }
     }
 
     pub fn write(&self) -> WriteGuard<'_, T> {
-        self.inner.acquire_write_lock(None);
+        let _ = self.inner.acquire_write_lock(None);
         unsafe { WriteGuard::new(self) }
     }
 

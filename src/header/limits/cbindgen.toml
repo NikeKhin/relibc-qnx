@@ -1,8 +1,11 @@
-sys_includes = []
+# POSIX header spec: https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/limits.h.html
+#
+# There are no spec quotations relating to includes
 include_guard = "_RELIBC_LIMITS_H"
-trailer = "#include <bits/limits.h>"
+after_includes = """
+#include <bits/limits/ptdi.h> // for PTHREAD_DESTRUCTOR_ITERATIONS
+"""
 language = "C"
-style = "Tag"
 no_includes = true
 cpp_compat = true
 

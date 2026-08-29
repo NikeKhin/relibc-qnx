@@ -13,7 +13,10 @@ use crate::{
     fs::File,
     header::{errno, fcntl, string::strcmp},
     io::{BufReader, SeekFrom, prelude::*},
-    platform::{self, types::*},
+    platform::{
+        self,
+        types::{c_char, c_int, gid_t, size_t, uid_t},
+    },
     raw_cell::RawCell,
 };
 
@@ -27,9 +30,11 @@ use self::linux as sys;
 #[cfg(target_os = "redox")]
 use self::redox as sys;
 
+/// cbindgen:ignore
 #[cfg(target_os = "linux")]
 const SEPARATOR: u8 = b':';
 
+/// cbindgen:ignore
 #[cfg(target_os = "redox")]
 const SEPARATOR: u8 = b';';
 
@@ -37,6 +42,7 @@ const SEPARATOR: u8 = b';';
 /// for POSIX minimum requirements, and
 /// <https://www.man7.org/linux/man-pages/man3/getpwnam.3.html> for further
 /// details.
+#[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Debug)]
 pub struct passwd {
@@ -49,7 +55,9 @@ pub struct passwd {
     pub pw_shell: *mut c_char,
 }
 
+/// cbindgen:ignore
 static mut PASSWD_BUF: Option<MaybeAllocated> = None;
+/// cbindgen:ignore
 static PASSWD: RawCell<passwd> = RawCell::new(passwd {
     pw_name: ptr::null_mut(),
     pw_passwd: ptr::null_mut(),
@@ -116,6 +124,7 @@ enum Cause {
     Other,
 }
 
+/// cbindgen:ignore
 static READER: RawCell<Option<BufReader<File>>> = RawCell::new(None);
 
 fn parsed<I, O>(buf: Option<I>) -> Option<O>
@@ -128,6 +137,9 @@ where
     string.parse().ok()
 }
 
+/// See <https://www.man7.org/linux/man-pages/man3/getpwent_r.3.html>.
+///
+/// Non-POSIX
 fn getpwent_r(
     reader: &mut BufReader<File>,
     destination: Option<DestBuffer>,
@@ -182,9 +194,8 @@ fn pwd_lookup<F>(mut matches: F, destination: Option<DestBuffer>) -> Result<Owne
 where
     F: FnMut(&passwd) -> bool,
 {
-    let file = match File::open(c"/etc/passwd".into(), fcntl::O_RDONLY) {
-        Ok(file) => file,
-        Err(_) => return Err(Cause::Other),
+    let Ok(file) = File::open(c"/etc/passwd".into(), fcntl::O_RDONLY) else {
+        return Err(Cause::Other);
     };
 
     let mut reader = BufReader::new(file);
@@ -205,16 +216,16 @@ unsafe fn mux(
 ) -> c_int {
     match status {
         Ok(owned) => {
-            *out = owned.reference;
-            *result = out;
+            unsafe { *out = owned.reference };
+            unsafe { *result = out };
             0
         }
         Err(Cause::Eof) => {
-            *result = ptr::null_mut();
+            unsafe { *result = ptr::null_mut() };
             0
         }
         Err(Cause::Other) => {
-            *result = ptr::null_mut();
+            unsafe { *result = ptr::null_mut() };
             -1
         }
     }
@@ -234,9 +245,8 @@ pub extern "C" fn getpwent() -> *mut passwd {
     let reader = match unsafe { &mut *READER.as_mut_ptr() } {
         Some(reader) => reader,
         None => {
-            let file = match File::open(c"/etc/passwd".into(), fcntl::O_RDONLY) {
-                Ok(file) => file,
-                Err(_) => return ptr::null_mut(),
+            let Ok(file) = File::open(c"/etc/passwd".into(), fcntl::O_RDONLY) else {
+                return ptr::null_mut();
             };
             let reader = BufReader::new(file);
             unsafe {
@@ -267,17 +277,19 @@ pub unsafe extern "C" fn getpwnam_r(
     size: size_t,
     result: *mut *mut passwd,
 ) -> c_int {
-    mux(
-        pwd_lookup(
-            |parts| strcmp(parts.pw_name, name) == 0,
-            Some(DestBuffer {
-                ptr: buf as *mut u8,
-                len: size,
-            }),
-        ),
-        out,
-        result,
-    )
+    unsafe {
+        mux(
+            pwd_lookup(
+                |parts| strcmp(parts.pw_name, name) == 0,
+                Some(DestBuffer {
+                    ptr: buf.cast::<u8>(),
+                    len: size,
+                }),
+            ),
+            out,
+            result,
+        )
+    }
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getpwuid.html>.
@@ -297,18 +309,19 @@ pub unsafe extern "C" fn getpwuid_r(
     size: size_t,
     result: *mut *mut passwd,
 ) -> c_int {
-    let slice = core::slice::from_raw_parts_mut(buf as *mut u8, size);
-    mux(
-        pwd_lookup(
-            |part| part.pw_uid == uid,
-            Some(DestBuffer {
-                ptr: buf as *mut u8,
-                len: size,
-            }),
-        ),
-        out,
-        result,
-    )
+    unsafe {
+        mux(
+            pwd_lookup(
+                |part| part.pw_uid == uid,
+                Some(DestBuffer {
+                    ptr: buf.cast::<u8>(),
+                    len: size,
+                }),
+            ),
+            out,
+            result,
+        )
+    }
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endpwent.html>.

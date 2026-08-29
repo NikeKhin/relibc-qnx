@@ -1,6 +1,6 @@
 # Redox C Library (relibc)
 
-relibc is a portable C standard library written in Rust and is under heavy development, this library contain the following items:
+relibc is a portable C standard library written in Rust and is under heavy development, this library contains the following items:
 
 - C, Linux, BSD functions and extensions
 - POSIX compatibility layer
@@ -73,6 +73,12 @@ sudo dnf install expect
 sudo pacman -S expect
 ```
 
+- Void Linux:
+
+```sh
+sudo xbps-install -S expect
+```
+
 ### Build Relibc
 
 To build the relibc library objects, run the following command:
@@ -121,9 +127,9 @@ Relibc has a test suite that also runs every time a new commit get pushed. You c
 
 Couple of notes:
 
-- Relibc and its tests will rebuild if files changed, however switching between arch or host requires you to run `make clean`
-- Redoxer is needed to run tests for Redox. You can install it using `cargo install redoxer`
-- Tests can hangs, the test runner can anticipate this, assuming the kernel doesn't hang too.
+- Relibc and its tests will rebuild if files are changed, however switching between arch or host requires you to run `make clean`
+- Redoxer is needed to run tests for Redox without `--host`. You can install it using `cargo install redoxer`
+- Tests can hang, the test runner can anticipate this, assuming the kernel doesn't hang too.
 
 ## Issues
 

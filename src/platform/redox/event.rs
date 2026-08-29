@@ -1,14 +1,14 @@
 use core::mem::size_of;
 
 use crate::header::{
-    fcntl::{O_CLOEXEC, O_CREAT, O_RDWR},
-    signal::sigset_t,
+    bits_sigset_t::sigset_t,
+    fcntl::{AT_FDCWD, O_CLOEXEC, O_CREAT, O_RDWR},
     time::timespec,
 };
 
 use super::libredox::RawResult;
 
-use bitflags::Flags;
+use redox_path::RedoxStr;
 use syscall::{EINVAL, Error, Result};
 
 #[unsafe(no_mangle)]
@@ -17,7 +17,12 @@ pub unsafe extern "C" fn redox_event_queue_create_v1(flags: u32) -> RawResult {
         if flags != 0 {
             return Err(Error::new(EINVAL));
         }
-        Ok(super::libredox::open("/scheme/event", O_CLOEXEC | O_CREAT | O_RDWR, 0o700)? as usize)
+        Ok(super::libredox::openat(
+            AT_FDCWD,
+            RedoxStr::new("/scheme/event").unwrap(),
+            O_CLOEXEC | O_CREAT | O_RDWR,
+            0o700,
+        )? as usize)
     })())
 }
 #[unsafe(no_mangle)]
@@ -40,11 +45,13 @@ pub unsafe extern "C" fn redox_event_queue_get_events_v1(
             size_of::<syscall::Event>(),
             "EOF not yet defined for event queue reads"
         );
-        buf.write(event::raw::RawEventV1 {
-            fd: event.id,
-            flags: event::raw::EventFlags::from(event.flags).bits(),
-            user_data: event.data,
-        });
+        unsafe {
+            buf.write(event::raw::RawEventV1 {
+                fd: event.id,
+                flags: event::raw::EventFlags::from(event.flags).bits(),
+                user_data: event.data,
+            })
+        };
 
         Ok(1)
     })())
@@ -77,5 +84,5 @@ pub unsafe extern "C" fn redox_event_queue_ctl_v1(
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn redox_event_queue_destroy_v1(queue: usize) -> RawResult {
-    Error::mux(syscall::close(queue))
+    Error::mux(redox_rt::sys::close(queue))
 }

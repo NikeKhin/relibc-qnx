@@ -1,10 +1,9 @@
-//! `getopt` implementation.
+//! `getopt.h` implementation.
 //!
-//! See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getopt.html>.
-
-#![deny(unsafe_op_in_unsafe_fn)]
+//! Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getopt.3.html>.
 
 use crate::{
+    casting::ByteLiteral,
     header::{
         stdio, string,
         unistd::{optarg, opterr, optind, optopt},
@@ -13,12 +12,17 @@ use crate::{
 };
 use core::ptr;
 
+/// cbindgen:ignore
 static mut CURRENT_OPT: *mut c_char = ptr::null_mut();
 
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getopt.3.html>.
 pub const no_argument: c_int = 0;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getopt.3.html>.
 pub const required_argument: c_int = 1;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getopt.3.html>.
 pub const optional_argument: c_int = 2;
 
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getopt.3.html>.
 #[repr(C)]
 pub struct option {
     name: *const c_char,
@@ -27,9 +31,7 @@ pub struct option {
     val: c_int,
 }
 
-/// See <https://www.man7.org/linux/man-pages/man3/getopt.3.html>.
-///
-/// Non-POSIX.
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getopt.3.html>.
 ///
 /// Functions the same as `getopt` but also accepts long options.
 #[unsafe(no_mangle)]
@@ -60,8 +62,8 @@ pub unsafe extern "C" fn getopt_long(
             let current_arg = unsafe { *argv.offset(optind as isize) };
             if unsafe {
                 current_arg.is_null()
-                    || *current_arg != b'-' as c_char
-                    || *current_arg.offset(1) == 0
+                    || *current_arg != ByteLiteral::cast_cchar(b'-')
+                    || *current_arg.add(1) == 0
             } {
                 -1
             } else if unsafe { string::strcmp(current_arg, c"--".as_ptr()) == 0 } {
@@ -71,10 +73,10 @@ pub unsafe extern "C" fn getopt_long(
                 -1
             } else {
                 // remove the '-'
-                let current_arg = unsafe { current_arg.offset(1) };
+                let current_arg = unsafe { current_arg.add(1) };
 
-                if unsafe { *current_arg == b'-' as c_char } && !longopts.is_null() {
-                    let current_arg = unsafe { current_arg.offset(1) };
+                if unsafe { *current_arg == ByteLiteral::cast_cchar(b'-') } && !longopts.is_null() {
+                    let current_arg = unsafe { current_arg.add(1) };
                     // is a long option
                     for i in 0.. {
                         let opt = unsafe { &*longopts.offset(i) };
@@ -85,7 +87,7 @@ pub unsafe extern "C" fn getopt_long(
                         let mut end = 0;
                         while {
                             let c = unsafe { *current_arg.offset(end) };
-                            c != 0 && c != b'=' as c_char
+                            c != 0 && c != ByteLiteral::cast_cchar(b'=')
                         } {
                             end += 1;
                         }
@@ -100,31 +102,31 @@ pub unsafe extern "C" fn getopt_long(
 
                             if opt.has_arg == optional_argument {
                                 unsafe {
-                                    if *current_arg.offset(end) == b'=' as c_char {
+                                    if *current_arg.offset(end) == ByteLiteral::cast_cchar(b'=') {
                                         optarg = current_arg.offset(end + 1);
                                     }
                                 }
                             } else if opt.has_arg == required_argument {
                                 unsafe {
-                                    if *current_arg.offset(end) == b'=' as c_char {
+                                    if *current_arg.offset(end) == ByteLiteral::cast_cchar(b'=') {
                                         optarg = current_arg.offset(end + 1);
                                     } else if optind < argc {
                                         optarg = *argv.offset(optind as isize);
                                         optind += 1;
-                                    } else if *optstring == b':' as c_char {
-                                        return b':' as c_int;
+                                    } else if *optstring == ByteLiteral::cast_cchar(b':') {
+                                        return c_int::from(b':');
                                     } else {
-                                        stdio::fputs(*argv as _, &mut *stdio::stderr);
+                                        stdio::fputs((*argv).cast_const(), &raw mut *stdio::stderr);
                                         stdio::fputs(
-                                            ": option '--\0".as_ptr() as _,
-                                            &mut *stdio::stderr,
+                                            c": option '--".as_ptr().cast(),
+                                            &raw mut *stdio::stderr,
                                         );
-                                        stdio::fputs(current_arg, &mut *stdio::stderr);
+                                        stdio::fputs(current_arg, &raw mut *stdio::stderr);
                                         stdio::fputs(
-                                            "' requires an argument\n\0".as_ptr() as _,
-                                            &mut *stdio::stderr,
+                                            c"' requires an argument\n".as_ptr().cast(),
+                                            &raw mut *stdio::stderr,
                                         );
-                                        return b'?' as c_int;
+                                        return c_int::from(b'?');
                                     }
                                 }
                             }
@@ -154,7 +156,7 @@ unsafe fn parse_arg(
     optstring: *const c_char,
 ) -> c_int {
     let update_current_opt = || unsafe {
-        CURRENT_OPT = current_arg.offset(1);
+        CURRENT_OPT = current_arg.add(1);
         if *CURRENT_OPT == 0 {
             optind += 1;
         }
@@ -162,27 +164,27 @@ unsafe fn parse_arg(
 
     let print_error = |desc: &[u8]| unsafe {
         // NOTE: we don't use fprintf to get around the usage of va_list
-        stdio::fputs(*argv as _, &mut *stdio::stderr);
-        stdio::fputs(desc.as_ptr() as _, &mut *stdio::stderr);
-        stdio::fputc(*current_arg as _, &mut *stdio::stderr);
-        stdio::fputc(b'\n' as _, &mut *stdio::stderr);
+        stdio::fputs((*argv).cast_const(), &raw mut *stdio::stderr);
+        stdio::fputs(desc.as_ptr().cast(), &raw mut *stdio::stderr);
+        stdio::fputc((*current_arg).into(), &raw mut *stdio::stderr);
+        stdio::fputc(b'\n'.into(), &raw mut *stdio::stderr);
     };
 
     match unsafe { find_option(*current_arg, optstring) } {
         Some(GetoptOption::Flag) => {
             update_current_opt();
 
-            unsafe { *current_arg as c_int }
+            unsafe { c_int::from(*current_arg) }
         }
         Some(GetoptOption::OptArg) => unsafe {
-            CURRENT_OPT = b"\0".as_ptr() as _;
-            if *current_arg.offset(1) == 0 {
+            CURRENT_OPT = c"".as_ptr().cast_mut();
+            if *current_arg.add(1) == 0 {
                 optind += 2;
                 if optind > argc {
                     CURRENT_OPT = ptr::null_mut();
 
-                    optopt = *current_arg as c_int;
-                    let errch = if *optstring == b':' as c_char {
+                    optopt = c_int::from(*current_arg);
+                    let errch = if *optstring == ByteLiteral::cast_cchar(b':') {
                         b':'
                     } else {
                         if opterr != 0 {
@@ -191,17 +193,17 @@ unsafe fn parse_arg(
 
                         b'?'
                     };
-                    errch as c_int
+                    c_int::from(errch)
                 } else {
                     optarg = *argv.offset(optind as isize - 1);
 
-                    *current_arg as c_int
+                    c_int::from(*current_arg)
                 }
             } else {
-                optarg = current_arg.offset(1);
+                optarg = current_arg.add(1);
                 optind += 1;
 
-                *current_arg as c_int
+                c_int::from(*current_arg)
             }
         },
         None => {
@@ -213,9 +215,9 @@ unsafe fn parse_arg(
             update_current_opt();
 
             unsafe {
-                optopt = *current_arg as c_int;
+                optopt = c_int::from(*current_arg);
             }
-            b'?' as c_int
+            c_int::from(b'?')
         }
     }
 }
@@ -230,7 +232,7 @@ unsafe fn find_option(ch: c_char, optstring: *const c_char) -> Option<GetoptOpti
 
     while unsafe { *optstring.offset(i) != 0 } {
         if unsafe { *optstring.offset(i) == ch } {
-            let result = if unsafe { *optstring.offset(i + 1) == b':' as c_char } {
+            let result = if unsafe { *optstring.offset(i + 1) == ByteLiteral::cast_cchar(b':') } {
                 GetoptOption::OptArg
             } else {
                 GetoptOption::Flag

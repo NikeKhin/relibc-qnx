@@ -1,5 +1,5 @@
-use super::{siginfo_t, sigset_t, stack_t};
-use crate::platform::types::*;
+use super::{sigset_t, stack_t};
+use crate::platform::types::{c_longlong, c_uchar, c_uint, c_ulong, c_ulonglong, c_ushort};
 use core::arch::global_asm;
 
 // Needs to be defined in assembly because it can't have a function prologue
@@ -34,146 +34,90 @@ global_asm!(
 "
 );
 
-pub const SIGHUP: usize = 1;
-pub const SIGINT: usize = 2;
-pub const SIGQUIT: usize = 3;
-pub const SIGILL: usize = 4;
-pub const SIGTRAP: usize = 5;
-pub const SIGABRT: usize = 6;
-pub const SIGIOT: usize = SIGABRT;
-pub const SIGBUS: usize = 7;
-pub const SIGFPE: usize = 8;
-pub const SIGKILL: usize = 9;
-pub const SIGUSR1: usize = 10;
-pub const SIGSEGV: usize = 11;
-pub const SIGUSR2: usize = 12;
-pub const SIGPIPE: usize = 13;
-pub const SIGALRM: usize = 14;
-pub const SIGTERM: usize = 15;
-pub const SIGSTKFLT: usize = 16;
-pub const SIGCHLD: usize = 17;
-pub const SIGCONT: usize = 18;
-pub const SIGSTOP: usize = 19;
-pub const SIGTSTP: usize = 20;
-pub const SIGTTIN: usize = 21;
-pub const SIGTTOU: usize = 22;
-pub const SIGURG: usize = 23;
-pub const SIGXCPU: usize = 24;
-pub const SIGXFSZ: usize = 25;
-pub const SIGVTALRM: usize = 26;
-pub const SIGPROF: usize = 27;
-pub const SIGWINCH: usize = 28;
-pub const SIGIO: usize = 29;
-pub const SIGPOLL: usize = SIGIO;
-pub const SIGPWR: usize = 30;
-pub const SIGSYS: usize = 31;
-pub const SIGUNUSED: usize = SIGSYS;
-pub const NSIG: usize = 32;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man7/signal.7.html>.
+///
+/// IOT trap. A synonym for `SIGABRT`.
+pub const SIGIOT: usize = super::constants::SIGABRT;
+// TODO mark #[deprecated]?
+/// Obsolete in issue 7, removed in issue 8.
+///
+/// Pollable event.
+/// Default action: T
+pub const SIGPOLL: usize = super::constants::SIGIO;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man7/signal.7.html>.
+///
+/// Synonymous with `SIGSYS`.
+pub const SIGUNUSED: usize = super::constants::SIGSYS;
 
-pub const SIGRTMIN: usize = 35; // TODO: decrease to 34
-pub const SIGRTMAX: usize = 64;
-
+// Below SA_* constants cannot share the same values as Redox for implementation reasons.
+/// Do not generate `SIGCHLD` when children stop or stopped children continue.
 pub const SA_NOCLDSTOP: usize = 1;
-pub const SA_NOCLDWAIT: usize = 2;
+/// Causes extra information to be passed to signal handlers at the time of
+/// receipt of a signal.
 pub const SA_SIGINFO: usize = 4;
+/// Process is executing on an alternate signal stack.
 pub const SA_ONSTACK: usize = 0x0800_0000;
+/// Causes certain functions to become restartable.
 pub const SA_RESTART: usize = 0x1000_0000;
+/// Causes signal not to be automatically blocked on entry to signal handler.
 pub const SA_NODEFER: usize = 0x4000_0000;
+/// Causes signal dispositions to be set to `SIG_DFL` on entry to signal
+/// handlers.
 pub const SA_RESETHAND: usize = 0x8000_0000;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man2/sigaction.2.html>.
+///
+/// Not intended for application use. Used by C libraries to indicate that the
+/// `sa_restorer` field contains the address of a "signal trampoline".
 pub const SA_RESTORER: usize = 0x0400_0000;
-
-pub const SS_ONSTACK: usize = 1;
-pub const SS_DISABLE: usize = 2;
-
-// Those two should be updated from kernel headers
-pub const MINSIGSTKSZ: usize = 2048;
-pub const SIGSTKSZ: usize = 8096;
-
-pub const SI_QUEUE: i32 = -1;
-pub const SI_USER: i32 = 0;
-pub const SI_TIMER: i32 = 1;
-pub const SI_ASYNCIO: i32 = 2;
-pub const SI_MESGQ: i32 = 3;
-
-// si_code values (signal-specific)
-pub const ILL_ILLOPC: i32 = 1;
-pub const ILL_ILLOPN: i32 = 2;
-pub const ILL_ILLADR: i32 = 3;
-pub const ILL_ILLTRP: i32 = 4;
-pub const ILL_PRVOPC: i32 = 5;
-pub const ILL_PRVREG: i32 = 6;
-pub const ILL_COPROC: i32 = 7;
-pub const ILL_BADSTK: i32 = 8;
-
-pub const FPE_INTDIV: i32 = 1;
-pub const FPE_INTOVF: i32 = 2;
-pub const FPE_FLTDIV: i32 = 3;
-pub const FPE_FLTOVF: i32 = 4;
-pub const FPE_FLTUND: i32 = 5;
-pub const FPE_FLTRES: i32 = 6;
-pub const FPE_FLTINV: i32 = 7;
-pub const FPE_FLTSUB: i32 = 8;
-
-pub const SEGV_MAPERR: i32 = 1;
-pub const SEGV_ACCERR: i32 = 2;
-
-pub const BUS_ADRALN: i32 = 1;
-pub const BUS_ADRERR: i32 = 2;
-pub const BUS_OBJERR: i32 = 3;
-
-pub const TRAP_BRKPT: i32 = 1;
-pub const TRAP_TRACE: i32 = 2;
-
-pub const CLD_EXITED: i32 = 1;
-pub const CLD_KILLED: i32 = 2;
-pub const CLD_DUMPED: i32 = 3;
-pub const CLD_TRAPPED: i32 = 4;
-pub const CLD_STOPPED: i32 = 5;
-pub const CLD_CONTINUED: i32 = 6;
 
 // Mirrors the ucontext_t struct from the libc crate on Linux.
 
 pub(crate) type ucontext_t = ucontext;
+/// A machine-specific representation of the saved context.
 pub(crate) type mcontext_t = mcontext;
 
 #[repr(C)]
 pub struct ucontext {
     pub uc_flags: c_ulong,
+    /// Pointer to the context that is resumed when this context returns.
     pub uc_link: *mut ucontext_t,
+    /// The stack used by this context.
     pub uc_stack: stack_t,
+    /// A machine-specific representation of the saved context.
     pub uc_mcontext: mcontext_t,
+    /// The set of signals that are blocked when this context is active.
     pub uc_sigmask: sigset_t,
-    __private: [u8; 512],
+    __private: [c_uchar; 512],
 }
 
 #[repr(C)]
 pub struct _libc_fpstate {
-    pub cwd: u16,
-    pub swd: u16,
-    pub ftw: u16,
-    pub fop: u16,
-    pub rip: u64,
-    pub rdp: u64,
-    pub mxcsr: u32,
-    pub mxcr_mask: u32,
+    pub cwd: c_ushort,
+    pub swd: c_ushort,
+    pub ftw: c_ushort,
+    pub fop: c_ushort,
+    pub rip: c_ulonglong,
+    pub rdp: c_ulonglong,
+    pub mxcsr: c_uint,
+    pub mxcr_mask: c_uint,
     pub _st: [_libc_fpxreg; 8],
     pub _xmm: [_libc_xmmreg; 16],
-    __private: [u64; 12],
+    __private: [c_ulonglong; 12],
 }
 #[repr(C)]
 pub struct _libc_fpxreg {
-    pub significand: [u16; 4],
-    pub exponent: u16,
-    __private: [u16; 3],
+    pub significand: [c_ushort; 4],
+    pub exponent: c_ushort,
+    __private: [c_ushort; 3],
 }
 
 #[repr(C)]
 pub struct _libc_xmmreg {
-    pub element: [u32; 4],
+    pub element: [c_uint; 4],
 }
 #[repr(C)]
 pub struct mcontext {
-    pub gregs: [i64; 23], // TODO: greg_t?
+    pub gregs: [c_longlong; 23], // TODO: greg_t?
     pub fpregs: *mut _libc_fpstate,
-    __private: [u64; 8],
+    __private: [c_ulonglong; 8],
 }

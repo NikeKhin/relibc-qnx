@@ -2,48 +2,66 @@
 //!
 //! See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/poll.h.html>.
 
-// TODO: set this for entire crate when possible
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use core::{mem, ptr, slice};
 
 use crate::{
-    error::ResultExt,
+    error::Errno,
     fs::File,
     header::{
-        signal::sigset_t,
+        bits_sigset_t::sigset_t,
+        errno::{EBADF, EINTR},
         sys_epoll::{
             EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLNVAL, EPOLLOUT,
-            EPOLLPRI, EPOLLRDBAND, EPOLLRDNORM, EPOLLWRBAND, EPOLLWRNORM, epoll_create1, epoll_ctl,
-            epoll_data, epoll_event, epoll_pwait,
+            EPOLLPRI, EPOLLRDBAND, EPOLLRDNORM, EPOLLWRBAND, EPOLLWRNORM, epoll_data, epoll_event,
         },
         time::timespec,
     },
-    platform::types::{c_int, c_short, c_ulong},
+    platform::{
+        ERRNO, PalEpoll, Sys,
+        types::{c_int, c_short, c_ulong},
+    },
 };
 
+/// Data other than high-priority data may be read without blocking.
 pub const POLLIN: c_short = 0x001;
+/// High-priority data may be read without blocking.
 pub const POLLPRI: c_short = 0x002;
+/// Normal data may be written without blocking.
 pub const POLLOUT: c_short = 0x004;
+/// An error has occurred (revents only).
 pub const POLLERR: c_short = 0x008;
+/// Device has been disconnected (revents only).
 pub const POLLHUP: c_short = 0x010;
+/// Invalid fd member (revents only).
 pub const POLLNVAL: c_short = 0x020;
+/// Normal data may be read without blocking.
 pub const POLLRDNORM: c_short = 0x040;
+/// Priority data may be read without blocking.
 pub const POLLRDBAND: c_short = 0x080;
+/// Equivalent to POLLOUT.
 pub const POLLWRNORM: c_short = 0x100;
+/// Priority data may be written.
 pub const POLLWRBAND: c_short = 0x200;
 
+/// An unsigned integer type used for the number of file descriptors.
+#[allow(non_camel_case_types)]
 pub type nfds_t = c_ulong;
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/poll.h.html>.
+///
+/// A structure storing a file descriptor along with input and output flags for poll operations.
+#[allow(non_camel_case_types)]
 #[repr(C)]
 pub struct pollfd {
+    /// The following descriptor being polled.
     pub fd: c_int,
+    /// The input event flags.
     pub events: c_short,
+    /// The output event flags.
     pub revents: c_short,
 }
 
-pub fn poll_epoll(fds: &mut [pollfd], timeout: c_int, sigmask: *const sigset_t) -> c_int {
+pub unsafe fn poll_epoll(fds: &mut [pollfd], timeout: c_int, sigmask: *const sigset_t) -> c_int {
     let event_map = [
         (POLLIN, EPOLLIN),
         (POLLPRI, EPOLLPRI),
@@ -58,27 +76,28 @@ pub fn poll_epoll(fds: &mut [pollfd], timeout: c_int, sigmask: *const sigset_t) 
     ];
 
     let ep = {
-        let epfd = epoll_create1(EPOLL_CLOEXEC);
-        if epfd < 0 {
-            return -1;
-        }
+        let epfd = match Sys::epoll_create1(EPOLL_CLOEXEC) {
+            Ok(epfd) => epfd,
+            Err(Errno(err)) => {
+                ERRNO.set(err);
+                return -1;
+            }
+        };
         File::new(epfd)
     };
 
-    for i in 0..fds.len() {
-        let mut pfd = &mut fds[i];
+    let mut closed = 0;
+    for (i, fd) in fds.iter_mut().enumerate() {
+        let pfd = fd;
 
-        // Ignore the entry with negative fd, set the revents to 0
+        pfd.revents = 0;
+
+        // Ignore the entry with negative fd
         if pfd.fd < 0 {
-            pfd.revents = 0;
             continue;
         }
 
-        let mut event = epoll_event {
-            events: 0,
-            data: epoll_data { u64: i as u64 },
-            ..Default::default()
-        };
+        let mut event = epoll_event::new(0, epoll_data { u64: i as u64 });
 
         for (p, ep) in event_map.iter() {
             if pfd.events & p > 0 {
@@ -86,35 +105,55 @@ pub fn poll_epoll(fds: &mut [pollfd], timeout: c_int, sigmask: *const sigset_t) 
             }
         }
 
-        pfd.revents = 0;
-
-        if unsafe { epoll_ctl(*ep, EPOLL_CTL_ADD, pfd.fd, &mut event) } < 0 {
-            return -1;
+        match unsafe { Sys::epoll_ctl(*ep, EPOLL_CTL_ADD, pfd.fd, &raw mut event) } {
+            Ok(()) => {}
+            Err(Errno(EBADF)) => {
+                pfd.revents |= POLLNVAL;
+                closed += 1;
+            }
+            Err(Errno(err)) => {
+                ERRNO.set(err);
+                return -1;
+            }
         }
     }
 
+    // Early exit if there are fds, and all are closed (revents = POLLNVAL)
+    if closed > 0 && closed == fds.len() {
+        // TODO should we panic if fd.len() is greater than i32::MAX instead?
+        // seems unlikely we'll be dealing with that many file descriptors
+        return i32::try_from(closed).unwrap_or(i32::MAX);
+    }
+
     let mut events: [epoll_event; 32] = unsafe { mem::zeroed() };
-    let res = unsafe {
-        epoll_pwait(
+    match unsafe {
+        Sys::epoll_pwait(
             *ep,
             events.as_mut_ptr(),
-            events.len() as c_int,
+            c_int::try_from(events.len()).expect("events len below i32::MAX"),
             timeout,
             sigmask,
         )
-    };
-    if res < 0 {
-        return -1;
-    }
-
-    for event in events.iter().take(res as usize) {
-        let pi = unsafe { event.data.u64 as usize };
-        // TODO: Error status when fd does not match?
-        if let Some(pfd) = fds.get_mut(pi) {
-            for (p, ep) in event_map.iter() {
-                if event.events & ep > 0 {
-                    pfd.revents |= p;
+    } {
+        Ok(res) => {
+            for event in events.iter().take(res) {
+                let pi = unsafe { event.data.u64 as usize };
+                // TODO: Error status when fd does not match?
+                if let Some(pfd) = fds.get_mut(pi) {
+                    for (p, ep) in event_map.iter() {
+                        if event.events & ep > 0 {
+                            pfd.revents |= p;
+                        }
+                    }
                 }
+            }
+        }
+        Err(Errno(err)) => {
+            if err == EINTR && closed > 0 {
+                // some fds are closed by signal
+            } else {
+                ERRNO.set(err);
+                return -1;
             }
         }
     }
@@ -129,14 +168,25 @@ pub fn poll_epoll(fds: &mut [pollfd], timeout: c_int, sigmask: *const sigset_t) 
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/poll.html>.
+///
+/// Provides applications with a mechanism for multiplexing input/output
+/// over a set of file descriptors.
+///
+/// - The `timeout` parameter represents milliseconds.
+/// - A `timeout` of `-1` is equivalent to passing a null pointer for `tmo_p` to `ppoll`.
+/// - `poll` should behave equivalent to `ppoll` with a null pointer for `sigmask`.
+///
+/// Note: Uses epoll internally.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) -> c_int {
     trace_expr!(
-        poll_epoll(
-            unsafe { slice::from_raw_parts_mut(fds, nfds as usize) },
-            timeout,
-            ptr::null_mut()
-        ),
+        unsafe {
+            poll_epoll(
+                slice::from_raw_parts_mut(fds, nfds as usize),
+                timeout,
+                ptr::null_mut(),
+            )
+        },
         "poll({:p}, {}, {})",
         fds,
         nfds,
@@ -145,6 +195,14 @@ pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: nfds_t, timeout: c_int) ->
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/ppoll.html>.
+///
+/// Provides applications with a mechanism for multiplexing input/output
+/// over a set of file descriptors.
+///
+/// - The `tmo_p` parameter is the timeout as represented by a `timespec` struct.
+/// - Passing a null pointer for timeout is equivalent to `-1` for `timeout` to `poll`.
+///
+/// Note: Uses epoll internally.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ppoll(
     fds: *mut pollfd,
@@ -156,15 +214,20 @@ pub unsafe extern "C" fn ppoll(
         -1
     } else {
         let tmo = unsafe { &*tmo_p };
-        //TODO: handle overflow
-        ((tmo.tv_sec as c_int) * 1000) + ((tmo.tv_nsec as c_int) / 1000000)
+        if tmo.tv_sec > (c_int::MAX / 1000).into() {
+            c_int::MAX
+        } else {
+            ((tmo.tv_sec as c_int) * 1000) + ((tmo.tv_nsec as c_int) / 1000000)
+        }
     };
     trace_expr!(
-        poll_epoll(
-            unsafe { slice::from_raw_parts_mut(fds, nfds as usize) },
-            timeout,
-            sigmask
-        ),
+        unsafe {
+            poll_epoll(
+                slice::from_raw_parts_mut(fds, nfds as usize),
+                timeout,
+                sigmask,
+            )
+        },
         "ppoll({:p}, {}, {:p}, {:p})",
         fds,
         nfds,

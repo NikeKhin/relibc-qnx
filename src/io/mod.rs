@@ -365,7 +365,7 @@ fn read_to_end_with_reservation<R: Read + ?Sized>(
     let start_len = buf.len();
     let mut g = Guard {
         len: buf.len(),
-        buf: buf,
+        buf,
     };
     let ret;
     loop {
@@ -546,7 +546,7 @@ pub trait Read {
     ///     let mut buffer = [0; 10];
     ///
     ///     // read up to 10 bytes
-    ///     f.read(&mut buffer[..])?;
+    ///     f.read(&mut buffer.as_slice())?;
     ///     Ok(())
     /// }
     /// ```
@@ -916,10 +916,7 @@ pub trait Read {
     where
         Self: Sized,
     {
-        Take {
-            inner: self,
-            limit: limit,
-        }
+        Take { inner: self, limit }
     }
 }
 
@@ -1383,7 +1380,7 @@ impl<T: Read, U: Read> Read for Chain<T, U> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         if !self.done_first {
             match self.first.read(buf)? {
-                0 if buf.len() != 0 => {
+                0 if !buf.is_empty() => {
                     self.done_first = true;
                 }
                 n => return Ok(n),
@@ -1393,11 +1390,11 @@ impl<T: Read, U: Read> Read for Chain<T, U> {
     }
 
     unsafe fn initializer(&self) -> Initializer {
-        let initializer = self.first.initializer();
+        let initializer = unsafe { self.first.initializer() };
         if initializer.should_initialize() {
             initializer
         } else {
-            self.second.initializer()
+            unsafe { self.second.initializer() }
         }
     }
 }
@@ -1406,7 +1403,7 @@ impl<T: BufRead, U: BufRead> BufRead for Chain<T, U> {
     fn fill_buf(&mut self) -> Result<&[u8]> {
         if !self.done_first {
             match self.first.fill_buf()? {
-                buf if buf.len() == 0 => {
+                [] => {
                     self.done_first = true;
                 }
                 buf => return Ok(buf),
@@ -1586,7 +1583,7 @@ impl<T: Read> Read for Take<T> {
     }
 
     unsafe fn initializer(&self) -> Initializer {
-        self.inner.initializer()
+        unsafe { self.inner.initializer() }
     }
 
     fn read_to_end(&mut self, buf: &mut Vec<u8>) -> Result<usize> {
@@ -2035,12 +2032,12 @@ mod tests {
     #[test]
     #[cfg_attr(target_os = "emscripten", ignore)]
     fn read_until() {
-        let mut buf = Cursor::new(&b"12"[..]);
+        let mut buf = Cursor::new(b"12".as_slice());
         let mut v = Vec::new();
         assert_eq!(buf.read_until(b'3', &mut v).unwrap(), 2);
         assert_eq!(v, b"12");
 
-        let mut buf = Cursor::new(&b"1233"[..]);
+        let mut buf = Cursor::new(b"1233".as_slice());
         let mut v = Vec::new();
         assert_eq!(buf.read_until(b'3', &mut v).unwrap(), 3);
         assert_eq!(v, b"123");
@@ -2054,12 +2051,12 @@ mod tests {
 
     #[test]
     fn split() {
-        let buf = Cursor::new(&b"12"[..]);
+        let buf = Cursor::new(b"12".as_slice());
         let mut s = buf.split(b'3');
         assert_eq!(s.next().unwrap().unwrap(), vec![b'1', b'2']);
         assert!(s.next().is_none());
 
-        let buf = Cursor::new(&b"1233"[..]);
+        let buf = Cursor::new(b"1233".as_slice());
         let mut s = buf.split(b'3');
         assert_eq!(s.next().unwrap().unwrap(), vec![b'1', b'2']);
         assert_eq!(s.next().unwrap().unwrap(), vec![]);
@@ -2068,12 +2065,12 @@ mod tests {
 
     #[test]
     fn read_line() {
-        let mut buf = Cursor::new(&b"12"[..]);
+        let mut buf = Cursor::new(b"12".as_slice());
         let mut v = String::new();
         assert_eq!(buf.read_line(&mut v).unwrap(), 2);
         assert_eq!(v, "12");
 
-        let mut buf = Cursor::new(&b"12\n\n"[..]);
+        let mut buf = Cursor::new(b"12\n\n".as_slice());
         let mut v = String::new();
         assert_eq!(buf.read_line(&mut v).unwrap(), 3);
         assert_eq!(v, "12\n");
@@ -2087,12 +2084,12 @@ mod tests {
 
     // #[test]
     // fn lines() {
-    //     let buf = Cursor::new(&b"12\r"[..]);
+    //     let buf = Cursor::new(b"12\r".as_slice());
     //     let mut s = buf.lines();
     //     assert_eq!(s.next().unwrap().unwrap(), "12\r".to_string());
     //     assert!(s.next().is_none());
 
-    //     let buf = Cursor::new(&b"12\r\n\n"[..]);
+    //     let buf = Cursor::new(b"12\r\n\n".as_slice());
     //     let mut s = buf.lines();
     //     assert_eq!(s.next().unwrap().unwrap(), "12".to_string());
     //     assert_eq!(s.next().unwrap().unwrap(), "".to_string());
@@ -2101,12 +2098,12 @@ mod tests {
 
     #[test]
     fn read_to_end() {
-        let mut c = Cursor::new(&b""[..]);
+        let mut c = Cursor::new(b"".as_slice());
         let mut v = Vec::new();
         assert_eq!(c.read_to_end(&mut v).unwrap(), 0);
         assert_eq!(v, []);
 
-        let mut c = Cursor::new(&b"1"[..]);
+        let mut c = Cursor::new(b"1".as_slice());
         let mut v = Vec::new();
         assert_eq!(c.read_to_end(&mut v).unwrap(), 1);
         assert_eq!(v, b"1");
@@ -2122,17 +2119,17 @@ mod tests {
 
     #[test]
     fn read_to_string() {
-        let mut c = Cursor::new(&b""[..]);
+        let mut c = Cursor::new(b"".as_slice());
         let mut v = String::new();
         assert_eq!(c.read_to_string(&mut v).unwrap(), 0);
         assert_eq!(v, "");
 
-        let mut c = Cursor::new(&b"1"[..]);
+        let mut c = Cursor::new(b"1".as_slice());
         let mut v = String::new();
         assert_eq!(c.read_to_string(&mut v).unwrap(), 1);
         assert_eq!(v, "1");
 
-        let mut c = Cursor::new(&b"\xff"[..]);
+        let mut c = Cursor::new(b"\xff".as_slice());
         let mut v = String::new();
         assert!(c.read_to_string(&mut v).is_err());
     }
@@ -2141,17 +2138,17 @@ mod tests {
     fn read_exact() {
         let mut buf = [0; 4];
 
-        let mut c = Cursor::new(&b""[..]);
+        let mut c = Cursor::new(b"".as_slice());
         assert_eq!(
             c.read_exact(&mut buf).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
 
-        let mut c = Cursor::new(&b"123"[..]).chain(Cursor::new(&b"456789"[..]));
+        let mut c = Cursor::new(b"123".as_slice()).chain(Cursor::new(b"456789".as_slice()));
         c.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"1234");
+        assert_eq!(buf, *b"1234");
         c.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"5678");
+        assert_eq!(buf, *b"5678");
         assert_eq!(
             c.read_exact(&mut buf).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
@@ -2162,27 +2159,27 @@ mod tests {
     fn read_exact_slice() {
         let mut buf = [0; 4];
 
-        let mut c = &b""[..];
+        let mut c = b"".as_slice();
         assert_eq!(
             c.read_exact(&mut buf).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
 
-        let mut c = &b"123"[..];
+        let mut c = b"123".as_slice();
         assert_eq!(
             c.read_exact(&mut buf).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
         // make sure the optimized (early returning) method is being used
-        assert_eq!(&buf, &[0; 4]);
+        assert_eq!(buf, [0; 4]);
 
-        let mut c = &b"1234"[..];
+        let mut c = b"1234".as_slice();
         c.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"1234");
+        assert_eq!(buf, *b"1234");
 
-        let mut c = &b"56789"[..];
+        let mut c = b"56789".as_slice();
         c.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"5678");
+        assert_eq!(buf, *b"5678");
         assert_eq!(c, b"9");
     }
 
@@ -2230,7 +2227,7 @@ mod tests {
         }
         assert_eq!(br1.fill_buf().unwrap().len(), 0);
         assert_eq!(br2.fill_buf().unwrap().len(), 0);
-        assert_eq!(&cat[..], &exp[..])
+        assert_eq!(&cat, &exp)
     }
 
     #[test]
@@ -2243,7 +2240,7 @@ mod tests {
         let chain2 = (&testdata[..4])
             .chain(&testdata[4..8])
             .chain(&testdata[8..]);
-        cmp_bufread(chain1, chain2, &testdata[..]);
+        cmp_bufread(chain1, chain2, testdata.as_slice());
     }
 
     #[test]
@@ -2251,7 +2248,7 @@ mod tests {
         let a = b"A";
         let b = b"B";
         let mut s = String::new();
-        let mut chain = (&a[..]).chain(&b[..]);
+        let mut chain = a.chain(b.as_slice());
         chain.read(&mut []).unwrap();
         chain.read_to_string(&mut s).unwrap();
         assert_eq!("AB", s);

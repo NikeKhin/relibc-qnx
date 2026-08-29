@@ -1,6 +1,6 @@
 //! A part of the ptrace compatibility for Redox OS
 
-use crate::platform::types::*;
+use crate::platform::types::{c_char, c_int, c_long, c_ulong};
 
 #[repr(C)]
 pub struct user_fpregs_struct {
@@ -50,7 +50,7 @@ pub struct user_regs_struct {
 
 pub type elf_greg_t = c_ulong;
 
-pub type elf_gregset_t = [c_ulong; 27];
+pub type elf_gregset_t = *mut [c_ulong; 27];
 pub type elf_fpregset_t = user_fpregs_struct;
 #[repr(C)]
 pub struct user {
@@ -69,15 +69,4 @@ pub struct user {
     pub magic: c_ulong,
     pub u_comm: [c_char; 32],
     pub u_debugreg: [c_ulong; 8],
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn _cbindgen_export_x86_user(
-    a: user_fpregs_struct,
-    b: user_regs_struct,
-    c: user,
-    d: elf_gregset_t,
-    e: elf_greg_t,
-    f: elf_fpregset_t,
-) {
 }

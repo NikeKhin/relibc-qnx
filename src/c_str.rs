@@ -1,13 +1,10 @@
 //! Nul-terminated byte strings.
 
-use core::{marker::PhantomData, ptr::NonNull, str::Utf8Error};
+use core::{alloc::Layout, marker::PhantomData, ptr::NonNull, str::Utf8Error};
 
-use alloc::{
-    borrow::{Cow, ToOwned},
-    string::String,
-};
+use alloc::{borrow::Cow, boxed::Box, string::String};
 
-use crate::platform::types::{c_char, c_int, wchar_t};
+use crate::platform::types::{c_char, wchar_t};
 
 mod private {
     pub trait Sealed {}
@@ -49,13 +46,13 @@ impl Kind for Thin {
     const IS_THIN_NOT_WIDE: bool = true;
 
     unsafe fn strlen(s: *const c_char) -> usize {
-        crate::header::string::strlen(s)
+        unsafe { crate::header::string::strlen(s) }
     }
     unsafe fn strchr(s: *const c_char, c: c_char) -> *const c_char {
-        crate::header::string::strchr(s, c.into())
+        unsafe { crate::header::string::strchr(s, c.into()) }
     }
     unsafe fn strchrnul(s: *const c_char, c: c_char) -> *const c_char {
-        crate::header::string::strchrnul(s, c.into())
+        unsafe { crate::header::string::strchrnul(s, c.into()) }
     }
     fn r2c(c: u8) -> c_char {
         c as _
@@ -78,15 +75,15 @@ impl Kind for Wide {
     const IS_THIN_NOT_WIDE: bool = false;
 
     unsafe fn strlen(s: *const Self::C) -> usize {
-        crate::header::wchar::wcslen(s)
+        unsafe { crate::header::wchar::wcslen(s) }
     }
     unsafe fn strchr(s: *const Self::C, c: Self::C) -> *const Self::C {
-        crate::header::wchar::wcschr(s, c)
+        unsafe { crate::header::wchar::wcschr(s, c) }
     }
     unsafe fn strchrnul(mut s: *const Self::C, c: Self::C) -> *const Self::C {
         // TODO: optimized function
-        while s.read() != c && s.read() != 0 {
-            s = s.add(1);
+        while unsafe { s.read() } != c && unsafe { s.read() } != 0 {
+            s = unsafe { s.add(1) };
         }
         s
     }
@@ -96,10 +93,10 @@ impl Kind for Wide {
     fn c2r(c: Self::C) -> Self::Char {
         c as _
     }
-    fn chars_from_bytes(b: &[u8]) -> Option<&[Self::Char]> {
+    fn chars_from_bytes(_: &[u8]) -> Option<&[Self::Char]> {
         None
     }
-    fn chars_to_bytes(c: &[Self::Char]) -> Option<&[u8]> {
+    fn chars_to_bytes(_: &[Self::Char]) -> Option<&[u8]> {
         None
     }
 }
@@ -120,7 +117,7 @@ impl<'a, T: Kind> NulStr<'a, T> {
     /// The ptr must be valid up to and including the first NUL byte from the base ptr.
     pub const unsafe fn from_ptr(ptr: *const T::C) -> Self {
         Self {
-            ptr: NonNull::new_unchecked(ptr as *mut T::C),
+            ptr: unsafe { NonNull::new_unchecked(ptr.cast_mut()) },
             _marker: PhantomData,
         }
     }
@@ -128,11 +125,12 @@ impl<'a, T: Kind> NulStr<'a, T> {
         if ptr.is_null() {
             None
         } else {
-            Some(Self::from_ptr(ptr))
+            Some(unsafe { Self::from_ptr(ptr) })
         }
     }
     /// Look for the closest occurence of `c`, and if found, split the string into a slice up to
     /// that byte and a `CStr` starting at that byte.
+    #[allow(clippy::type_complexity)]
     #[inline]
     #[doc(alias = "strchrnul")]
     pub fn find_get_subslice_or_all(
@@ -242,7 +240,7 @@ impl<'a, T: Kind> NulStr<'a, T> {
         self.ptr.as_ptr()
     }
     pub const unsafe fn from_chars_with_nul_unchecked(chars: &'a [T::Char]) -> Self {
-        Self::from_ptr(chars.as_ptr().cast())
+        unsafe { Self::from_ptr(chars.as_ptr().cast()) }
     }
     pub fn from_chars_with_nul(chars: &'a [T::Char]) -> Result<Self, FromCharsWithNulError> {
         if chars.last() != Some(&T::NUL) || chars[..chars.len() - 1].contains(&T::NUL) {
@@ -261,6 +259,7 @@ impl<'a, T: Kind> NulStr<'a, T> {
     /// Scan the string to get its length.
     #[doc(alias = "strlen")]
     #[doc(alias = "wcslen")]
+    #[expect(clippy::len_without_is_empty, reason = "len() signature intentional")]
     pub fn len(self) -> usize {
         self.to_chars().len()
     }
@@ -271,7 +270,7 @@ impl<'a, T: Kind> NulStr<'a, T> {
 }
 impl<'a> CStr<'a> {
     pub fn to_owned_cstring(self) -> CString {
-        CString::from(unsafe { core::ffi::CStr::from_ptr(self.ptr.as_ptr()) })
+        CString::from(self.to_cstr())
     }
     pub fn borrow(string: &'a CString) -> Self {
         unsafe { Self::from_ptr(string.as_ptr()) }
@@ -287,12 +286,15 @@ impl<'a> CStr<'a> {
     pub fn to_str(self) -> Result<&'a str, Utf8Error> {
         core::str::from_utf8(self.to_bytes())
     }
+    pub fn to_cstr(self) -> &'a core::ffi::CStr {
+        unsafe { core::ffi::CStr::from_ptr(self.ptr.as_ptr()) }
+    }
     pub fn to_string_lossy(self) -> Cow<'a, str> {
         String::from_utf8_lossy(self.to_bytes())
     }
     #[inline]
     pub const unsafe fn from_bytes_with_nul_unchecked(bytes: &'a [u8]) -> Self {
-        Self::from_chars_with_nul_unchecked(bytes)
+        unsafe { Self::from_chars_with_nul_unchecked(bytes) }
     }
     #[inline]
     pub fn from_bytes_with_nul(bytes: &'a [u8]) -> Result<Self, FromCharsWithNulError> {
@@ -323,3 +325,56 @@ pub struct FromCharsWithNulError;
 pub struct FromCharsUntilNulError;
 
 pub use alloc::ffi::CString;
+
+/// Owned variant of CStr, allocated by the global allocator used by Rust (which currently is the
+/// same as malloc/free for relibc).
+#[repr(transparent)]
+pub struct OwnedThinCStr {
+    ptr: NonNull<c_char>,
+}
+impl OwnedThinCStr {
+    #[inline]
+    pub const unsafe fn from_ptr(ptr: *mut c_char) -> Self {
+        Self {
+            ptr: unsafe { NonNull::new_unchecked(ptr) },
+        }
+    }
+    #[inline]
+    pub unsafe fn from_nullable_ptr(ptr: *mut c_char) -> Option<Self> {
+        Some(Self {
+            ptr: NonNull::new(ptr)?,
+        })
+    }
+    #[inline]
+    pub const fn as_cstr(&self) -> CStr<'_> {
+        unsafe { CStr::from_ptr(self.ptr.as_ptr()) }
+    }
+    pub const fn into_ptr(self) -> *mut c_char {
+        let ptr = self.ptr.as_ptr();
+        core::mem::forget(self);
+        ptr
+    }
+}
+impl From<CString> for OwnedThinCStr {
+    fn from(value: CString) -> Self {
+        unsafe { Self::from_ptr(value.into_raw()) }
+    }
+}
+impl From<CStr<'_>> for OwnedThinCStr {
+    fn from(value: CStr<'_>) -> Self {
+        let owned = Box::<[u8]>::from(value.to_bytes());
+        unsafe { Self::from_ptr(Box::into_raw(owned).as_mut_ptr().cast()) }
+    }
+}
+impl Drop for OwnedThinCStr {
+    fn drop(&mut self) {
+        unsafe {
+            // TODO: Getting the length can be ignored if we know it was allocated with malloc and
+            // (len-unaware) free. But the guarantee that the Rust and C allocators are identical
+            // in relibc, must be documented better in that case.
+            let len = CStr::from_ptr(self.ptr.as_ptr()).len();
+            let layout = Layout::array::<u8>(len).unwrap();
+            alloc::alloc::dealloc(self.ptr.as_ptr().cast(), layout);
+        }
+    }
+}

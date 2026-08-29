@@ -32,10 +32,11 @@ impl RawLineBuffer {
         }
     }
 
-    // Can't use iterators because we want to return a reference.
-    // See https://stackoverflow.com/a/30422716/5069285
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Line {
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "Can't use iterators because we want to return a reference, see https://stackoverflow.com/a/30422716/5069285"
+    )]
+    pub fn next(&mut self) -> Line<'_> {
         // Remove last line
         if let Some(newline) = self.newline {
             self.buf.drain(..=newline);
@@ -65,7 +66,7 @@ impl RawLineBuffer {
                 .map(|u| u as isize)
                 .or_minus_one_errno();
 
-            let read_usize = read.max(0) as usize;
+            let read_usize = read.max(0).cast_unsigned();
 
             // Remove all uninitialized memory that wasn't read
             unsafe {

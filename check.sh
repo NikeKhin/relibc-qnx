@@ -31,12 +31,6 @@ show_help() {
     echo "  TARGET              Sets the default target (overridden by --target)"
 }
 
-if ! command -v redoxer &> /dev/null; then
-    echo "Error: 'redoxer' CLI not found."
-    echo "Please install it: cargo install redoxer"
-    exit 1
-fi
-
 if ! command -v cbindgen &> /dev/null; then
     echo "Error: 'cbindgen' CLI not found."
     echo "Please install it: cargo install cbindgen"
@@ -74,6 +68,10 @@ while [[ $# -gt 0 ]]; do
         --cargo)
             CMD_ACTION="cargo"
             ;;
+        --clippy)
+            CMD_ACTION="cargo"
+            CARGO_ACTION="clippy"
+            ;;
         --host)
             CURRENT_TARGET="$(uname -m)-unknown-linux-gnu"
             IS_HOST=1
@@ -97,15 +95,21 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+if [ "$IS_HOST" -eq 0 ]; then
+if ! command -v redoxer &> /dev/null; then
+    echo "Error: 'redoxer' CLI not found."
+    echo "Please install it: cargo install redoxer"
+    exit 1
+fi
+fi
+
 run_redoxer() {
     export TARGET=$1
     REDOXER_ENV="redoxer env"
     if [ "$IS_HOST" -eq 0 ]; then
         redoxer toolchain || { echo -e "${RED}Fail: redoxer toolchain for: $target.${NC}" && exit 1; }
         export CARGO_TEST="redoxer"
-        export TEST_RUNNER="redoxer exec --folder ../sysroot/$TARGET/:/usr --folder . --"
-# TODO: Identify hang issue with pthread/barrier and pthread/once tests in multi core to get rid of this limit
-        export REDOXER_QEMU_ARGS="-smp 1"
+        export TEST_RUNNER="redoxer exec --folder ../../sysroot/$TARGET/:/usr --folder . --"
 
         MAKE_ACTION="$MAKE_ACTION IS_REDOX=1"
     else
@@ -123,7 +127,7 @@ run_redoxer() {
     if [ "$CMD_ACTION" == "make" ]; then
         CMD_OPT="-j $(nproc) $MAKE_ACTION"
     else
-        CMD_OPT="$CARGO_ACTION"
+        CMD_OPT="$CARGO_ACTION --target=$TARGET"
     fi
 
     echo "----------------------------------------"

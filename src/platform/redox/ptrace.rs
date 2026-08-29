@@ -4,9 +4,9 @@
 //! we are NOT going to bend our API for the sake of
 //! compatibility. So, this module will be a hellhole.
 
-use super::super::{ERRNO, Pal, PalPtrace, PalSignal, Sys, types::*};
-#[cfg(target_arch = "aarch64")]
-use crate::header::arch_aarch64_user::user_regs_struct;
+use super::super::{ERRNO, PalPtrace, Sys, types::*};
+#[cfg(target_arch = "x86_64")]
+use super::super::{Pal, PalSignal};
 #[cfg(target_arch = "x86_64")]
 use crate::header::arch_x64_user::user_regs_struct;
 use crate::{
@@ -15,15 +15,22 @@ use crate::{
     fs::File,
     header::{
         errno::{self as errnoh, EIO},
-        fcntl, signal, sys_ptrace,
+        fcntl,
     },
-    io::{self, prelude::*},
+    io,
     raw_cell::RawCell,
     sync::Mutex,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::{
+    header::{signal, sys_ptrace},
+    io::prelude::*,
+};
 
 use alloc::collections::{BTreeMap, btree_map::Entry};
+#[cfg(target_arch = "x86_64")]
 use core::mem;
+#[cfg(target_arch = "x86_64")]
 use syscall;
 
 pub struct Session {
@@ -53,7 +60,7 @@ pub fn init_state() -> &'static State {
         if STATE.unsafe_ref().is_none() {
             STATE.unsafe_set(Some(State::new()));
         }
-        let state_ptr = STATE.unsafe_ref().as_ref().unwrap() as *const State;
+        let state_ptr = core::ptr::from_ref::<State>(STATE.unsafe_ref().as_ref().unwrap());
         &*state_ptr
     }
 }
@@ -110,6 +117,7 @@ pub fn get_session(
 }
 
 #[cfg(target_arch = "aarch64")]
+#[expect(unused_variables, reason = "function not yet implemented")]
 unsafe fn inner_ptrace(
     request: c_int,
     pid: pid_t,
@@ -121,6 +129,7 @@ unsafe fn inner_ptrace(
 }
 
 #[cfg(target_arch = "x86")]
+#[expect(unused_variables, reason = "function not yet implemented")]
 unsafe fn inner_ptrace(
     request: c_int,
     pid: pid_t,
@@ -135,7 +144,7 @@ unsafe fn inner_ptrace(
 unsafe fn inner_ptrace(
     request: c_int,
     pid: pid_t,
-    addr: *mut c_void,
+    _addr: *mut c_void, // FIXME addr not used
     data: *mut c_void,
 ) -> io::Result<c_int> {
     let state = init_state();
@@ -161,7 +170,7 @@ unsafe fn inner_ptrace(
         | sys_ptrace::PTRACE_SYSCALL
         | sys_ptrace::PTRACE_SYSEMU
         | sys_ptrace::PTRACE_SYSEMU_SINGLESTEP => {
-            Sys::kill(pid, signal::SIGCONT as _);
+            if let Ok(()) = Sys::kill(pid, signal::SIGCONT as _) {}; // TODO handle error
 
             // TODO: Translate errors
             let syscall = syscall::PTRACE_STOP_PRE_SYSCALL | syscall::PTRACE_STOP_POST_SYSCALL;
@@ -186,7 +195,7 @@ unsafe fn inner_ptrace(
             Ok(0)
         }
         sys_ptrace::PTRACE_GETREGS => {
-            let c_regs = unsafe { &mut *(data as *mut user_regs_struct) };
+            let c_regs = unsafe { &mut *data.cast::<user_regs_struct>() };
             let mut redox_regs = syscall::IntRegisters::default();
             (&mut &session.regs).read(&mut redox_regs)?;
             *c_regs = user_regs_struct {
@@ -221,7 +230,7 @@ unsafe fn inner_ptrace(
             Ok(0)
         }
         sys_ptrace::PTRACE_SETREGS => {
-            let c_regs = unsafe { &*(data as *mut user_regs_struct) };
+            let c_regs = unsafe { &*data.cast::<user_regs_struct>() };
             let redox_regs = syscall::IntRegisters {
                 r15: c_regs.r15 as _,
                 r14: c_regs.r14 as _,
@@ -259,6 +268,7 @@ unsafe fn inner_ptrace(
 }
 
 #[cfg(target_arch = "riscv64")]
+#[expect(unused_variables, reason = "function not yet implemented")]
 fn inner_ptrace(
     request: c_int,
     pid: pid_t,
@@ -270,13 +280,14 @@ fn inner_ptrace(
 }
 
 impl PalPtrace for Sys {
+    #[allow(unused_unsafe)] // keeping inner unsafe fails x86_64, removing fails riscv cross-build
     unsafe fn ptrace(
         request: c_int,
         pid: pid_t,
         addr: *mut c_void,
         data: *mut c_void,
     ) -> Result<c_int, Errno> {
-        inner_ptrace(request, pid, addr, data)
+        unsafe { inner_ptrace(request, pid, addr, data) }
             .map_err(|err| Errno(err.raw_os_error().unwrap_or(EIO)))
     }
 }

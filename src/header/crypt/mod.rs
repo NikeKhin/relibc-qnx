@@ -2,16 +2,13 @@
 //!
 //! Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/crypt.3.html>.
 
-// TODO: set this for entire crate when possible
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use ::scrypt::password_hash::{Salt, SaltString};
 use alloc::{
     ffi::CString,
     string::{String, ToString},
 };
 use core::ptr;
-use rand::{RngCore, SeedableRng, rngs::SmallRng};
+use rand::{Rng, SeedableRng, rngs::SmallRng};
 
 use crate::{
     c_str::CStr,
@@ -49,6 +46,7 @@ pub struct crypt_data {
 }
 
 impl crypt_data {
+    #[expect(clippy::new_without_default)]
     pub fn new() -> Self {
         crypt_data {
             initialized: 1,
@@ -75,12 +73,11 @@ pub unsafe extern "C" fn crypt_r(
         unsafe { *data = crypt_data::new() };
     }
 
-    let key = unsafe { CStr::from_ptr(key) }
-        .to_str()
-        .expect("key must be utf-8");
-    let setting = unsafe { CStr::from_ptr(setting) }
-        .to_str()
-        .expect("setting must be utf-8");
+    let key = unsafe { CStr::from_ptr(key) }.to_bytes();
+    let Ok(setting) = unsafe { CStr::from_ptr(setting) }.to_str() else {
+        platform::ERRNO.set(EINVAL);
+        return ptr::null_mut();
+    };
 
     let encoded = if setting.starts_with('$') {
         if setting.starts_with("$1$") {
@@ -109,8 +106,8 @@ pub unsafe extern "C" fn crypt_r(
         let len = inner.len();
         if let Ok(ret) = CString::new(inner) {
             let ret_ptr = ret.into_raw();
-            let dst = unsafe { (*data).buff }.as_mut_ptr();
             unsafe {
+                let dst = (*data).buff.as_mut_ptr();
                 ptr::copy_nonoverlapping(ret_ptr, dst.cast(), len);
             }
             ret_ptr.cast()

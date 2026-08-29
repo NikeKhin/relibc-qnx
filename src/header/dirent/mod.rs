@@ -2,8 +2,6 @@
 //!
 //! See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/dirent.h.html>.
 
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use alloc::{boxed::Box, vec::Vec};
 use core::{mem, ptr, slice};
 
@@ -13,9 +11,8 @@ use crate::{
     error::{Errno, ResultExt, ResultExtPtrMut},
     fs::File,
     header::{
-        errno::{self, EINVAL, EIO, ENOMEM, ENOTDIR},
+        errno::{EINVAL, EIO, ENOMEM, ENOTDIR},
         fcntl, stdlib, string, sys_stat,
-        unistd::{SEEK_CUR, SEEK_SET},
     },
     out::Out,
     platform::{
@@ -27,6 +24,31 @@ use crate::{
     },
 };
 
+// values of below constants taken from musl
+
+/// Unknown file type.
+pub const DT_UNKNOWN: c_int = 0;
+/// FIFO special.
+pub const DT_FIFO: c_int = 1;
+/// Character special.
+pub const DT_CHR: c_int = 2;
+/// Directory.
+pub const DT_DIR: c_int = 4;
+/// Block special.
+pub const DT_BLK: c_int = 6;
+/// Regular.
+pub const DT_REG: c_int = 8;
+/// Symbolic link.
+pub const DT_LNK: c_int = 10;
+/// Socket.
+pub const DT_SOCK: c_int = 12;
+/// Non-POSIX.
+/// Whiteout inode.
+pub const DT_WHT: c_int = 14;
+
+// values of above constants taken from musl
+
+/// cbindgen:ignore
 const INITIAL_BUFSIZE: usize = 512;
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/dirent.h.html>.
@@ -54,9 +76,7 @@ impl DIR {
     }
     pub fn from_fd(fd: c_int) -> Result<Box<Self>, Errno> {
         let mut stat = sys_stat::stat::default();
-        unsafe {
-            Sys::fstat(fd, Out::from_mut(&mut stat))?;
-        }
+        Sys::fstat(fd, Out::from_mut(&mut stat))?;
         if (stat.st_mode & sys_stat::S_IFMT) != sys_stat::S_IFDIR {
             return Err(Errno(ENOTDIR));
         }
@@ -120,7 +140,7 @@ impl DIR {
         Ok(dent_ptr)
     }
     fn seek(&mut self, off: u64) {
-        let Ok(_) = Sys::dir_seek(*self.file, off) else {
+        let Ok(()) = Sys::dir_seek(*self.file, off) else {
             return;
         };
         self.buf.clear();
@@ -129,7 +149,7 @@ impl DIR {
     }
     fn rewind(&mut self) {
         self.opaque_offset = 0;
-        let Ok(_) = Sys::dir_seek(*self.file, 0) else {
+        let Ok(()) = Sys::dir_seek(*self.file, 0) else {
             return;
         };
         self.buf.clear();
@@ -168,6 +188,7 @@ pub struct posix_dent {
     pub d_name: [c_char; 256],
 }
 
+/// cbindgen:ignore
 #[cfg(target_os = "redox")]
 const _: () = {
     use core::mem::{offset_of, size_of};
@@ -243,7 +264,7 @@ pub extern "C" fn posix_getdents(
     nbyte: size_t,
     _flags: c_int,
 ) -> ssize_t {
-    let slice = unsafe { slice::from_raw_parts_mut(buf as *mut u8, nbyte) };
+    let slice = unsafe { slice::from_raw_parts_mut(buf.cast::<u8>(), nbyte) };
 
     Sys::posix_getdents(fildes, slice)
         .map(|s| s as ssize_t)
@@ -290,9 +311,8 @@ pub unsafe extern "C" fn scandir(
         return -1;
     }
 
-    let mut vec = match CVec::with_capacity(4) {
-        Ok(vec) => vec,
-        Err(err) => return -1,
+    let Ok(mut vec) = CVec::with_capacity(4) else {
+        return -1;
     };
 
     let old_errno = platform::ERRNO.get();
@@ -304,18 +324,18 @@ pub unsafe extern "C" fn scandir(
             break;
         }
 
-        if let Some(filter) = filter {
-            if filter(entry) == 0 {
-                continue;
-            }
+        if let Some(filter) = filter
+            && filter(entry) == 0
+        {
+            continue;
         }
 
-        let copy = unsafe { platform::alloc(mem::size_of::<dirent>()) } as *mut dirent;
+        let copy = unsafe { platform::alloc(mem::size_of::<dirent>()) }.cast::<dirent>();
         if copy.is_null() {
             break;
         }
         unsafe { ptr::write(copy, (*entry).clone()) };
-        if let Err(_) = vec.push(copy) {
+        if vec.push(copy).is_err() {
             break;
         }
     }
@@ -323,13 +343,13 @@ pub unsafe extern "C" fn scandir(
     closedir(unsafe { Box::from_raw(dir) });
 
     let len = vec.len();
-    if let Err(_) = vec.shrink_to_fit() {
+    if vec.shrink_to_fit().is_err() {
         return -1;
     }
 
     if platform::ERRNO.get() != 0 {
         for ptr in &mut vec {
-            unsafe { platform::free(*ptr as *mut c_void) };
+            unsafe { platform::free((*ptr).cast::<c_void>()) };
         }
         -1
     } else {
@@ -345,9 +365,10 @@ pub unsafe extern "C" fn scandir(
         platform::ERRNO.set(old_errno);
         unsafe {
             stdlib::qsort(
-                *namelist as *mut c_void,
+                (*namelist).cast::<c_void>(),
                 len as size_t,
                 mem::size_of::<*mut dirent>(),
+                #[expect(clippy::missing_transmute_annotations, reason = "too verbose")]
                 mem::transmute(compare),
             )
         };
@@ -359,10 +380,12 @@ pub unsafe extern "C" fn scandir(
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/seekdir.html>.
 #[unsafe(no_mangle)]
 pub extern "C" fn seekdir(dir: &mut DIR, off: c_long) {
-    dir.seek(
-        off.try_into()
-            .expect("off must come from telldir, thus never negative"),
-    );
+    let Ok(off) = off.try_into() else {
+        platform::ERRNO.set(EINVAL);
+        return;
+    };
+
+    dir.seek(off);
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/telldir.html>.
@@ -370,6 +393,3 @@ pub extern "C" fn seekdir(dir: &mut DIR, off: c_long) {
 pub extern "C" fn telldir(dir: &mut DIR) -> c_long {
     dir.opaque_offset as c_long
 }
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn cbindgen_stupid_struct_user_for_posix_dent(_: posix_dent) {}

@@ -1,17 +1,23 @@
 use alloc::boxed::Box;
 
-use super::{Buffer, FILE, constants::*};
+use super::{
+    Buffer, FILE,
+    constants::{F_APP, F_NORD, F_NOWR},
+};
 use crate::{
     c_str::CStr,
     error::Errno,
     fs::File,
     header::{
-        errno::{self, EINVAL},
-        fcntl::*,
+        errno::EINVAL,
+        fcntl::{
+            F_GETFL, F_SETFD, F_SETFL, FD_CLOEXEC, O_APPEND, O_CLOEXEC, O_CREAT, O_EXCL, O_RDONLY,
+            O_RDWR, O_TRUNC, O_WRONLY, fcntl,
+        },
+        pthread,
     },
     io::BufWriter,
-    platform::{self, types::*},
-    sync::Mutex,
+    platform::types::{c_int, c_ulonglong},
 };
 use alloc::vec::Vec;
 
@@ -68,21 +74,21 @@ pub fn _fdopen(fd: c_int, mode: CStr) -> Result<Box<FILE>, Errno> {
     }
 
     let file = File::new(fd);
-    let writer = Box::new(BufWriter::new(unsafe { file.get_ref() }));
-
+    let writer = BufWriter::new(unsafe { file.get_ref() });
+    const MUTEX_ATTR: pthread::RlctMutexAttr = pthread::RlctMutexAttr {
+        ty: pthread::PTHREAD_MUTEX_RECURSIVE,
+        ..pthread::RlctMutexAttr::default_const()
+    };
     Ok(Box::new(FILE {
-        lock: Mutex::new(()),
-
+        lock: pthread::RlctMutex::new(&MUTEX_ATTR).unwrap(),
         file,
         flags,
-        read_buf: Buffer::Owned(vec![0; BUFSIZ as usize]),
+        read_buf: Buffer::Owned(None),
         read_pos: 0,
         read_size: 0,
         unget: Vec::new(),
-        writer,
-
+        writer: super::FileInnerWriter::Buf(writer),
         pid: None,
-
         orientation: 0,
     }))
 }

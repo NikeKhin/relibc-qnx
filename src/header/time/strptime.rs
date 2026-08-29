@@ -2,21 +2,19 @@
 //
 // See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/strptime.html>.
 
-use crate::{
-    header::{string::strlen, time::tm},
-    platform::types::size_t,
-};
-use alloc::{string::String, vec::Vec};
+use crate::header::time::tm;
+use alloc::string::String;
 use core::{
     ffi::{CStr, c_char, c_int, c_void},
-    mem::MaybeUninit,
     ptr,
     ptr::NonNull,
-    slice, str,
+    str,
 };
 
+/// cbindgen:ignore
 /// For convenience, we define some helper constants for the C-locale.
 const SHORT_DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+/// cbindgen:ignore
 const LONG_DAYS: [&str; 7] = [
     "Sunday",
     "Monday",
@@ -26,9 +24,11 @@ const LONG_DAYS: [&str; 7] = [
     "Friday",
     "Saturday",
 ];
+/// cbindgen:ignore
 const SHORT_MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+/// cbindgen:ignore
 const LONG_MONTHS: [&str; 12] = [
     "January",
     "February",
@@ -52,23 +52,15 @@ pub unsafe extern "C" fn strptime(
     tm: *mut tm,
 ) -> *mut c_char {
     // Validate inputs
-    let buf_ptr = if let Some(ptr) = NonNull::new(buf as *const c_void as *mut c_void) {
-        ptr
-    } else {
+    if NonNull::new(buf.cast::<c_void>().cast_mut()).is_none() {
         return ptr::null_mut();
-    };
-    //
-    let fmt_ptr = if let Some(ptr) = NonNull::new(format as *const c_void as *mut c_void) {
-        ptr
-    } else {
+    }
+    if NonNull::new(format.cast::<c_void>().cast_mut()).is_none() {
         return ptr::null_mut();
-    };
-
-    let tm_ptr = if let Some(ptr) = NonNull::new(tm) {
-        ptr
-    } else {
+    }
+    if NonNull::new(tm).is_none() {
         return ptr::null_mut();
-    };
+    }
 
     // Convert raw pointers into slices/strings.
     let input_str = unsafe {
@@ -152,9 +144,8 @@ pub unsafe extern "C" fn strptime(
             // Day of Month: %d / %e
             'd' | 'e' => {
                 // parse a 2-digit day (with or without leading zero)
-                let (val, len) = match parse_int(&input_str[index_in_input..], 2, false) {
-                    Some(v) => unsafe { v },
-                    None => return ptr::null_mut(),
+                let Some((val, len)) = parse_int(&input_str[index_in_input..], 2, false) else {
+                    return ptr::null_mut();
                 };
                 unsafe {
                     (*tm).tm_mday = val as c_int;
@@ -169,9 +160,8 @@ pub unsafe extern "C" fn strptime(
             // Month: %m
             'm' => {
                 // parse a 2-digit month
-                let (val, len) = match parse_int(&input_str[index_in_input..], 2, false) {
-                    Some(v) => v,
-                    None => return ptr::null_mut(),
+                let Some((val, len)) = parse_int(&input_str[index_in_input..], 2, false) else {
+                    return ptr::null_mut();
                 };
                 // tm_mon is 0-based (0 = Jan, 1 = Feb,...)
                 unsafe {
@@ -186,9 +176,8 @@ pub unsafe extern "C" fn strptime(
             // Year without century: %y
             'y' => {
                 // parse a 2-digit year
-                let (val, len) = match parse_int(&input_str[index_in_input..], 2, false) {
-                    Some(v) => v,
-                    None => return ptr::null_mut(),
+                let Some((val, len)) = parse_int(&input_str[index_in_input..], 2, false) else {
+                    return ptr::null_mut();
                 };
                 // According to POSIX, %y in strptime is [00,99], and the "year" is 1900..1999 for [00..99],
                 // but the standard says: "values in [69..99] refer to 1969..1999, [00..68] => 2000..2068"
@@ -203,9 +192,8 @@ pub unsafe extern "C" fn strptime(
             'Y' => {
                 // parse up to 4-digit (or more) year
                 // We allow more than 4 digits if needed
-                let (val, len) = match parse_int(&input_str[index_in_input..], 4, true) {
-                    Some(v) => v,
-                    None => return ptr::null_mut(),
+                let Some((val, len)) = parse_int(&input_str[index_in_input..], 4, true) else {
+                    return ptr::null_mut();
                 };
                 unsafe {
                     (*tm).tm_year = (val as c_int) - 1900;
@@ -215,9 +203,8 @@ pub unsafe extern "C" fn strptime(
 
             // Hour (00..23): %H
             'H' => {
-                let (val, len) = match parse_int(&input_str[index_in_input..], 2, false) {
-                    Some(v) => v,
-                    None => return ptr::null_mut(),
+                let Some((val, len)) = parse_int(&input_str[index_in_input..], 2, false) else {
+                    return ptr::null_mut();
                 };
                 if val > 23 {
                     return ptr::null_mut();
@@ -230,11 +217,10 @@ pub unsafe extern "C" fn strptime(
 
             // Hour (01..12): %I
             'I' => {
-                let (val, len) = match parse_int(&input_str[index_in_input..], 2, false) {
-                    Some(v) => v,
-                    None => return ptr::null_mut(),
+                let Some((val, len)) = parse_int(&input_str[index_in_input..], 2, false) else {
+                    return ptr::null_mut();
                 };
-                if val < 1 || val > 12 {
+                if !(1..=12).contains(&val) {
                     return ptr::null_mut();
                 }
                 unsafe {
@@ -246,9 +232,8 @@ pub unsafe extern "C" fn strptime(
 
             // Minute (00..59): %M
             'M' => {
-                let (val, len) = match parse_int(&input_str[index_in_input..], 2, false) {
-                    Some(v) => v,
-                    None => return ptr::null_mut(),
+                let Some((val, len)) = parse_int(&input_str[index_in_input..], 2, false) else {
+                    return ptr::null_mut();
                 };
                 if val > 59 {
                     return ptr::null_mut();
@@ -261,9 +246,8 @@ pub unsafe extern "C" fn strptime(
 
             // Seconds (00..60): %S
             'S' => {
-                let (val, len) = match parse_int(&input_str[index_in_input..], 2, false) {
-                    Some(v) => v,
-                    None => return ptr::null_mut(),
+                let Some((val, len)) = parse_int(&input_str[index_in_input..], 2, false) else {
+                    return ptr::null_mut();
                 };
                 if val > 60 {
                     return ptr::null_mut();
@@ -364,11 +348,10 @@ pub unsafe extern "C" fn strptime(
             // Day of year: %j
             'j' => {
                 // parse 3-digit day of year [001..366]
-                let (val, len) = match parse_int(&input_str[index_in_input..], 3, false) {
-                    Some(v) => v,
-                    None => return ptr::null_mut(),
+                let Some((val, len)) = parse_int(&input_str[index_in_input..], 3, false) else {
+                    return ptr::null_mut();
                 };
-                if val < 1 || val > 366 {
+                if !(1..=366).contains(&val) {
                     return ptr::null_mut();
                 }
                 // store in tm_yday
@@ -384,31 +367,31 @@ pub unsafe extern "C" fn strptime(
                 // We can do a mini strptime recursion or manually parse
                 // For simplicity, we'll do it inline here
                 let subfmt = "%m/%d/%y";
-                let used =
-                    match unsafe { apply_subformat(&input_str[index_in_input..], subfmt, tm) } {
-                        Some(v) => v,
-                        None => return ptr::null_mut(),
-                    };
+                let Some(used) =
+                    (unsafe { apply_subformat(&input_str[index_in_input..], subfmt, tm) })
+                else {
+                    return ptr::null_mut();
+                };
                 index_in_input += used;
             }
             'F' => {
                 // Equivalent to "%Y-%m-%d"
                 let subfmt = "%Y-%m-%d";
-                let used =
-                    match unsafe { apply_subformat(&input_str[index_in_input..], subfmt, tm) } {
-                        Some(v) => v,
-                        None => return ptr::null_mut(),
-                    };
+                let Some(used) =
+                    (unsafe { apply_subformat(&input_str[index_in_input..], subfmt, tm) })
+                else {
+                    return ptr::null_mut();
+                };
                 index_in_input += used;
             }
             'T' => {
                 // Equivalent to %H:%M:%S
                 let subfmt = "%H:%M:%S";
-                let used =
-                    match unsafe { apply_subformat(&input_str[index_in_input..], subfmt, tm) } {
-                        Some(v) => v,
-                        None => return ptr::null_mut(),
-                    };
+                let Some(used) =
+                    (unsafe { apply_subformat(&input_str[index_in_input..], subfmt, tm) })
+                else {
+                    return ptr::null_mut();
+                };
                 index_in_input += used;
             }
 
@@ -436,7 +419,7 @@ pub unsafe extern "C" fn strptime(
     // If we got here, parsing was successful. Return pointer to the
     // next unparsed character in `buf`.
     let ret_ptr = unsafe { buf.add(index_in_input) };
-    ret_ptr as *mut c_char
+    ret_ptr.cast_mut()
 }
 
 // Helper / Parsing Logic
@@ -448,16 +431,18 @@ pub unsafe extern "C" fn strptime(
 ///   (e.g., `%Y` can have more than 4 digits, but also might parse "2023" or "12345").
 fn parse_int(input: &str, width: usize, allow_variable: bool) -> Option<(i32, usize)> {
     let mut val = 0i32;
-    let mut chars = input.chars();
+    let chars = input.chars();
     let mut count = 0;
 
-    while let Some(c) = chars.next() {
+    for c in chars {
         if !c.is_ascii_digit() {
             break;
         }
 
         // Check for integer overflow
-        val = val.checked_mul(10)?.checked_add((c as u8 - b'0') as i32)?;
+        val = val
+            .checked_mul(10)?
+            .checked_add(i32::from(c as u8 - b'0'))?;
 
         count += 1;
         if count == width && !allow_variable {
@@ -488,11 +473,15 @@ fn parse_am_pm(s: &str) -> Option<(bool, usize)> {
 /// Parse a weekday name from `s`.
 /// - if `abbrev == true`, match short forms: "Mont".."Sun"
 /// - otherwise, match "Monday".."Sunday"
+///
 /// Return (weekday_index, length_consumed).
 fn parse_weekday(s: &str, abbrev: bool) -> Option<(usize, usize)> {
     let list = if abbrev { &SHORT_DAYS } else { &LONG_DAYS };
     for (i, name) in list.iter().enumerate() {
-        if s.len() >= name.len() && s[0..name.len()].eq_ignore_ascii_case(name) {
+        if s.len() >= name.len()
+            && s.get(0..name.len())
+                .is_some_and(|sub| sub.eq_ignore_ascii_case(name))
+        {
             return Some((i, name.len()));
         }
     }
@@ -502,11 +491,15 @@ fn parse_weekday(s: &str, abbrev: bool) -> Option<(usize, usize)> {
 /// Parse a month name from `s`.
 /// - If `abbrev == true`, match short forms: "Jan".."Dec"
 /// - Otherwise, match "January".."December"
+///
 /// Return (month_index, length_consumed).
 fn parse_month(s: &str, abbrev: bool) -> Option<(usize, usize)> {
     let list = if abbrev { &SHORT_MONTHS } else { &LONG_MONTHS };
     for (i, name) in list.iter().enumerate() {
-        if s.len() >= name.len() && s[0..name.len()].eq_ignore_ascii_case(name) {
+        if s.len() >= name.len()
+            && s.get(0..name.len())
+                .is_some_and(|sub| sub.eq_ignore_ascii_case(name))
+        {
             return Some((i, name.len()));
         }
     }
@@ -534,8 +527,8 @@ unsafe fn apply_subformat(input: &str, subfmt: &str, tm: *mut tm) -> Option<usiz
 
     let consumed_ptr = unsafe {
         strptime(
-            tmpbuf.as_ptr() as *const c_char,
-            tmpfmt.as_ptr() as *const c_char,
+            tmpbuf.as_ptr().cast::<c_char>(),
+            tmpfmt.as_ptr().cast::<c_char>(),
             tm,
         )
     };

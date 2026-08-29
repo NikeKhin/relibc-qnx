@@ -1,23 +1,16 @@
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-    vec::{IntoIter, Vec},
-};
-use core::mem;
+use alloc::{string::ToString, vec::Vec};
 
 use crate::{
+    error::Errno,
     out::Out,
-    platform::{Pal, Sys, types::*},
+    platform::{Pal, PalSocket, Sys},
 };
 
 use crate::header::{
-    errno::*,
-    netinet_in::{IPPROTO_UDP, htons, in_addr, sockaddr_in},
-    sys_socket::{
-        self,
-        constants::{AF_INET, SOCK_DGRAM},
-        sockaddr, socklen_t,
-    },
+    bits_arpainet::htons,
+    errno::EINVAL,
+    netinet_in::{IPPROTO_UDP, in_addr, sockaddr_in},
+    sys_socket::constants::{AF_INET, SOCK_DGRAM},
     time::{self, timespec},
 };
 
@@ -26,125 +19,82 @@ use super::{
     sys::get_dns_server,
 };
 
-pub struct LookupHost(IntoIter<in_addr>);
+pub type LookupHost = Vec<in_addr>;
 
-impl Iterator for LookupHost {
-    type Item = in_addr;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0.next()
-    }
-}
-
-impl From<u32> for LookupHost {
-    /// from ipv4 address
-    fn from(s_addr: u32) -> Self {
-        LookupHost(vec![in_addr { s_addr }].into_iter())
-    }
-}
-
-pub fn lookup_host(host: &str) -> Result<LookupHost, c_int> {
+pub fn lookup_host(host: &str) -> Result<LookupHost, Errno> {
     if let Some(host_direct_addr) = parse_ipv4_string(host) {
         // already an ip address
-        return Ok(host_direct_addr.into());
+        return Ok(vec![in_addr {
+            s_addr: host_direct_addr,
+        }]);
     }
 
-    let dns_string = get_dns_server().map_err(|e| e.0)?;
+    let dns_string = get_dns_server()?;
 
-    if let Some(dns_addr) = parse_ipv4_string(&dns_string) {
-        let mut timespec = timespec::default();
-        unsafe {
-            Sys::clock_gettime(
-                time::constants::CLOCK_REALTIME,
-                Out::from_mut(&mut timespec),
-            );
-        }
-        let tid = (timespec.tv_nsec >> 16) as u16;
+    let dns_addr = parse_ipv4_string(&dns_string).ok_or(Errno(EINVAL))?;
 
-        let packet = Dns {
-            transaction_id: tid,
-            flags: 0x0100,
-            queries: vec![DnsQuery {
-                name: host.to_string(),
-                q_type: 0x0001,
-                q_class: 0x0001,
-            }],
-            answers: vec![],
-        };
+    let mut timespec = timespec::default();
+    Sys::clock_gettime(
+        time::constants::CLOCK_REALTIME,
+        Out::from_mut(&mut timespec),
+    )?;
+    let tid = (timespec.tv_nsec >> 16) as u16;
 
-        let packet_data = packet.compile();
-        let packet_data_len = packet_data.len();
+    let packet = Dns {
+        transaction_id: tid,
+        flags: 0x0100,
+        queries: vec![DnsQuery {
+            name: host.to_string(),
+            q_type: 0x0001,
+            q_class: 0x0001,
+        }],
+        answers: vec![],
+    };
 
-        let packet_data_box = packet_data.into_boxed_slice();
-        let packet_data_ptr = Box::into_raw(packet_data_box) as *mut _ as *mut c_void;
+    let packet_data = packet.compile();
 
-        let dest = sockaddr_in {
-            sin_family: AF_INET as u16,
-            sin_port: htons(53),
-            sin_addr: in_addr { s_addr: dns_addr },
-            ..Default::default()
-        };
-        let dest_ptr = &dest as *const _ as *const sockaddr;
+    let mut dest = [0_u8; size_of::<sockaddr_in>()];
+    *plain::from_mut_bytes(&mut dest).unwrap() = sockaddr_in {
+        sin_family: u16::try_from(AF_INET).expect("AF_INET is positive and below u16::MAX"),
+        sin_port: htons(53),
+        sin_addr: in_addr { s_addr: dns_addr },
+        ..Default::default()
+    };
 
-        let sock = unsafe {
-            let sock = sys_socket::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP as i32);
-            if sys_socket::connect(sock, dest_ptr, mem::size_of_val(&dest) as socklen_t) < 0 {
-                return Err(EIO);
+    let sock = Sys::socket(AF_INET, SOCK_DGRAM, i32::from(IPPROTO_UDP))?;
+    let _ = Sys::connect(sock, &dest)?;
+    Sys::sendto(sock, &packet_data, 0, None)?;
+
+    let mut buf = vec![0u8; 65536];
+
+    let (count, _srcaddr_len) = Sys::recvfrom(sock, Out::from_mut(&mut buf), 0, None)?;
+
+    let response = Dns::parse(&buf[..count]).map_err(|_| Errno(EINVAL))?;
+    let addrs: Vec<_> = response
+        .answers
+        .into_iter()
+        .filter_map(|answer| {
+            if answer.a_type == 0x0001 && answer.a_class == 0x0001 && answer.data.len() == 4 {
+                let addr = in_addr {
+                    s_addr: u32::from_ne_bytes([
+                        answer.data[0],
+                        answer.data[1],
+                        answer.data[2],
+                        answer.data[3],
+                    ]),
+                };
+                Some(addr)
+            } else {
+                None
             }
-            if sys_socket::send(sock, packet_data_ptr, packet_data_len, 0) < 0 {
-                Box::from_raw(packet_data_ptr);
-                return Err(EIO);
-            }
-            sock
-        };
+        })
+        .collect();
 
-        unsafe {
-            Box::from_raw(packet_data_ptr);
-        }
-
-        let i = 0 as socklen_t;
-        let mut buf = vec![0u8; 65536];
-        let buf_ptr = buf.as_mut_ptr() as *mut c_void;
-
-        let count = unsafe { sys_socket::recv(sock, buf_ptr, 65536, 0) };
-        if count < 0 {
-            return Err(EIO);
-        }
-
-        match Dns::parse(&buf[..count as usize]) {
-            Ok(response) => {
-                let addrs: Vec<_> = response
-                    .answers
-                    .into_iter()
-                    .filter_map(|answer| {
-                        if answer.a_type == 0x0001
-                            && answer.a_class == 0x0001
-                            && answer.data.len() == 4
-                        {
-                            let addr = in_addr {
-                                s_addr: u32::from_ne_bytes([
-                                    answer.data[0],
-                                    answer.data[1],
-                                    answer.data[2],
-                                    answer.data[3],
-                                ]),
-                            };
-                            Some(addr)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                Ok(LookupHost(addrs.into_iter()))
-            }
-            Err(_err) => Err(EINVAL),
-        }
-    } else {
-        Err(EINVAL)
-    }
+    Ok(addrs)
 }
 
-pub fn lookup_addr(addr: in_addr) -> Result<Vec<Vec<u8>>, c_int> {
-    let dns_string = get_dns_server().map_err(|e| e.0)?;
+pub fn lookup_addr(addr: in_addr) -> Result<Vec<Vec<u8>>, Errno> {
+    let dns_string = get_dns_server()?;
 
     if let Some(dns_addr) = parse_ipv4_string(&dns_string) {
         let addr: [u8; 4] = addr.s_addr.to_ne_bytes();
@@ -155,12 +105,10 @@ pub fn lookup_addr(addr: in_addr) -> Result<Vec<Vec<u8>>, c_int> {
         );
 
         let mut timespec = timespec::default();
-        unsafe {
-            Sys::clock_gettime(
-                time::constants::CLOCK_REALTIME,
-                Out::from_mut(&mut timespec),
-            )
-        };
+        if let Ok(()) = Sys::clock_gettime(
+            time::constants::CLOCK_REALTIME,
+            Out::from_mut(&mut timespec),
+        ) {}; // TODO handle error
         let tid = (timespec.tv_nsec >> 16) as u16;
 
         let packet = Dns {
@@ -175,47 +123,25 @@ pub fn lookup_addr(addr: in_addr) -> Result<Vec<Vec<u8>>, c_int> {
         };
 
         let packet_data = packet.compile();
-        let packet_data_len = packet_data.len();
-        let packet_data_box = packet_data.into_boxed_slice();
-        let packet_data_ptr = Box::into_raw(packet_data_box) as *mut _ as *mut c_void;
 
-        let dest = sockaddr_in {
-            sin_family: AF_INET as u16,
+        let mut dest_addr = [0_u8; size_of::<sockaddr_in>()];
+        *plain::from_mut_bytes(&mut dest_addr).unwrap() = sockaddr_in {
+            sin_family: u16::try_from(AF_INET).expect("AF_INET is positive and below u16::MAX"),
             sin_port: htons(53),
             sin_addr: in_addr { s_addr: dns_addr },
             ..Default::default()
         };
 
-        let dest_ptr = &dest as *const _ as *const sockaddr;
+        let sock = Sys::socket(AF_INET, SOCK_DGRAM, i32::from(IPPROTO_UDP))?;
+        let _ = Sys::connect(sock, &dest_addr)?;
 
-        let sock = unsafe {
-            let sock = sys_socket::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP as i32);
-            if sys_socket::connect(sock, dest_ptr, mem::size_of_val(&dest) as socklen_t) < 0 {
-                return Err(EIO);
-            }
-            sock
-        };
+        let _bytes_sent = Sys::sendto(sock, &packet_data, 0, None)?;
 
-        unsafe {
-            if sys_socket::send(sock, packet_data_ptr, packet_data_len, 0) < 0 {
-                return Err(EIO);
-            }
-        }
-
-        unsafe {
-            Box::from_raw(packet_data_ptr);
-        }
-
-        let i = mem::size_of::<sockaddr_in>() as socklen_t;
         let mut buf = [0u8; 65536];
-        let buf_ptr = buf.as_mut_ptr() as *mut c_void;
 
-        let count = unsafe { sys_socket::recv(sock, buf_ptr, 65536, 0) };
-        if count < 0 {
-            return Err(EIO);
-        }
+        let (count, _dstaddr_len) = Sys::recvfrom(sock, Out::from_mut(&mut buf), 0, None)?;
 
-        match Dns::parse(&buf[..count as usize]) {
+        match Dns::parse(&buf[..count]) {
             Ok(response) => {
                 let names = response
                     .answers
@@ -235,10 +161,10 @@ pub fn lookup_addr(addr: in_addr) -> Result<Vec<Vec<u8>>, c_int> {
                     .collect();
                 Ok(names)
             }
-            Err(_err) => Err(EINVAL),
+            Err(_err) => Err(Errno(EINVAL)),
         }
     } else {
-        Err(EINVAL)
+        Err(Errno(EINVAL))
     }
 }
 

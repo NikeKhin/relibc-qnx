@@ -8,6 +8,9 @@ description = "Ioctl definitions and (de)serialization for Redox"
 
 [dependencies]
 drm-sys = "0.8.0"
-redox_syscall = "0.6.0"
+redox_syscall.workspace = true
 
 [features]
+
+[lints]
+workspace = true

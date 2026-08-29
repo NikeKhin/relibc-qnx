@@ -1,4 +1,4 @@
-use crate::platform::types::*;
+use crate::platform::types::{c_int, c_uint, int32_t, off_t};
 
 pub const EOF: c_int = -1;
 pub const BUFSIZ: c_int = 1024;
@@ -16,9 +16,7 @@ pub const F_SVB: c_int = 64;
 pub const F_APP: c_int = 128;
 pub const F_BADJ: c_int = 256;
 
-pub const SEEK_SET: c_int = 0;
-pub const SEEK_CUR: c_int = 1;
-pub const SEEK_END: c_int = 2;
+// SEEK_SET, SEEK_CUR and SEEK_END defined in fcntl bits header
 
 pub const _IOFBF: c_int = 0;
 pub const _IOLBF: c_int = 1;
@@ -35,14 +33,16 @@ pub const RENAME_EXCHANGE: c_uint = 0x02;
 pub const RENAME_WHITEOUT: c_uint = 0x04;
 
 // /dev/tty + nul
+/// Maximum size of character array to hold `ctermid()` output.
 pub const L_ctermid: usize = 9;
 // form of name is /XXXXXX, so 7
 pub const L_tmpnam: c_int = 7;
 // 36^6 (26 letters + 10 digits) is larger than i32::MAX, so just set to that
 // for now
 pub const TMP_MAX: int32_t = 2_147_483_647;
-// XXX: defined manually in bits/stdio.h as well because cbindgen can't handle
+// XXX: defined manually in cbindgen as well because it can't handle
 //      string constants in any form AFAICT
+/// cbindgen:ignore
 pub const P_tmpdir: &[u8; 5] = b"/tmp\0";
 
 #[allow(non_camel_case_types)]

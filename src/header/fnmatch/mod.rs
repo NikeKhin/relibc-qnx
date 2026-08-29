@@ -2,8 +2,6 @@
 //!
 //! See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/fnmatch.h.html>.
 
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use alloc::{borrow::Cow, vec::Vec};
 use core::slice;
 
@@ -14,16 +12,23 @@ use posix_regex::{
     tree::{Tree, TreeBuilder},
 };
 
+/// cbindgen:ignore
 const ONCE: Range = Range(1, Some(1));
 
+/// The input string does not match the specified pattern.
 pub const FNM_NOMATCH: c_int = 1;
 
+/// Disable backslash escaping.
 pub const FNM_NOESCAPE: c_int = 1;
+/// Backslash in the input string only matches backlash in pattern.
 pub const FNM_PATHNAME: c_int = 2;
+/// Leading period in input string only matches period in pattern.
 pub const FNM_PERIOD: c_int = 4;
+/// Compare input string and pattern in a case-insensitive manner.
 pub const FNM_CASEFOLD: c_int = 8;
+/// Equivalent to `FNM_CASEFOLD`.
 pub const FNM_IGNORECASE: c_int = FNM_CASEFOLD;
-// TODO: FNM_EXTMATCH
+// TODO: FNM_EXTMATCH (Non-POSIX)
 
 unsafe fn tokenize(mut pattern: *const u8, flags: c_int) -> Tree {
     fn any(leading: bool, flags: c_int) -> Token {
@@ -45,6 +50,7 @@ unsafe fn tokenize(mut pattern: *const u8, flags: c_int) -> Tree {
     }
 
     let mut leading = true;
+    let mut need_collapsing = false;
 
     let mut builder = TreeBuilder::default();
     builder.start_internal(Token::Root, Range(1, Some(1)));
@@ -55,7 +61,13 @@ unsafe fn tokenize(mut pattern: *const u8, flags: c_int) -> Tree {
         leading = false;
 
         let c = unsafe { *pattern };
-        pattern = unsafe { pattern.offset(1) };
+        pattern = unsafe { pattern.add(1) };
+
+        match (c == b'*', need_collapsing) {
+            (true, true) => continue,
+            (true, false) => need_collapsing = true,
+            (false, _) => need_collapsing = false,
+        }
 
         let (token, range) = match c {
             b'\\' if flags & FNM_NOESCAPE == FNM_NOESCAPE => {
@@ -64,7 +76,7 @@ unsafe fn tokenize(mut pattern: *const u8, flags: c_int) -> Tree {
                     // Trailing backslash. Maybe error here?
                     break;
                 }
-                pattern = unsafe { pattern.offset(1) };
+                pattern = unsafe { pattern.add(1) };
                 leading = is_leading(flags, c);
                 (Token::Char(c), ONCE)
             }
@@ -73,7 +85,7 @@ unsafe fn tokenize(mut pattern: *const u8, flags: c_int) -> Tree {
             b'[' => {
                 let mut list: Vec<Collation> = Vec::new();
                 let invert = if unsafe { *pattern == b'!' } {
-                    pattern = unsafe { pattern.offset(1) };
+                    pattern = unsafe { pattern.add(1) };
                     true
                 } else {
                     false
@@ -84,12 +96,12 @@ unsafe fn tokenize(mut pattern: *const u8, flags: c_int) -> Tree {
                     if c == 0 {
                         break;
                     }
-                    pattern = unsafe { pattern.offset(1) };
+                    pattern = unsafe { pattern.add(1) };
                     match c {
                         b']' => break,
                         b'\\' => {
                             c = unsafe { *pattern };
-                            pattern = unsafe { pattern.offset(1) };
+                            pattern = unsafe { pattern.add(1) };
                             if c == 0 {
                                 // Trailing backslash. Maybe error?
                                 break;
@@ -97,9 +109,9 @@ unsafe fn tokenize(mut pattern: *const u8, flags: c_int) -> Tree {
                         }
                         _ => (),
                     }
-                    if unsafe { *pattern == b'-' && *pattern.offset(1) != 0 } {
-                        let end = unsafe { *pattern.offset(1) };
-                        pattern = unsafe { pattern.offset(2) };
+                    if unsafe { *pattern == b'-' && *pattern.add(1) != 0 } {
+                        let end = unsafe { *pattern.add(1) };
+                        pattern = unsafe { pattern.add(2) };
                         for c in c..=end {
                             if can_push(was_leading, flags, c) {
                                 list.push(Collation::Char(c));
@@ -127,6 +139,12 @@ unsafe fn tokenize(mut pattern: *const u8, flags: c_int) -> Tree {
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/fnmatch.html>.
+///
+/// Checks the `input` string to see if it matches `pattern`.
+///
+/// # Safety
+///
+/// The `input` and `pattern` parameters must be non-null and properly aligned.
 #[unsafe(no_mangle)]
 #[linkage = "weak"] // often redefined in GNU programs
 pub unsafe extern "C" fn fnmatch(
@@ -138,9 +156,9 @@ pub unsafe extern "C" fn fnmatch(
     while unsafe { *input.offset(len) != 0 } {
         len += 1;
     }
-    let input = unsafe { slice::from_raw_parts(input as *const u8, len as usize) };
+    let input = unsafe { slice::from_raw_parts(input.cast::<u8>(), len as usize) };
 
-    let tokens = unsafe { tokenize(pattern as *const u8, flags) };
+    let tokens = unsafe { tokenize(pattern.cast::<u8>(), flags) };
 
     if PosixRegex::new(Cow::Owned(tokens))
         .case_insensitive(flags & FNM_CASEFOLD == FNM_CASEFOLD)

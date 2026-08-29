@@ -1,6 +1,6 @@
 // Start code adapted from https://gitlab.redox-os.org/redox-os/relibc/blob/master/src/start.rs
 
-#![deny(unsafe_op_in_unsafe_fn)]
+use core::slice;
 
 use alloc::{
     borrow::ToOwned,
@@ -9,15 +9,26 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use object::{
+    NativeEndian,
+    elf::{self, PT_DYNAMIC, PT_PHDR},
+    read::elf::{Dyn as _, FileHeader as _, ProgramHeader as _},
+};
 
 use crate::{
-    ALLOCATOR,
     c_str::CStr,
     header::{
-        sys_auxv::{AT_ENTRY, AT_PHDR},
+        elf::{AT_BASE, AT_ENTRY, AT_PHDR, AT_PHENT, AT_PHNUM},
         unistd,
     },
-    platform::{get_auxv, get_auxvs, types::c_char},
+    ld_so::{
+        dso::{
+            DT_RELR, DT_RELRENT, DT_RELRSZ, Dyn, FileHeader, ProgramHeader, Rel, Rela, Relocation,
+            RelocationKind, Relr, apply_relr,
+        },
+        linker::{DebugFlags, Me},
+    },
+    platform::{auxv_iter, get_auxvs, logger::RELIBC_LOG_ENV_VAR_STR, types::c_char},
     start::Stack,
     sync::mutex::Mutex,
 };
@@ -29,14 +40,6 @@ use super::{
     linker::{Config, Linker},
     tcb::Tcb,
 };
-
-use generic_rt::ExpectTlsFree;
-
-#[cfg(target_pointer_width = "32")]
-pub const SIZEOF_EHDR: usize = 52;
-
-#[cfg(target_pointer_width = "64")]
-pub const SIZEOF_EHDR: usize = 64;
 
 unsafe fn get_argv(mut ptr: *const usize) -> (Vec<String>, *const usize) {
     //traverse the stack and collect argument vector
@@ -63,10 +66,10 @@ unsafe fn get_env(mut ptr: *const usize) -> (BTreeMap<String, String>, *const us
         let env = unsafe { *ptr };
         if let Ok(arg_str) = unsafe { CStr::from_ptr(env as *const c_char).to_str() } {
             let mut parts = arg_str.splitn(2, '=');
-            if let Some(key) = parts.next() {
-                if let Some(value) = parts.next() {
-                    envs.insert(key.to_owned(), value.to_owned());
-                }
+            if let Some(key) = parts.next()
+                && let Some(value) = parts.next()
+            {
+                envs.insert(key.to_owned(), value.to_owned());
             }
         }
         ptr = unsafe { ptr.add(1) };
@@ -75,7 +78,7 @@ unsafe fn get_env(mut ptr: *const usize) -> (BTreeMap<String, String>, *const us
     (envs, ptr)
 }
 
-#[allow(unsafe_op_in_unsafe_fn)]
+#[expect(unsafe_op_in_unsafe_fn)]
 unsafe fn adjust_stack(sp: &'static mut Stack) {
     let mut argv = sp.argv() as *mut usize;
 
@@ -145,40 +148,236 @@ fn resolve_path_name(
             format!("{}/{}", part, name_or_path)
         };
         if accessible(&path, unistd::F_OK).is_ok() {
-            return Some((path.to_string(), name_or_path.to_string()));
+            return Some((path.clone(), name_or_path.to_string()));
         }
     }
     None
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn relibc_ld_so_start(sp: &'static mut Stack, ld_entry: usize) -> usize {
+pub unsafe extern "C" fn relibc_ld_so_start(
+    sp: &'static mut Stack,
+    ld_entry: usize,
+    dynamic: *const Dyn,
+) -> usize {
+    // Relocate ourselves.
+    //
+    // This function is very delicate as it must **not** contain relocations itself. References to
+    // external symbols **cannot** be made until `stage2()` so, this function might not be very
+    // elegant.
+    //
+    // At this stage the TCB is not setup either so `expect_notls` must be used instead of `expect`
+    // and `unwrap`.
+    let mut at_phdr = None;
+    let mut at_phnum = None;
+    let mut at_phent = None;
+    let mut at_base = None;
+    let mut at_entry = None;
+    for [kind, value] in unsafe { auxv_iter(sp.auxv().cast::<usize>()) } {
+        match kind {
+            AT_PHDR => at_phdr = Some(value as *const ProgramHeader),
+            AT_PHNUM => at_phnum = Some(value),
+            AT_PHENT => at_phent = Some(value),
+            AT_BASE => at_base = Some(value),
+            AT_ENTRY => at_entry = Some(value),
+            _ => {}
+        }
+    }
+
+    let at_phdr = at_phdr.expect("`AT_PHDR` must be present");
+    let at_phnum = at_phnum.expect("`AT_PHNUM` must be present if `AT_PHDR` is");
+    let at_phent = at_phent.expect("`AT_PHENT` must be present if `AT_PHDR` is");
+    assert!(!at_phdr.is_null() && at_phnum != 0 && at_phent == size_of::<ProgramHeader>());
+    let phdrs = unsafe { slice::from_raw_parts(at_phdr, at_phnum) };
+
+    let at_entry = at_entry.expect("`AT_ENTRY` must be present");
+    let at_base = at_base.unwrap_or_default();
+
+    let self_base = if at_base != 0 {
+        at_base
+    } else {
+        let ph = phdrs
+            .iter()
+            .find(|ph| ph.p_type(NativeEndian) == PT_DYNAMIC)
+            .unwrap();
+        unsafe { dynamic.byte_sub(ph.p_vaddr(NativeEndian) as usize) as usize }
+    };
+
+    let is_manual = at_entry == ld_entry; // Whether the dynamic linker was invoked as a command.
+
+    let mut i = 0;
+    let mut rela_ptr = None;
+    let mut rela_len = None;
+    let mut relr_ptr = None;
+    let mut relr_len = None;
+    let mut rel_ptr = None;
+    let mut rel_len = None;
+    loop {
+        let entry = unsafe { &*dynamic.add(i) };
+        let val = entry.d_val(NativeEndian);
+        let ptr = val as *const u8;
+        #[cfg(target_pointer_width = "32")]
+        let d_tag = entry.d_tag(NativeEndian);
+        #[cfg(target_pointer_width = "64")]
+        let d_tag = entry.d_tag(NativeEndian) as u32;
+        match d_tag {
+            elf::DT_NULL => break,
+            elf::DT_RELA => rela_ptr = Some(ptr.cast::<Rela>()),
+            elf::DT_RELASZ => rela_len = Some(val as usize / size_of::<Rela>()),
+            elf::DT_RELAENT => {
+                assert_eq!(val as usize, size_of::<Rela>(),);
+            }
+            elf::DT_REL => rel_ptr = Some(ptr.cast::<Rel>()),
+            elf::DT_RELSZ => rel_len = Some(val as usize / size_of::<Rel>()),
+            elf::DT_RELENT => {
+                assert_eq!(val as usize, size_of::<Rel>());
+            }
+            DT_RELR => relr_ptr = Some(ptr.cast::<Relr>()),
+            DT_RELRSZ => relr_len = Some(val as usize / size_of::<Relr>()),
+            DT_RELRENT => {
+                assert_eq!(val as usize, size_of::<Relr>());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let dyns = unsafe { slice::from_raw_parts(dynamic, i) };
+
+    unsafe fn get_array<'a, T>(
+        ptr: Option<*const T>,
+        len: Option<usize>,
+        base_addr: usize,
+    ) -> &'a [T] {
+        if let Some(ptr) = ptr {
+            let len = len.expect("dynamic entry was present without it's corresponding size");
+            unsafe { slice::from_raw_parts(ptr.byte_add(base_addr), len) }
+        } else {
+            &[]
+        }
+    }
+
+    fn do_relocs<'a, T>(relocs: &'a [T], self_base: usize)
+    where
+        Relocation: From<&'a T>,
+    {
+        for reloc in relocs {
+            let reloc: Relocation = reloc.into();
+            let ptr = (reloc.offset + self_base) as *mut usize;
+            if reloc.kind == RelocationKind::RELATIVE {
+                unsafe { *ptr = self_base + reloc.addend.unwrap_or_default() };
+            }
+        }
+    }
+
+    let rela = unsafe { get_array::<Rela>(rela_ptr, rela_len, self_base) };
+    let rel = unsafe { get_array::<Rel>(rel_ptr, rel_len, self_base) };
+    do_relocs(rela, self_base);
+    do_relocs(rel, self_base);
+
+    unsafe {
+        let relr = get_array(relr_ptr, relr_len, self_base);
+        apply_relr(self_base as *const u8, relr);
+    }
+
+    let mut base_addr = None;
+    if !is_manual {
+        // if we are not running in manual mode, then the main
+        // program is already loaded by the kernel and we want
+        // to use it. on redox, we treat it the same.
+        for ph in phdrs.iter() {
+            if ph.p_type(NativeEndian) == PT_PHDR {
+                assert!(base_addr.is_none(), "`PT_PHDR` cannot occur more than once");
+                base_addr = Some(unsafe {
+                    phdrs
+                        .as_ptr()
+                        .cast::<u8>()
+                        .sub(ph.p_vaddr(NativeEndian) as usize)
+                } as usize);
+            }
+        }
+    }
+
+    unsafe extern "C" {
+        safe static __ehdr_start: FileHeader;
+    }
+
+    let ph_off = __ehdr_start.e_phoff(NativeEndian) as usize;
+    let ph_num = __ehdr_start.e_phnum(NativeEndian) as usize;
+
+    let my_phdrs = unsafe {
+        slice::from_raw_parts(
+            core::ptr::addr_of!(__ehdr_start)
+                .byte_add(ph_off)
+                .cast::<ProgramHeader>(),
+            ph_num,
+        )
+    };
+
+    stage2(sp, self_base, is_manual, base_addr, dyns, my_phdrs)
+}
+
+fn stage2(
+    sp: &'static mut Stack,
+    self_base: usize,
+    is_manual: bool,
+    base_addr: Option<usize>,
+    my_dyns: &'static [Dyn],
+    my_phdrs: &'static [ProgramHeader],
+) -> usize {
     // Setup TCB for ourselves.
     unsafe {
         #[cfg(target_os = "redox")]
-        let thr_fd =
-            crate::platform::get_auxv_raw(sp.auxv().cast(), redox_rt::auxv_defs::AT_REDOX_THR_FD)
-                .expect_notls("no thread fd present");
+        let auxv = sp.auxv().cast();
+        #[cfg(target_os = "redox")]
+        let thr_fd = crate::platform::get_auxv_raw(auxv, redox_rt::auxv_defs::AT_REDOX_THR_FD)
+            .expect("no thread fd present");
 
-        let tcb = Tcb::new(0).expect_notls("ld.so: failed to allocate bootstrap TCB");
+        #[cfg(target_os = "redox")]
+        {
+            if redox_rt::current_filetable().fd().is_none() {
+                let filetable_fd = crate::platform::get_auxv_raw(
+                    sp.auxv().cast(),
+                    redox_rt::auxv_defs::AT_REDOX_FILETABLE_FD,
+                )
+                .expect("no filetable fd present");
+                let filetable_guard = redox_rt::proc::FdGuard::new(filetable_fd)
+                    .to_upper()
+                    .expect("failed to move filetable fd to upper table");
+                *redox_rt::current_filetable() =
+                    redox_rt::sys::FdTbl::from_binary_fd(filetable_guard)
+                        .expect("failed to initialize FILETABLE");
+            }
+        }
+
+        let tcb = Tcb::new(0).expect("[ld.so]: failed to allocate bootstrap TCB");
         tcb.activate(
             #[cfg(target_os = "redox")]
-            redox_rt::proc::FdGuard::new(thr_fd)
-                .to_upper()
-                .expect_notls("failed to move thread fd to upper table"),
+            Some(
+                redox_rt::proc::FdGuard::new(thr_fd)
+                    .to_upper()
+                    .expect("failed to move thread fd to upper table"),
+            ),
         );
         #[cfg(target_os = "redox")]
         {
-            let proc_fd = crate::platform::get_auxv_raw(
-                sp.auxv().cast(),
-                redox_rt::auxv_defs::AT_REDOX_PROC_FD,
-            )
-            .expect_notls("no proc fd present");
+            let proc_fd =
+                crate::platform::get_auxv_raw(auxv, redox_rt::auxv_defs::AT_REDOX_PROC_FD)
+                    .expect("no proc fd present");
+
+            let ns_fd = crate::platform::get_auxv_raw(auxv, redox_rt::auxv_defs::AT_REDOX_NS_FD)
+                .filter(|&fd| fd != usize::MAX)
+                .map(|fd| {
+                    redox_rt::proc::FdGuard::new(fd)
+                        .to_upper()
+                        .expect("failed to move ns fd to upper table")
+                });
 
             redox_rt::initialize(
                 redox_rt::proc::FdGuard::new(proc_fd)
                     .to_upper()
-                    .expect_notls("failed to move proc fd to upper table"),
+                    .expect("failed to move proc fd to upper table"),
+                ns_fd,
             );
             redox_rt::signal::setup_sighandler(&tcb.os_specific, true);
         }
@@ -210,23 +409,10 @@ pub unsafe extern "C" fn relibc_ld_so_start(sp: &'static mut Stack, ld_entry: us
                 .chain(core::iter::once(core::ptr::null_mut()))
                 .collect::<Vec<_>>(),
         );
-
-        crate::platform::environ = crate::platform::OUR_ENVIRON.unsafe_mut().as_mut_ptr();
     }
-
-    let is_manual = if let Some(img_entry) = get_auxv(&auxv, AT_ENTRY) {
-        img_entry == ld_entry
-    } else {
-        true
-    };
 
     // we might need global lock for this kind of stuff
-    _r_debug.lock().r_ldbase = ld_entry;
-
-    // TODO: Fix memory leak, although minimal.
-    unsafe {
-        crate::platform::init(auxv.clone());
-    }
+    _r_debug.lock().r_ldbase = self_base;
 
     let name_or_path = if is_manual {
         // ld.so is run directly by user and not via execve() or similar systemcall
@@ -239,47 +425,59 @@ pub unsafe extern "C" fn relibc_ld_so_start(sp: &'static mut Stack, ld_entry: us
             unistd::_exit(1);
         }
         unsafe { adjust_stack(sp) };
-        argv[1].to_string()
+        argv[1].clone()
     } else {
-        argv[0].to_string()
+        argv[0].clone()
     };
 
-    let (path, _name) = match resolve_path_name(&name_or_path, &envs) {
-        Some((p, n)) => (p, n),
-        None => {
-            eprintln!("ld.so: failed to locate '{}'", name_or_path);
-            unistd::_exit(1);
+    {
+        let name = name_or_path.split('/').next_back();
+        let level = envs.get(RELIBC_LOG_ENV_VAR_STR).map(|s| s.as_str());
+        if crate::platform::logger::init_inner(level, name).is_err() {
+            log::error!("Logger has already been initialised");
         }
+    }
+
+    // TODO: Fix memory leak, although minimal.
+    #[cfg(target_os = "redox")]
+    unsafe {
+        crate::platform::init_inner(auxv);
+    }
+
+    let Some((path, _name)) = resolve_path_name(&name_or_path, &envs) else {
+        eprintln!("[ld.so]: failed to locate '{name_or_path}'");
+        unistd::_exit(1);
     };
 
-    // if we are not running in manual mode, then the main
-    // program is already loaded by the kernel and we want
-    // to use it. on redox, we treat it the same.
-    let base_addr = {
-        let mut base = None;
-        if !is_manual && cfg!(not(target_os = "redox")) {
-            let phdr = get_auxv(&auxv, AT_PHDR).unwrap();
-            if phdr != 0 {
-                base = Some(phdr - SIZEOF_EHDR);
-            }
+    let config = Config::from_env(&envs);
+    if config.debug_flags.contains(DebugFlags::LOAD) {
+        println!("[ld.so]: relocated self at {self_base:#x}!");
+        if let Some(base_addr) = base_addr {
+            println!("[ld.so]: executable has been already loaded at {base_addr:#x?}");
         }
-        base
-    };
-    let mut linker = Linker::new(Config::from_env(&envs));
+    }
+
+    let mut linker = Linker::new(
+        Me {
+            base: self_base as *const u8,
+            phdrs: my_phdrs,
+            dyns: my_dyns,
+        },
+        config,
+    );
     let entry = match linker.load_program(&path, base_addr) {
         Ok(entry) => entry,
         Err(err) => {
-            eprintln!("[ld.so]: failed to link '{}': {:?}", path, err);
+            eprintln!("[ld.so]: failed to link '{path}': {err:?}");
             eprintln!("[ld.so]: enable debug output with `LD_DEBUG=all` for more information");
             unistd::_exit(1);
         }
     };
     if let Some(tcb) = unsafe { Tcb::current() } {
         tcb.linker_ptr = Box::into_raw(Box::new(Mutex::new(linker)));
-        tcb.mspace = ALLOCATOR.get();
     }
     if is_manual {
-        eprintln!("[ld.so]: entry '{}': {:#x}", path, entry);
+        eprintln!("[ld.so]: entry '{path}': {entry:#x}");
     }
     entry
 }

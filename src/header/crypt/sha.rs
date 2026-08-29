@@ -53,7 +53,7 @@ pub enum ShaType {
 /// # Note
 /// The `crypt_sha` function uses the SHA256 or SHA512 hashing algorithm for hashing.
 /// The output of the SHA operation is base64-encoded using the BCrypt variant of base64.
-pub fn crypt_sha(passw: &str, setting: &str, cipher: ShaType) -> Option<String> {
+pub fn crypt_sha(passw: &[u8], setting: &str, cipher: ShaType) -> Option<String> {
     let mut cursor = 3;
     let rounds;
 
@@ -77,18 +77,17 @@ pub fn crypt_sha(passw: &str, setting: &str, cipher: ShaType) -> Option<String> 
 
     let has_round;
     // 7 is len("rounds=")
-    if &setting[cursor..cursor + 7] == RSTRING {
+    if setting.get(cursor..cursor + 7) == Some(RSTRING) {
         cursor += 7;
         has_round = true;
-        if let Some(c_end) = setting[cursor..].chars().position(|r| r == '$') {
+        {
+            let c_end = setting[cursor..].chars().position(|r| r == '$')?;
             if let Ok(u) = setting[cursor..cursor + c_end].parse::<c_ulong>() {
                 cursor += c_end + 1;
                 rounds = u.min(ROUNDS_MAX as c_ulong).max(ROUNDS_MIN as c_ulong);
             } else {
                 return None;
             }
-        } else {
-            return None;
         }
     } else {
         has_round = false;
@@ -115,14 +114,14 @@ pub fn crypt_sha(passw: &str, setting: &str, cipher: ShaType) -> Option<String> 
 
     if let Ok(enc) = match cipher {
         ShaType::Sha256 => {
-            let params = Sha256Params::new(rounds as usize)
+            let params = Sha256Params::new(usize::try_from(rounds).expect("rounds below u32::MAX"))
                 .unwrap_or(Sha256Params::new(ROUNDS_DEFAULT).unwrap());
-            sha256_crypt_b64(passw.as_bytes(), setting.as_bytes(), &params)
+            sha256_crypt_b64(passw, setting.as_bytes(), &params)
         }
         ShaType::Sha512 => {
-            let params = Sha512Params::new(rounds as usize)
+            let params = Sha512Params::new(usize::try_from(rounds).expect("rounds below u32::MAX"))
                 .unwrap_or(Sha512Params::new(ROUNDS_DEFAULT).unwrap());
-            sha512_crypt_b64(passw.as_bytes(), setting.as_bytes(), &params)
+            sha512_crypt_b64(passw, setting.as_bytes(), &params)
         }
     } {
         let (r_slice, rn_slice) = if has_round {

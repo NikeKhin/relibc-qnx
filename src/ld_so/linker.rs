@@ -1,19 +1,17 @@
 use alloc::{
     collections::BTreeMap,
-    rc::Rc,
     string::{String, ToString},
     sync::{Arc, Weak},
     vec::Vec,
 };
+use object::elf;
+#[cfg(not(target_arch = "x86"))]
 use object::{
-    NativeEndian, elf,
+    NativeEndian,
     read::elf::{Rela as _, Sym},
 };
 
-use core::{
-    cell::RefCell,
-    ptr::{self, NonNull},
-};
+use core::ptr;
 
 use crate::{
     c_str::{CStr, CString},
@@ -23,21 +21,25 @@ use crate::{
         fcntl, sys_mman,
         unistd::F_OK,
     },
-    ld_so::dso::{SymbolBinding, resolve_sym},
+    ld_so::dso::{Dyn, SymbolBinding},
     out::Out,
     platform::{
         Pal, Sys,
-        types::{c_int, c_uint, c_void},
+        types::{c_int, c_void},
     },
     sync::rwlock::RwLock,
 };
 
+#[cfg(not(target_arch = "x86"))]
+use crate::{ld_so::dso::resolve_sym, platform::types::c_uint};
+
+#[cfg(not(target_arch = "x86"))]
+use super::dso::Rela;
 use super::{
     PATH_SEP,
     access::accessible,
-    callbacks::LinkerCallbacks,
     debug::{_dl_debug_state, _r_debug, RTLDState},
-    dso::{DSO, ProgramHeader, Rela},
+    dso::{DSO, ProgramHeader},
     tcb::{Master, Tcb},
 };
 
@@ -90,7 +92,10 @@ impl MmapFile {
         let mut stat = crate::header::sys_stat::stat::default();
         Sys::fstat(fd, Out::from_mut(&mut stat))?;
 
-        let size = stat.st_size as usize;
+        Self::from_fd(fd, stat.st_size as usize)
+    }
+
+    fn from_fd(fd: i32, size: usize) -> core::result::Result<Self, Errno> {
         let ptr = unsafe {
             Sys::mmap(
                 ptr::null_mut(),
@@ -105,8 +110,28 @@ impl MmapFile {
         Ok(Self { fd, ptr, size })
     }
 
+    fn anonymous(size: usize) -> core::result::Result<Self, Errno> {
+        let ptr = unsafe {
+            Sys::mmap(
+                ptr::null_mut(),
+                size,
+                sys_mman::PROT_READ | sys_mman::PROT_WRITE,
+                sys_mman::MAP_PRIVATE | sys_mman::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        }?;
+
+        Ok(Self { fd: -1, ptr, size })
+    }
+
     fn data(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.ptr.cast::<u8>(), self.size) }
+    }
+
+    #[expect(clippy::mut_from_ref)]
+    fn as_mut_slice(&self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.ptr.cast::<u8>(), self.size) }
     }
 }
 
@@ -114,7 +139,9 @@ impl Drop for MmapFile {
     fn drop(&mut self) {
         unsafe {
             Sys::munmap(self.ptr, self.size).unwrap();
-            Sys::close(self.fd).unwrap();
+            if self.fd != -1 {
+                Sys::close(self.fd).unwrap();
+            }
         }
     }
 }
@@ -295,41 +322,6 @@ impl Scope {
     }
 }
 
-// Used by dlfcn.h
-//
-// We need this as the handle must be created and destroyed with the dynamic
-// linker's allocator.
-pub struct ObjectHandle(*const DSO);
-
-impl ObjectHandle {
-    #[inline]
-    fn new(obj: Arc<DSO>) -> Self {
-        Self(Arc::into_raw(obj))
-    }
-
-    #[inline]
-    fn into_inner(self) -> Arc<DSO> {
-        unsafe { Arc::from_raw(self.0) }
-    }
-
-    #[inline]
-    pub fn as_ptr(&self) -> *const c_void {
-        self.0.cast()
-    }
-
-    #[inline]
-    pub fn from_ptr(ptr: *const c_void) -> Option<Self> {
-        NonNull::new(ptr as *mut DSO).map(|ptr| Self(ptr.as_ptr()))
-    }
-}
-
-impl AsRef<DSO> for ObjectHandle {
-    #[inline]
-    fn as_ref(&self) -> &DSO {
-        unsafe { &*self.0 }
-    }
-}
-
 bitflags::bitflags! {
     #[derive(Debug, Default)]
     pub struct DebugFlags: u32 {
@@ -344,7 +336,7 @@ bitflags::bitflags! {
 
 #[derive(Default)]
 pub struct Config {
-    debug_flags: DebugFlags,
+    pub debug_flags: DebugFlags,
     library_path: Option<String>,
     /// Resolve symbols at program startup.
     bind_now: bool,
@@ -384,29 +376,36 @@ impl Config {
     }
 }
 
+pub struct Me {
+    pub base: *const u8,
+    pub phdrs: &'static [ProgramHeader],
+    pub dyns: &'static [Dyn],
+}
+
 pub struct Linker {
     config: Config,
+
+    me: Me,
 
     next_object_id: usize,
     next_tls_module_id: usize,
     tls_size: usize,
     objects: BTreeMap<usize, Arc<DSO>>,
     name_to_object_id_map: BTreeMap<String, usize>,
-    pub cbs: Rc<RefCell<LinkerCallbacks>>,
 }
 
 const ROOT_ID: usize = 1;
 
 impl Linker {
-    pub fn new(config: Config) -> Self {
+    pub fn new(me: Me, config: Config) -> Self {
         Self {
+            me,
             config,
             next_object_id: ROOT_ID,
             next_tls_module_id: 1,
             tls_size: 0,
             objects: BTreeMap::new(),
             name_to_object_id_map: BTreeMap::new(),
-            cbs: Rc::new(RefCell::new(LinkerCallbacks::new())),
         }
     }
 
@@ -432,10 +431,13 @@ impl Linker {
         resolve: Resolve,
         scope: ScopeKind,
         noload: bool,
-    ) -> Result<ObjectHandle> {
-        trace!(
+    ) -> Result<Arc<DSO>> {
+        log::trace!(
             "[ld.so] load_library(name={:?}, resolve={:#?}, scope={:#?}, noload={})",
-            name, resolve, scope, noload
+            name,
+            resolve,
+            scope,
+            noload
         );
 
         if noload && resolve == Resolve::Now {
@@ -464,14 +466,14 @@ impl Linker {
                         self.scope_debug();
                     }
 
-                    Ok(ObjectHandle::new(obj.clone()))
+                    Ok(obj.clone())
                 } else if !noload {
                     let parent_runpath = &self
                         .objects
                         .get(&ROOT_ID)
-                        .and_then(|parent| parent.runpath().map(|path| path.to_string()));
+                        .and_then(|parent| parent.runpath().cloned());
 
-                    Ok(ObjectHandle::new(self.load_object(
+                    Ok(self.load_object(
                         name,
                         parent_runpath,
                         None,
@@ -482,29 +484,24 @@ impl Linker {
                             resolve
                         },
                         scope,
-                    )?))
+                    )?)
                 } else {
-                    // FIXME: LoadError?
-                    // Err(Error::Malformed(format!(
-                    //     "object '{}' has not yet been loaded",
-                    //     name
-                    // )))
-                    Ok(ObjectHandle(ptr::null()))
+                    Err(DlError::NotFound)
                 }
             }
 
             None => match self.objects.get(&ROOT_ID) {
-                Some(obj) => Ok(ObjectHandle::new(obj.clone())),
+                Some(obj) => Ok(obj.clone()),
                 None => Err(DlError::NotFound),
             },
         }
     }
 
-    pub fn get_sym(&self, handle: Option<ObjectHandle>, name: &str) -> Option<*mut c_void> {
+    pub fn get_sym(&self, handle: Option<&DSO>, name: &str) -> Option<*mut c_void> {
         let guard;
 
-        if let Some(handle) = handle.as_ref() {
-            handle.as_ref().scope()
+        if let Some(handle) = handle {
+            handle.scope()
         } else {
             guard = GLOBAL_SCOPE.read();
             &guard
@@ -519,18 +516,17 @@ impl Linker {
                     ti_offset: symbol.value,
                 };
 
-                unsafe { __tls_get_addr(&mut tls_index) }
+                unsafe { __tls_get_addr(&raw mut tls_index) }
             }
         })
     }
 
-    pub fn unload(&mut self, handle: ObjectHandle) {
-        let obj = handle.into_inner();
+    pub fn unload(&mut self, obj: Arc<DSO>) {
         if !obj.dlopened {
             return;
         }
 
-        trace!(
+        log::trace!(
             "[ld.so] unloading {} (sc={}, wc={})",
             obj.name,
             Arc::strong_count(&obj),
@@ -551,12 +547,11 @@ impl Linker {
 
             let _ = self.objects.remove(&obj.id).unwrap();
             for dep in obj.dependencies() {
-                self.unload(ObjectHandle::new(
-                    self.objects
-                        .get(self.name_to_object_id_map.get(*dep).unwrap())
-                        .unwrap()
-                        .clone(),
-                ));
+                if let Some(name) = self.name_to_object_id_map.get(*dep)
+                    && let Some(object_name) = self.objects.get(name)
+                {
+                    self.unload(object_name.clone());
+                }
             }
             self.name_to_object_id_map.remove(&obj.name);
             assert!(Arc::strong_count(&obj) == 1);
@@ -568,7 +563,9 @@ impl Linker {
 
     pub fn fini(&self) {
         for obj in self.objects.values() {
-            obj.run_fini();
+            unsafe {
+                obj.run_fini();
+            }
         }
     }
 
@@ -628,7 +625,7 @@ impl Linker {
             Resolve::Now
         };
 
-        _r_debug.lock().state = RTLDState::RT_ADD;
+        _r_debug.lock().state = RTLDState::RtAdd;
         _dl_debug_state();
 
         let mut new_objects = Vec::new();
@@ -647,7 +644,7 @@ impl Linker {
         )?;
 
         for (i, obj) in new_objects.iter().enumerate() {
-            obj.relocate(&objects_data[i], resolve).unwrap();
+            obj.relocate(objects_data[i].as_deref(), resolve).unwrap();
         }
 
         unsafe {
@@ -669,14 +666,18 @@ impl Linker {
                     let new_tcb_len = new_tcb.generic.tcb_len;
 
                     // Unmap just the TCB page.
-                    Sys::munmap(new_tcb as *mut Tcb as *mut c_void, syscall::PAGE_SIZE).unwrap();
+                    Sys::munmap(
+                        core::ptr::from_mut::<Tcb>(new_tcb).cast::<c_void>(),
+                        syscall::PAGE_SIZE,
+                    )
+                    .unwrap();
 
                     let new_addr = ptr::addr_of!(*new_tcb) as usize;
 
                     assert_eq!(
                         syscall::syscall5(
                             syscall::SYS_MREMAP,
-                            old_tcb as *mut Tcb as usize,
+                            core::ptr::from_mut::<Tcb>(old_tcb) as usize,
                             syscall::PAGE_SIZE,
                             new_addr,
                             syscall::PAGE_SIZE,
@@ -697,7 +698,11 @@ impl Linker {
                     new_tcb.generic.tcb_len = new_tcb_len;
 
                     drop(_guard);
-                    (new_tcb, old_tcb as *mut Tcb as *mut c_void, thr_fd)
+                    (
+                        new_tcb,
+                        core::ptr::from_mut::<Tcb>(old_tcb).cast::<c_void>(),
+                        thr_fd,
+                    )
                 };
 
                 #[cfg(not(target_os = "redox"))]
@@ -738,7 +743,7 @@ impl Linker {
                 tcb.copy_masters().map_err(|_| DlError::Malformed)?;
                 tcb.activate(
                     #[cfg(target_os = "redox")]
-                    thr_fd,
+                    Some(thr_fd),
                 );
 
                 #[cfg(target_os = "redox")]
@@ -755,12 +760,15 @@ impl Linker {
         }
 
         for obj in new_objects.into_iter() {
-            obj.mark_ready();
+            // SAFETY: `obj` and its dependencies have been successfuly loaded.
+            unsafe {
+                obj.mark_ready();
+            }
             self.run_init(&obj);
             self.register_object(obj);
         }
 
-        _r_debug.lock().state = RTLDState::RT_CONSISTENT;
+        _r_debug.lock().state = RTLDState::RtConsistent;
         _dl_debug_state();
 
         Ok(loaded_dso)
@@ -784,14 +792,15 @@ impl Linker {
     ///
     /// If a dependency has already been loaded, it is *not* added to the scope
     /// nor to `new_objects`.
-    fn load_objects_recursive<'a>(
+    #[expect(clippy::too_many_arguments)]
+    fn load_objects_recursive(
         &mut self,
         name: &str,
         parent_runpath: &Option<String>,
         base_addr: Option<usize>,
         dlopened: bool,
         new_objects: &mut Vec<Arc<DSO>>,
-        objects_data: &mut Vec<Vec<ProgramHeader>>,
+        objects_data: &mut Vec<Option<Vec<ProgramHeader>>>,
         tcb_masters: &mut Vec<Master>,
         // Scope of the object that caused this object to be loaded.
         dependent_scope: Option<&mut Scope>,
@@ -824,6 +833,51 @@ impl Linker {
 
         let debug = self.config.debug_flags.contains(DebugFlags::LOAD);
 
+        if name == "libc.so.6" || name == "libc.so" {
+            let (me, master) = DSO::from_raw(
+                self.me.base,
+                self.me.dyns,
+                self.me.phdrs,
+                self.next_object_id,
+                self.next_tls_module_id,
+                self.tls_size.next_multiple_of(16),
+            );
+
+            if debug {
+                let bounds = me.find_bounds(self.me.phdrs);
+
+                eprintln!(
+                    "[ld.so]: loading object: libc.so.6 (aka. ld.so) at {:#x}:{:#x} (pie: {})",
+                    bounds.0, bounds.1, me.pie,
+                );
+            }
+
+            self.tls_size = master.offset;
+            self.next_tls_module_id += 1;
+            self.next_object_id += 1;
+
+            let obj = Arc::new(me);
+
+            tcb_masters.push(master);
+            objects_data.push(None);
+            new_objects.push(obj.clone());
+
+            if let Some(dependent_scope) = dependent_scope {
+                match scope_kind {
+                    ScopeKind::Local => dependent_scope.add(&obj),
+                    ScopeKind::Global => GLOBAL_SCOPE.write().add(&obj),
+                }
+            } else if let ScopeKind::Global = scope_kind {
+                GLOBAL_SCOPE.write().add(&obj);
+            }
+
+            let mut scope = Scope::local();
+            scope.set_owner(Arc::downgrade(&obj));
+            obj.scope.call_once(|| scope);
+
+            return Ok(obj);
+        }
+
         let path = self.search_object(name, parent_runpath)?;
         let file = self.read_file(&path)?;
         let data = file.data();
@@ -849,8 +903,8 @@ impl Linker {
             eprintln!(
                 "[ld.so]: loading object: {} at {:#x}:{:#x} (pie: {})",
                 name,
-                obj.mmap.as_ptr() as usize,
-                obj.mmap.as_ptr() as usize + obj.mmap.len(),
+                obj.mmap.as_ref().unwrap().as_ptr() as usize,
+                obj.mmap.as_ref().unwrap().as_ptr() as usize + obj.mmap.as_ref().unwrap().size(),
                 obj.pie,
             );
         }
@@ -866,7 +920,7 @@ impl Linker {
             self.next_tls_module_id += 1;
         }
 
-        let runpath = obj.runpath().map(|rpath| rpath.to_string());
+        let runpath = obj.runpath().cloned();
         let dependencies = obj
             .dependencies()
             .iter()
@@ -899,7 +953,7 @@ impl Linker {
             )?;
         }
 
-        objects_data.push(elf);
+        objects_data.push(Some(elf));
         new_objects.push(obj.clone());
 
         scope.set_owner(Arc::downgrade(&obj));
@@ -961,14 +1015,16 @@ impl Linker {
             DlError::NotFound
         })?;
 
-        let flags = fcntl::O_RDONLY | fcntl::O_CLOEXEC;
-        let file = MmapFile::open(CStr::borrow(&path_c), flags).map_err(|err| {
-            if debug {
-                eprintln!("[ld.so]: failed to open '{}': {}", path, err)
-            }
+        let file = {
+            let flags = fcntl::O_RDONLY | fcntl::O_CLOEXEC;
+            MmapFile::open(CStr::borrow(&path_c), flags).map_err(|err| {
+                if debug {
+                    eprintln!("[ld.so]: failed to open '{}': {}", path, err)
+                }
 
-            DlError::NotFound
-        })?;
+                DlError::NotFound
+            })?
+        };
 
         Ok(file)
     }
@@ -1012,7 +1068,7 @@ impl Linker {
 #[cfg(target_pointer_width = "64")]
 extern "C" fn __plt_resolve_inner(obj: *const DSO, relocation_index: c_uint) -> *mut c_void {
     let obj = unsafe { &*obj };
-    let obj_base = obj.mmap.as_ptr() as usize;
+    let obj_base = obj.base as usize;
     let jmprel = obj.dynamic.jmprel;
 
     let rela = unsafe { &*(jmprel as *const Rela).add(relocation_index as usize) };
@@ -1042,8 +1098,8 @@ extern "C" fn __plt_resolve_inner(obj: *const DSO, relocation_index: c_uint) -> 
     } else {
         rela.r_offset(NativeEndian) as *mut u64
     };
-
-    trace!("@plt: {} -> *mut {:p}", name, ptr);
+    #[cfg(feature = "trace_tls")]
+    log::trace!("@plt: {} -> *mut {:p}", name, ptr);
 
     unsafe { *ptr = resolved as u64 }
     resolved

@@ -93,6 +93,7 @@ impl<R: Read> BufReader<R> {
     ///     Ok(())
     /// }
     /// ```
+    #[expect(clippy::uninit_vec, reason = "buffer is initialized after set_len")]
     pub fn with_capacity(cap: usize, inner: R) -> BufReader<R> {
         unsafe {
             let mut buffer = Vec::with_capacity(cap);
@@ -142,13 +143,11 @@ impl<R: Seek> BufReader<R> {
                 self.pos = new_pos as usize;
                 return Ok(());
             }
-        } else {
-            if let Some(new_pos) = pos.checked_add(offset as u64) {
-                if new_pos <= self.cap as u64 {
-                    self.pos = new_pos as usize;
-                    return Ok(());
-                }
-            }
+        } else if let Some(new_pos) = pos.checked_add(offset as u64)
+            && new_pos <= self.cap as u64
+        {
+            self.pos = new_pos as usize;
+            return Ok(());
         }
         self.seek(SeekFrom::Current(offset)).map(|_| ())
     }
@@ -172,7 +171,7 @@ impl<R: Read> Read for BufReader<R> {
 
     // we can't skip unconditionally because of the large buffer case in read.
     unsafe fn initializer(&self) -> Initializer {
-        self.inner.initializer()
+        unsafe { self.inner.initializer() }
     }
 }
 
@@ -207,9 +206,9 @@ impl<R: Seek> Seek for BufReader<R> {
     /// `.into_inner()` immediately after a seek yields the underlying reader
     /// at the same position.
     ///
-    /// To seek without discarding the internal buffer, use [`Seek::seek_relative`].
+    /// To seek without discarding the internal buffer, use [`seek_relative`](crate::io::BufReader::seek_relative).
     ///
-    /// See [`std::io::Seek`] for more details.
+    /// See [`std::io::Seek`](https://doc.rust-lang.org/std/io/trait.Seek.html) for more details.
     ///
     /// Note: In the edge case where you're seeking with `SeekFrom::Current(n)`
     /// where `n` minus the internal buffer length overflows an `i64`, two
@@ -219,7 +218,7 @@ impl<R: Seek> Seek for BufReader<R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let result: u64;
         if let SeekFrom::Current(n) = pos {
-            let remainder = (self.cap - self.pos) as i64;
+            let remainder = i64::try_from(self.cap - self.pos).expect("allocated 8 exbibytes");
             // it should be safe to assume that remainder fits within an i64 as the alternative
             // means we managed to allocate 8 exbibytes and that's absurd.
             // But it's not out of the realm of possibility for some weird underlying reader to
@@ -334,7 +333,7 @@ pub struct BufWriter<W: Write> {
 /// };
 /// ```
 #[derive(Debug)]
-pub struct IntoInnerError<W>(W, Error);
+pub struct IntoInnerError<W>(pub W, pub Error);
 
 impl<W: Write> BufWriter<W> {
     /// Creates a new `BufWriter` with a default buffer capacity. The default is currently 8 KB,
@@ -350,6 +349,24 @@ impl<W: Write> BufWriter<W> {
     /// ```
     pub fn new(inner: W) -> BufWriter<W> {
         BufWriter::with_capacity(DEFAULT_BUF_SIZE, inner)
+    }
+
+    /// Creates a new `BufWriter` with a zero buffer capacity.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::io::BufWriter;
+    /// use std::net::TcpStream;
+    ///
+    /// let mut buffer = BufWriter::new(TcpStream::connect("127.0.0.1:34254").unwrap());
+    /// ```
+    pub const fn new_const(inner: W) -> BufWriter<W> {
+        BufWriter {
+            inner: Some(inner),
+            buf: Vec::new(),
+            panicked: false,
+        }
     }
 
     /// Creates a new `BufWriter` with the specified buffer capacity.
@@ -394,9 +411,10 @@ impl<W: Write> BufWriter<W> {
         let mut written = 0;
         let len = self.buf.len();
         let mut ret = Ok(());
+        let writer = self.inner.as_mut().unwrap();
         while written < len {
             self.panicked = true;
-            let r = self.inner.as_mut().unwrap().write(&self.buf[written..]);
+            let r = writer.write(&self.buf[written..]);
             self.panicked = false;
 
             match r {
@@ -446,7 +464,8 @@ impl<W: Write> BufWriter<W> {
     ///
     /// # Errors
     ///
-    /// An `Err` will be returned if an error occurs while flushing the buffer.
+    /// An `Err` will be returned if an error occurs while flushing the buffer,
+    /// the pending buffer will be dropped in that case.
     ///
     /// # Examples
     ///
@@ -459,20 +478,27 @@ impl<W: Write> BufWriter<W> {
     /// // unwrap the TcpStream and flush the buffer
     /// let stream = buffer.into_inner().unwrap();
     /// ```
-    pub fn into_inner(mut self) -> Result<W, IntoInnerError<BufWriter<W>>> {
-        match self.flush_buf() {
-            Err(e) => Err(IntoInnerError(self, e)),
-            Ok(()) => Ok(self.inner.take().unwrap()),
+    pub fn into_inner(mut self) -> Result<W, IntoInnerError<W>> {
+        let r = self.flush_buf();
+        let inner = self.inner.take().unwrap();
+        match r {
+            Err(e) => Err(IntoInnerError(inner, e)),
+            Ok(()) => Ok(inner),
         }
     }
 }
 
 impl<W: Write> Write for BufWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if self.buf.len() + buf.len() > self.buf.capacity() {
+        let mut cap = self.buf.capacity();
+        if cap == 0 {
+            self.buf = Vec::with_capacity(DEFAULT_BUF_SIZE);
+            cap = DEFAULT_BUF_SIZE;
+        }
+        if self.buf.len() + buf.len() > cap {
             self.flush_buf()?;
         }
-        if buf.len() >= self.buf.capacity() {
+        if buf.len() >= cap {
             self.panicked = true;
             let r = self.inner.as_mut().unwrap().write(buf);
             self.panicked = false;
@@ -506,7 +532,7 @@ impl<W: Write + Seek> Seek for BufWriter<W> {
     ///
     /// Seeking always writes out the internal buffer before seeking.
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.flush_buf().and_then(|_| self.get_mut().seek(pos))
+        self.flush_buf().and_then(|()| self.get_mut().seek(pos))
     }
 }
 
@@ -599,6 +625,27 @@ impl<W: Write> LineWriter<W> {
         LineWriter::with_capacity(1024, inner)
     }
 
+    /// Creates a new `LineWriter`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::fs::File;
+    /// use std::io::LineWriter;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let file = File::create("poem.txt")?;
+    ///     let file = LineWriter::new(file);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub const fn new_const(inner: W) -> LineWriter<W> {
+        LineWriter {
+            inner: BufWriter::new_const(inner),
+            need_flush: false,
+        }
+    }
+
     /// Creates a new `LineWriter` with a specified capacity for the internal
     /// buffer.
     ///
@@ -664,6 +711,10 @@ impl<W: Write> LineWriter<W> {
     pub fn get_mut(&mut self) -> &mut W {
         self.inner.get_mut()
     }
+
+    pub fn into_inner(self) -> Result<W, IntoInnerError<W>> {
+        self.inner.into_inner()
+    }
 }
 
 impl<W: Write> Write for LineWriter<W> {
@@ -675,9 +726,8 @@ impl<W: Write> Write for LineWriter<W> {
         // Find the last newline character in the buffer provided. If found then
         // we're going to write all the data up to that point and then flush,
         // otherwise we just write the whole block to the underlying writer.
-        let i = match memchr::memrchr(b'\n', buf) {
-            Some(i) => i,
-            None => return self.inner.write(buf),
+        let Some(i) = memchr::memrchr(b'\n', buf) else {
+            return self.inner.write(buf);
         };
 
         // Ok, we're going to write a partial amount of the data given first
@@ -706,6 +756,23 @@ impl<W: Write> Write for LineWriter<W> {
         self.inner.flush()?;
         self.need_flush = false;
         Ok(())
+    }
+}
+
+impl<W: Write> From<BufWriter<W>> for LineWriter<W> {
+    fn from(value: BufWriter<W>) -> Self {
+        // TODO: this is fast, but is it correct?
+        let need_flush = !value.buf.is_empty();
+        Self {
+            inner: value,
+            need_flush,
+        }
+    }
+}
+
+impl<W: Write> From<LineWriter<W>> for BufWriter<W> {
+    fn from(value: LineWriter<W>) -> Self {
+        value.inner
     }
 }
 
@@ -827,7 +894,7 @@ mod tests {
                         self.pos = self.pos.wrapping_add(n as u64);
                     }
                     SeekFrom::End(n) => {
-                        self.pos = u64::max_value().wrapping_add(n as u64);
+                        self.pos = u64::MAX.wrapping_add(n as u64);
                     }
                 }
                 Ok(self.pos)
@@ -836,15 +903,12 @@ mod tests {
 
         let mut reader = BufReader::with_capacity(5, PositionReader { pos: 0 });
         assert_eq!(reader.fill_buf().ok(), Some(&[0, 1, 2, 3, 4][..]));
-        assert_eq!(
-            reader.seek(SeekFrom::End(-5)).ok(),
-            Some(u64::max_value() - 5)
-        );
+        assert_eq!(reader.seek(SeekFrom::End(-5)).ok(), Some(u64::MAX - 5));
         assert_eq!(reader.fill_buf().ok().map(|s| s.len()), Some(5));
         // the following seek will require two underlying seeks
         let expected = 9223372036854775802;
         assert_eq!(
-            reader.seek(SeekFrom::Current(i64::min_value())).ok(),
+            reader.seek(SeekFrom::Current(i64::MIN)).ok(),
             Some(expected)
         );
         assert_eq!(reader.fill_buf().ok().map(|s| s.len()), Some(5));

@@ -1,20 +1,17 @@
 use super::{
-    super::{Pal, PalEpoll, types::*},
+    super::{
+        Pal, PalEpoll,
+        types::{c_int, c_uint},
+    },
     Sys,
 };
 
 use crate::{
-    error::{Errno, ResultExt},
-    fs::File,
-    header::{errno::*, fcntl::*, signal::sigset_t, sys_epoll::*},
-    io::prelude::*,
-    platform,
+    error::Errno,
+    header::{bits_sigset_t::sigset_t, errno::*, fcntl::*, sys_epoll::*},
 };
 use core::{mem, slice};
-use syscall::{
-    data::{Event, TimeSpec},
-    flag::EVENT_READ,
-};
+use syscall::{data::Event, flag::EVENT_READ};
 
 fn epoll_to_event_flags(epoll: c_uint) -> syscall::EventFlags {
     let mut event_flags = syscall::EventFlags::empty();
@@ -27,12 +24,11 @@ fn epoll_to_event_flags(epoll: c_uint) -> syscall::EventFlags {
         event_flags |= syscall::EventFlags::EVENT_WRITE;
     }
 
-    /*TODO: support more EPOLL flags
+    /*TODO: support more EPOLL flags  */
     let unsupported = !(EPOLLIN | EPOLLOUT);
     if epoll & unsupported != 0 {
-        eprintln!("epoll unsupported flags 0x{:X}", epoll & unsupported);
+        log::trace!("epoll unsupported flags 0x{:X}", epoll & unsupported);
     }
-    */
 
     event_flags
 }
@@ -53,7 +49,10 @@ fn event_flags_to_epoll(flags: syscall::EventFlags) -> c_uint {
 
 impl PalEpoll for Sys {
     fn epoll_create1(flags: c_int) -> Result<c_int, Errno> {
-        Sys::open(c"/scheme/event".into(), O_RDWR | flags, 0)
+        match redox_rt::sys::open("/scheme/event", (O_RDWR | flags) as usize) {
+            Ok(fd) => Ok(fd as c_int),
+            Err(e) => Err(Errno::from(e)),
+        }
     }
 
     unsafe fn epoll_ctl(
@@ -96,72 +95,70 @@ impl PalEpoll for Sys {
         events: *mut epoll_event,
         maxevents: c_int,
         timeout: c_int,
-        _sigset: *const sigset_t,
+        sigset: *const sigset_t,
     ) -> Result<usize, Errno> {
-        // TODO: sigset
         assert_eq!(mem::size_of::<epoll_event>(), mem::size_of::<Event>());
 
         if maxevents <= 0 {
             return Err(Errno(EINVAL));
         }
 
-        let timer_opt = if timeout != -1 {
-            let mut timer = File::open(c"/scheme/time/4".into(), O_RDWR)?;
-            Sys::write(
-                epfd,
-                &Event {
-                    id: timer.fd as usize,
-                    flags: EVENT_READ,
-                    data: 0,
-                },
-            )?;
+        if timeout != -1 {
+            register_timeout(epfd, timeout)?;
+        }
 
-            let mut time = TimeSpec::default();
-            let _ = timer
-                .read(&mut time)
-                .map_err(|err| Errno(err.raw_os_error().unwrap_or(EIO)))?;
-            time.tv_sec += (timeout as i64) / 1000;
-            time.tv_nsec += (timeout % 1000) * 1000000;
-            let _ = timer
-                .write(&time)
-                .map_err(|err| Errno(err.raw_os_error().unwrap_or(EIO)))?;
-
-            Some(timer)
-        } else {
-            None
+        let callback = || {
+            syscall::read(epfd as usize, unsafe {
+                slice::from_raw_parts_mut(
+                    events.cast::<u8>(),
+                    maxevents as usize * mem::size_of::<syscall::Event>(),
+                )
+            })
         };
 
-        let bytes_read = Sys::read(epfd, unsafe {
-            slice::from_raw_parts_mut(
-                events as *mut u8,
-                maxevents as usize * mem::size_of::<syscall::Event>(),
-            )
-        })?;
+        let bytes_read = if sigset.is_null() {
+            callback()
+        } else {
+            // Allowset is inverse of sigset mask
+            let allowset = !unsafe { *sigset };
+            redox_rt::signal::callback_or_signal_async(allowset, callback)
+        }?;
+
         let read = bytes_read as usize / mem::size_of::<syscall::Event>();
 
         let mut count = 0;
         for i in 0..read {
             unsafe {
-                let event_ptr = events.add(i);
+                let event_ptr = (events.cast::<Event>()).add(i);
                 let target_ptr = events.add(count);
-                let event = *(event_ptr as *mut Event);
-                if let Some(ref timer) = timer_opt {
-                    if event.id as c_int == timer.fd {
-                        // Do not count timer event
-                        continue;
-                    }
+                let event = *event_ptr;
+                if event.id == syscall::EVENT_TIMEOUT_ID {
+                    continue;
                 }
-                *target_ptr = epoll_event {
-                    events: event_flags_to_epoll(event.flags),
-                    data: epoll_data {
+                *target_ptr = epoll_event::new(
+                    event_flags_to_epoll(event.flags),
+                    epoll_data {
                         u64: event.data as u64,
                     },
-                    ..Default::default()
-                };
+                );
                 count += 1;
             }
         }
 
         Ok(count)
     }
+}
+
+fn register_timeout(epfd: i32, timeout: i32) -> Result<usize, Errno> {
+    if timeout < 0 {
+        return Err(Errno(EINVAL));
+    }
+    Sys::write(
+        epfd,
+        &Event {
+            id: syscall::EVENT_TIMEOUT_ID,
+            flags: EVENT_READ,
+            data: timeout as usize,
+        },
+    )
 }

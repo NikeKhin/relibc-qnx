@@ -2,7 +2,6 @@
 //!
 //! See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/dlfcn.h.html>.
 
-#![deny(unsafe_op_in_unsafe_fn)]
 // FIXME(andypython): remove this when #![allow(warnings, unused_variables)] is
 // dropped from src/lib.rs.
 #![warn(warnings, unused_variables)]
@@ -12,22 +11,41 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use alloc::sync::Arc;
+
 use crate::{
     c_str::CStr,
     ld_so::{
-        linker::{DlError, ObjectHandle, Resolve, ScopeKind},
+        dso::DSO,
+        linker::{DlError, Resolve, ScopeKind},
         tcb::Tcb,
     },
     platform::types::{c_char, c_int, c_void},
 };
 
+/// Relocations are performed at an implementation-defined time.
 pub const RTLD_LAZY: c_int = 1 << 0;
+/// Relocations are performed when the object is loaded.
 pub const RTLD_NOW: c_int = 1 << 1;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/dlopen.3.html>.
+/// Don't load the shared object.
 pub const RTLD_NOLOAD: c_int = 1 << 2;
+/// All symbols are available for relocation processing of other modules.
 pub const RTLD_GLOBAL: c_int = 1 << 8;
+/// All symbold are not made available for relocation processing by other
+/// modules.
 pub const RTLD_LOCAL: c_int = 0x0000;
 
-pub const RTLD_DEFAULT: *mut c_void = 0 as *mut c_void; // XXX: cbindgen doesn't like ptr::null_mut()
+/// Special purpose value for `handle` for `dlsym()` reserved by POSIX for
+/// future use.
+/// The identifier lookup happens in the normal global scope; that is, a
+/// search for an identifier using `handle` would find the same definition
+/// as a direct use of this identifier in the program code.
+#[expect(
+    clippy::zero_ptr,
+    reason = "cbindgen issue: https://github.com/mozilla/cbindgen/issues/948"
+)]
+pub const RTLD_DEFAULT: *mut c_void = 0 as *mut c_void; // XXX: cbindgen doesn't like ptr::null_mut() for publically exported constants
 
 static ERROR_NOT_SUPPORTED: &core::ffi::CStr = c"dlfcn not supported";
 
@@ -42,13 +60,17 @@ fn set_last_error(error: DlError) {
 #[repr(C)]
 #[allow(non_camel_case_types)]
 pub struct Dl_info_t {
+    /// Pathname of mapped object file.
     dli_fname: *const c_char,
+    /// Base of mapped address range.
     dli_fbase: *mut c_void,
+    /// Symbol name or null pointer.
     dli_sname: *const c_char,
+    /// Symbol address of null pointer.
     dli_saddr: *mut c_void,
 }
 
-/// alias as per spec update: https://www.austingroupbugs.net/view.php?id=1847
+/// alias as per spec update: <https://www.austingroupbugs.net/view.php?id=1847>
 pub type Dl_info = Dl_info_t;
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/dladdr.html>.
@@ -92,12 +114,9 @@ pub unsafe extern "C" fn dlopen(cfilename: *const c_char, flags: c_int) -> *mut 
         }
     };
 
-    let tcb = match unsafe { Tcb::current() } {
-        Some(tcb) => tcb,
-        None => {
-            ERROR.store(ERROR_NOT_SUPPORTED.as_ptr() as usize, Ordering::SeqCst);
-            return ptr::null_mut();
-        }
+    let Some(tcb) = (unsafe { Tcb::current() }) else {
+        ERROR.store(ERROR_NOT_SUPPORTED.as_ptr() as usize, Ordering::SeqCst);
+        return ptr::null_mut();
     };
 
     if tcb.linker_ptr.is_null() {
@@ -107,11 +126,8 @@ pub unsafe extern "C" fn dlopen(cfilename: *const c_char, flags: c_int) -> *mut 
 
     let mut linker = unsafe { (*tcb.linker_ptr).lock() };
 
-    let cbs_c = linker.cbs.clone();
-    let cbs = cbs_c.borrow();
-
-    match (cbs.load_library)(&mut linker, filename, resolve, scope, noload) {
-        Ok(handle) => handle.as_ptr().cast_mut(),
+    match linker.load_library(filename, resolve, scope, noload) {
+        Ok(handle) => Arc::into_raw(handle).cast::<c_void>().cast_mut(),
         Err(error) => {
             set_last_error(error);
             ptr::null_mut()
@@ -122,7 +138,7 @@ pub unsafe extern "C" fn dlopen(cfilename: *const c_char, flags: c_int) -> *mut 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/dlsym.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
-    let handle = ObjectHandle::from_ptr(handle);
+    let handle = unsafe { handle.cast::<DSO>().as_ref() };
 
     if symbol.is_null() {
         ERROR.store(ERROR_NOT_SUPPORTED.as_ptr() as usize, Ordering::SeqCst);
@@ -134,12 +150,9 @@ pub unsafe extern "C" fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *m
     // FIXME(andypython): just call obj.scope.get_sym() directly or search the
     // global scope.  The rest is unnecessary as Linker::get_sym() does not
     // depend on the Linker state.
-    let tcb = match unsafe { Tcb::current() } {
-        Some(tcb) => tcb,
-        None => {
-            ERROR.store(ERROR_NOT_SUPPORTED.as_ptr() as usize, Ordering::SeqCst);
-            return ptr::null_mut();
-        }
+    let Some(tcb) = (unsafe { Tcb::current() }) else {
+        ERROR.store(ERROR_NOT_SUPPORTED.as_ptr() as usize, Ordering::SeqCst);
+        return ptr::null_mut();
     };
 
     if tcb.linker_ptr.is_null() {
@@ -148,9 +161,8 @@ pub unsafe extern "C" fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *m
     }
 
     let linker = unsafe { (*tcb.linker_ptr).lock() };
-    let cbs_c = linker.cbs.clone();
-    let cbs = cbs_c.borrow();
-    match (cbs.get_sym)(&linker, handle, symbol_str) {
+
+    match linker.get_sym(handle, symbol_str) {
         Some(sym) => sym,
         _ => {
             ERROR.store(ERROR_NOT_SUPPORTED.as_ptr() as usize, Ordering::SeqCst);
@@ -162,12 +174,9 @@ pub unsafe extern "C" fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *m
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/dlclose.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
-    let tcb = match unsafe { Tcb::current() } {
-        Some(tcb) => tcb,
-        None => {
-            ERROR.store(ERROR_NOT_SUPPORTED.as_ptr() as usize, Ordering::SeqCst);
-            return -1;
-        }
+    let Some(tcb) = (unsafe { Tcb::current() }) else {
+        ERROR.store(ERROR_NOT_SUPPORTED.as_ptr() as usize, Ordering::SeqCst);
+        return -1;
     };
 
     if tcb.linker_ptr.is_null() {
@@ -175,15 +184,14 @@ pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
         return -1;
     };
 
-    let Some(handle) = ObjectHandle::from_ptr(handle) else {
+    if handle.is_null() {
         set_last_error(DlError::InvalidHandle);
         return -1;
-    };
+    }
 
     let mut linker = unsafe { (*tcb.linker_ptr).lock() };
-    let cbs_c = linker.cbs.clone();
-    let cbs = cbs_c.borrow();
-    (cbs.unload)(&mut linker, handle);
+    let obj = unsafe { Arc::from_raw(handle.cast::<DSO>()) };
+    linker.unload(obj);
     0
 }
 
@@ -192,6 +200,3 @@ pub unsafe extern "C" fn dlclose(handle: *mut c_void) -> c_int {
 pub extern "C" fn dlerror() -> *mut c_char {
     ERROR.swap(0, Ordering::SeqCst) as *mut c_char
 }
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn cbindgen_stupid_alias_dlinfo_for_dladdr(_: Dl_info) {}

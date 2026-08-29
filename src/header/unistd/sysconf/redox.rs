@@ -1,49 +1,16 @@
 use core::convert::TryInto;
 
-use alloc::string::String;
-
 use crate::{
     error::Errno,
     fs::File,
-    header::{errno, fcntl, limits, sys_statvfs},
+    header::{errno, fcntl, limits, sys_statvfs, unistd::sysconf::constants::*},
     io::Read,
     out::Out,
-    platform::{self, Pal, Sys, types::*},
+    platform::{
+        self, Pal, Sys,
+        types::{c_int, c_long},
+    },
 };
-
-// POSIX.1 {
-pub const _SC_ARG_MAX: c_int = 0;
-pub const _SC_CHILD_MAX: c_int = 1;
-pub const _SC_CLK_TCK: c_int = 2;
-pub const _SC_NGROUPS_MAX: c_int = 3;
-pub const _SC_OPEN_MAX: c_int = 4;
-pub const _SC_STREAM_MAX: c_int = 5;
-pub const _SC_TZNAME_MAX: c_int = 6;
-// ...
-pub const _SC_VERSION: c_int = 29;
-pub const _SC_PAGESIZE: c_int = 30;
-pub const _SC_PAGE_SIZE: c_int = 30;
-// ...
-pub const _SC_RE_DUP_MAX: c_int = 44;
-
-pub const _SC_NPROCESSORS_CONF: c_int = 57;
-pub const _SC_NPROCESSORS_ONLN: c_int = 58;
-pub const _SC_PHYS_PAGES: c_int = 59;
-pub const _SC_AVPHYS_PAGES: c_int = 60;
-
-// ...
-pub const _SC_GETGR_R_SIZE_MAX: c_int = 69;
-pub const _SC_GETPW_R_SIZE_MAX: c_int = 70;
-pub const _SC_LOGIN_NAME_MAX: c_int = 71;
-pub const _SC_TTY_NAME_MAX: c_int = 72;
-// ...
-pub const _SC_SYMLOOP_MAX: c_int = 173;
-// ...
-pub const _SC_HOST_NAME_MAX: c_int = 180;
-// ...
-pub const _SC_SIGQUEUE_MAX: c_int = 190;
-pub const _SC_REALTIME_SIGNALS: c_int = 191;
-// } POSIX.1
 
 pub(super) fn sysconf_impl(name: c_int) -> c_long {
     //TODO: Real values
@@ -62,8 +29,18 @@ pub(super) fn sysconf_impl(name: c_int) -> c_long {
         _SC_GETPW_R_SIZE_MAX => -1,
         _SC_LOGIN_NAME_MAX => 256,
         _SC_TTY_NAME_MAX => 32,
+        _SC_MONOTONIC_CLOCK => 200112,
+        _SC_SEMAPHORES => 200112,
+        _SC_BARRIERS => 202405,
+        _SC_SHELL => 1,
+        _SC_SHARED_MEMORY_OBJECTS => 200112,
+        _SC_THREADS => 202405,
+        _SC_THREAD_ATTR_STACKADDR => 202405,
+        _SC_THREAD_ATTR_STACKSIZE => 202405,
+        _SC_TIMEOUTS => 202405,
+        _SC_TIMERS => 202405,
         _SC_SYMLOOP_MAX => -1,
-        _SC_HOST_NAME_MAX => 64,
+        _SC_HOST_NAME_MAX => limits::HOST_NAME_MAX,
         _SC_NPROCESSORS_CONF => get_cpu_count().unwrap_or(None).unwrap_or(1),
         _SC_NPROCESSORS_ONLN => get_cpu_count().unwrap_or(None).unwrap_or(1),
         _SC_PHYS_PAGES => get_mem_stat().map(|s| s.f_blocks as c_long).unwrap_or(-1),
@@ -78,12 +55,17 @@ pub(super) fn sysconf_impl(name: c_int) -> c_long {
 }
 
 pub fn get_cpu_count() -> Result<Option<c_long>, Errno> {
-    let mut string = String::new();
+    // As long as CPUs: entry is in the first line, this is safe
+    let mut buffer = [0u8; 128];
     let mut file = File::open(c"/scheme/sys/cpu".into(), fcntl::O_RDONLY)?;
-    file.read_to_string(&mut string)
+
+    let bytes_read = file
+        .read(&mut buffer)
         .map_err(|_| Errno(errno::EIO).sync())?;
 
-    Ok(string
+    let contents =
+        str::from_utf8(&buffer[..bytes_read]).map_err(|_| Errno(errno::EINVAL).sync())?;
+    Ok(contents
         .lines()
         .find(|line| line.starts_with("CPUs:"))
         .and_then(|line| line.split(':').nth(1))
@@ -94,7 +76,7 @@ pub fn get_mem_stat() -> Result<sys_statvfs::statvfs, Errno> {
     let fd = Sys::open(c"/scheme/memory".into(), fcntl::O_PATH, 0)?;
     let mut buf = sys_statvfs::statvfs::default();
     let res = Sys::fstatvfs(fd, Out::from_mut(&mut buf));
-    Sys::close(fd);
-    let _ = res?;
-    return Ok(buf);
+    if let Ok(()) = Sys::close(fd) {}; // TODO handle error
+    res?;
+    Ok(buf)
 }

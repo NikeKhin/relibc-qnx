@@ -1,9 +1,9 @@
-use crate::platform::types::c_char;
+use crate::platform::types::{c_char, size_t, ssize_t};
 
 use super::{DEFAULT_MONETARY, FormatFlags, LocaleMonetaryInfo, apply_grouping};
 use alloc::string::{String, ToString};
-use core::{ffi::CStr, ptr, result, slice, str};
-use libm::{fabs, floor, pow, round, trunc};
+use core::{ffi::CStr, fmt::Write, slice};
+use libm::{fabs, pow, round, trunc};
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/strfmon.html>.
 ///
@@ -13,26 +13,26 @@ use libm::{fabs, floor, pow, round, trunc};
 ///
 /// Returns:
 /// - The number of characters written (excluding the null terminator), or -1 if
-/// an error occurs (e.g., invalid input, buffer overflow)
+///   an error occurs (e.g., invalid input, buffer overflow)
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn strfmon(
     s: *mut c_char,        // Output buffer
-    maxsize: usize,        // Maximum size of the buffer
+    maxsize: size_t,       // Maximum size of the buffer
     format: *const c_char, // Format string
     mut args: ...          // Variadic arguments for monetary values
-) -> isize {
+) -> ssize_t {
     // Validate input pointers and buffer size
     if s.is_null() || format.is_null() || maxsize == 0 {
         return -1; // Invalid input
     }
 
     // Convert the format string from C to string
-    let format_str = match unsafe { CStr::from_ptr(format) }.to_str() {
-        Ok(s) => s,
-        Err(_) => return -1, // Invalid format string
+    let Ok(format_str) = unsafe { CStr::from_ptr(format) }.to_str() else {
+        return -1;
     };
 
     // Create a mutable slice for the output buffer
-    let buffer = unsafe { slice::from_raw_parts_mut(s as *mut u8, maxsize) };
+    let buffer = unsafe { slice::from_raw_parts_mut(s.cast::<u8>(), maxsize) };
     let mut pos = 0;
     let mut format_chars = format_str.chars().peekable();
 
@@ -121,7 +121,7 @@ pub unsafe extern "C" fn strfmon(
             Some('i') => {
                 // International formatting
                 flags.international = true;
-                let value = unsafe { args.arg::<f64>() }; // Get the argument as f64
+                let value = unsafe { args.next_arg::<f64>() }; // Get the argument as f64
                 if let Some(written) =
                     format_monetary(&mut buffer[pos..], value, &DEFAULT_MONETARY, &flags)
                 {
@@ -132,7 +132,7 @@ pub unsafe extern "C" fn strfmon(
             }
             Some('n') => {
                 // Locale-specific formatting
-                let value = unsafe { args.arg::<f64>() }; // Get the argument as f64
+                let value = unsafe { args.next_arg::<f64>() }; // Get the argument as f64
                 if let Some(written) =
                     format_monetary(&mut buffer[pos..], value, &DEFAULT_MONETARY, &flags)
                 {
@@ -150,7 +150,7 @@ pub unsafe extern "C" fn strfmon(
         return -1; // Buffer overflow
     }
     buffer[pos] = 0; // Null-terminate the buffer
-    pos as isize // Return the number of characters written
+    pos as ssize_t // Return the number of characters written
 }
 
 /// Formats a monetary value into the given `buffer` using locale-specific rules
@@ -283,7 +283,7 @@ fn format_monetary(
     if frac_digits > 0 {
         result.push_str(monetary.mon_decimal_point);
         // Zero-pad fractional part to the specified width
-        result.push_str(&format!("{:0>width$}", frac_part, width = frac_digits));
+        let _ = write!(result, "{:0>width$}", frac_part, width = frac_digits);
     }
 
     // 12) if the currency symbol follows the amount, add it now
@@ -302,15 +302,15 @@ fn format_monetary(
     // 14) checks if the user specified a total field width
     //     - if the final result is shorter, we padd it
     //     - if `left_justify` is true, padd on the right otherwise padd on the left
-    if let Some(width) = flags.field_width {
-        if result.len() < width {
-            let padding = " ".repeat(width - result.len());
-            result = if flags.left_justify {
-                result + &padding
-            } else {
-                padding + &result
-            };
-        }
+    if let Some(width) = flags.field_width
+        && result.len() < width
+    {
+        let padding = " ".repeat(width - result.len());
+        result = if flags.left_justify {
+            result + &padding
+        } else {
+            padding + &result
+        };
     }
 
     // 15) write the final string to the buffer

@@ -5,8 +5,8 @@
 #![allow(non_camel_case_types)]
 
 use crate::{
-    header::sys_socket::{sa_family_t, sockaddr_storage},
-    platform::types::{c_char, c_int, uint16_t, uint32_t},
+    header::{bits_safamily_t::sa_family_t, sys_socket::sockaddr_storage},
+    platform::types::{c_char, c_int},
 };
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/netinet_in.h.html>.
@@ -16,7 +16,7 @@ pub type in_port_t = u16;
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/netinet_in.h.html>.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct in_addr {
     pub s_addr: in_addr_t,
 }
@@ -36,6 +36,7 @@ pub struct sockaddr_in {
     pub sin_addr: in_addr,
     pub sin_zero: [c_char; 8],
 }
+unsafe impl plain::Plain for sockaddr_in {}
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/netinet_in.h.html>.
 #[repr(C)]
@@ -46,6 +47,7 @@ pub struct sockaddr_in6 {
     pub sin6_addr: in6_addr,
     pub sin6_scope_id: u32,
 }
+unsafe impl plain::Plain for sockaddr_in6 {}
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/netinet_in.h.html>.
 #[repr(C)]
@@ -83,6 +85,8 @@ pub const IPPROTO_UDP: u8 = 17;
 pub const IPPROTO_IDP: u8 = 22;
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/netinet_in.h.html>.
 pub const IPPROTO_IPV6: u8 = 41;
+/// Non-POSIX.
+pub const IPPROTO_ICMPV6: u8 = 58;
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/netinet_in.h.html>.
 pub const IPPROTO_RAW: u8 = 0xff;
 /// Non-POSIX.
@@ -175,27 +179,3 @@ pub static in6addr_any: in6_addr = in6_addr {
 pub static in6addr_loopback: in6_addr = in6_addr {
     s6_addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
 };
-
-/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/htonl.html>.
-#[unsafe(no_mangle)]
-pub extern "C" fn htonl(hostlong: uint32_t) -> uint32_t {
-    hostlong.to_be()
-}
-
-/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/htonl.html>.
-#[unsafe(no_mangle)]
-pub extern "C" fn htons(hostshort: uint16_t) -> uint16_t {
-    hostshort.to_be()
-}
-
-/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/htonl.html>.
-#[unsafe(no_mangle)]
-pub extern "C" fn ntohl(netlong: uint32_t) -> uint32_t {
-    u32::from_be(netlong)
-}
-
-/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/htonl.html>.
-#[unsafe(no_mangle)]
-pub extern "C" fn ntohs(netshort: uint16_t) -> uint16_t {
-    u16::from_be(netshort)
-}

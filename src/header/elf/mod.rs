@@ -2,7 +2,10 @@
 //!
 //! Non-POSIX, see <https://www.man7.org/linux/man-pages/man5/elf.5.html>.
 
-use crate::platform::types::*;
+use crate::{
+    casting::ByteLiteral,
+    platform::types::{c_char, c_uchar, int32_t, int64_t, uint16_t, uint32_t, uint64_t},
+};
 
 pub type Elf32_Half = uint16_t;
 pub type Elf64_Half = uint16_t;
@@ -72,12 +75,12 @@ pub struct Elf64_Ehdr {
 pub const EI_MAG0: usize = 0;
 pub const ELFMAG0: usize = 0x7f;
 pub const EI_MAG1: usize = 1;
-pub const ELFMAG1: c_char = 'E' as c_char;
+pub const ELFMAG1: c_char = ByteLiteral::cast_cchar(b'E');
 pub const EI_MAG2: usize = 2;
-pub const ELFMAG2: c_char = 'L' as c_char;
+pub const ELFMAG2: c_char = ByteLiteral::cast_cchar(b'L');
 pub const EI_MAG3: usize = 3;
-pub const ELFMAG3: c_char = 'F' as c_char;
-pub const ELFMAG: &'static str = "\x7fELF";
+pub const ELFMAG3: c_char = ByteLiteral::cast_cchar(b'F');
+// ELFMAG is defined in cbindgen.toml
 pub const SELFMAG: usize = 4;
 pub const EI_CLASS: usize = 4;
 pub const ELFCLASSNONE: usize = 0;
@@ -774,8 +777,8 @@ pub struct Elf64_Nhdr {
     pub n_type: Elf64_Word,
 }
 
-pub const ELF_NOTE_SOLARIS: &'static str = "SUNW Solaris";
-pub const ELF_NOTE_GNU: &'static str = "GNU";
+pub const ELF_NOTE_SOLARIS: &str = "SUNW Solaris";
+pub const ELF_NOTE_GNU: &str = "GNU";
 
 pub const ELF_NOTE_PAGESIZE_HINT: usize = 1;
 
@@ -962,35 +965,3 @@ pub const R_X86_64_TLSDESC: usize = 36;
 pub const R_X86_64_IRELATIVE: usize = 37;
 pub const R_X86_64_RELATIVE64: usize = 38;
 pub const R_X86_64_NUM: usize = 39;
-
-#[unsafe(no_mangle)]
-pub extern "C" fn _cbindgen_export_elf(
-    a: Elf32_Ehdr,
-    b: Elf64_Ehdr,
-    c: Elf32_Shdr,
-    d: Elf64_Shdr,
-    e: Elf32_Sym,
-    f: Elf64_Sym,
-    g: Elf32_Syminfo,
-    h: Elf64_Syminfo,
-    i: Elf32_Rel,
-    j: Elf64_Rel,
-    k: Elf32_Rela,
-    l: Elf64_Rela,
-    m: Elf32_Phdr,
-    n: Elf64_Phdr,
-    o: Elf32_Dyn,
-    p: Elf64_Dyn,
-    q: Elf32_Verdef,
-    r: Elf64_Verdef,
-    s: Elf32_Verdaux,
-    t: Elf64_Verdaux,
-    u: Elf32_Verneed,
-    v: Elf64_Verneed,
-    w: Elf64_Vernaux,
-    x: Elf64_auxv_t,
-    y: Elf32_Nhdr,
-    z: Elf64_Nhdr,
-    aa: Elf64_Move,
-) {
-}

@@ -1,22 +1,22 @@
 //! Relibc Threads, or RLCT.
 
 use core::{
-    cell::{Cell, UnsafeCell},
-    mem::{MaybeUninit, offset_of},
-    ptr::{self, NonNull, addr_of},
+    cell::UnsafeCell,
+    ptr,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use alloc::{boxed::Box, collections::BTreeMap};
+use alloc::collections::BTreeMap;
+#[cfg(target_os = "redox")]
+use redox_rt::{
+    RtTcb,
+    arch::{STACK_SIZE, STACK_TOP},
+};
 
 use crate::{
     error::Errno,
     header::{errno::*, pthread as header, sched::sched_param, sys_mman},
-    ld_so::{
-        ExpectTlsFree,
-        linker::Linker,
-        tcb::{Master, Tcb},
-    },
+    ld_so::tcb::Tcb,
     platform::{Pal, Sys, types::*},
 };
 
@@ -24,7 +24,13 @@ use crate::sync::{Mutex, waitval::Waitval};
 
 /// Called only by the main thread, as part of relibc_start.
 pub unsafe fn init() {
-    let mut thread = Pthread {
+    //TODO: what is the best way to get these values?
+    #[cfg(target_os = "redox")]
+    let (stack_base, stack_size) = ((STACK_TOP - STACK_SIZE) as *mut c_void, STACK_SIZE);
+    #[cfg(target_os = "linux")]
+    let (stack_base, stack_size) = (ptr::null_mut(), 0);
+
+    let thread = Pthread {
         waitval: Waitval::new(),
         has_enabled_cancelation: AtomicBool::new(false),
         has_queued_cancelation: AtomicBool::new(false),
@@ -33,31 +39,27 @@ pub unsafe fn init() {
         //index: FIRST_THREAD_IDX,
 
         // TODO: set these values on Linux as well
-        stack_base: ptr::null_mut(),
-        stack_size: 0,
+        stack_base,
+        stack_size,
+
+        tcb_selfref: UnsafeCell::new(core::ptr::null_mut()),
 
         os_tid: UnsafeCell::new(Sys::current_os_tid()),
     };
 
-    #[cfg(target_os = "redox")]
-    {
-        //TODO: what is the best way to get these values?
-        use redox_rt::arch::{STACK_SIZE, STACK_TOP};
-        thread.stack_base = (STACK_TOP - STACK_SIZE) as *mut c_void;
-        thread.stack_size = STACK_SIZE;
+    let current_tcb = unsafe { Tcb::current() }.expect("no TCB present for main thread");
+    current_tcb.pthread = thread;
+    unsafe {
+        current_tcb.pthread.tcb_selfref.get().write(current_tcb);
     }
-
-    Tcb::current()
-        .expect_notls("no TCB present for main thread")
-        .pthread = thread;
 }
 
 //static NEXT_INDEX: AtomicU32 = AtomicU32::new(FIRST_THREAD_IDX + 1);
 //const FIRST_THREAD_IDX: usize = 1;
 
 pub unsafe fn terminate_from_main_thread() {
-    for (_, tcb) in OS_TID_TO_PTHREAD.lock().iter() {
-        let _ = cancel(&(*tcb.0).pthread);
+    for tcb in OS_TID_TO_PTHREAD.lock().values() {
+        let _ = unsafe { cancel(&(*tcb.0).pthread) };
     }
 }
 
@@ -76,6 +78,8 @@ pub struct Pthread {
 
     pub(crate) stack_base: *mut c_void,
     pub(crate) stack_size: usize,
+
+    pub(crate) tcb_selfref: UnsafeCell<*mut Tcb>,
 
     pub os_tid: UnsafeCell<OsTid>,
 }
@@ -111,35 +115,33 @@ pub(crate) unsafe fn create(
     start_routine: extern "C" fn(arg: *mut c_void) -> *mut c_void,
     arg: *mut c_void,
 ) -> Result<pthread_t, Errno> {
-    let attrs = attrs.copied().unwrap_or_default();
+    let attrs = attrs.cloned().unwrap_or_default();
 
-    let mut current_sigmask = 0_u64;
+    #[cfg(not(target_os = "redox"))]
+    let current_sigmask = 0_u64;
     #[cfg(target_os = "redox")]
-    {
-        current_sigmask =
-            redox_rt::signal::get_sigmask().expect("failed to obtain sigprocmask for caller");
-    }
+    let current_sigmask =
+        redox_rt::signal::get_sigmask().expect("failed to obtain sigprocmask for caller");
 
     // Create a locked mutex, unlocked by the thread after it has started.
-    let synchronization_mutex = Mutex::locked(current_sigmask);
+    let synchronization_mutex = unsafe { Mutex::locked(current_sigmask) };
     let synchronization_mutex = &synchronization_mutex;
-
-    let tid_mutex = Mutex::<MaybeUninit<OsTid>>::new(MaybeUninit::uninit());
-    let mut tid_guard = tid_mutex.lock();
 
     let stack_size = attrs.stacksize.next_multiple_of(Sys::getpagesize());
 
     let stack_base = if attrs.stack != 0 {
         attrs.stack as *mut c_void
     } else {
-        let ret = sys_mman::mmap(
-            core::ptr::null_mut(),
-            stack_size,
-            sys_mman::PROT_READ | sys_mman::PROT_WRITE,
-            sys_mman::MAP_PRIVATE | sys_mman::MAP_ANONYMOUS,
-            -1,
-            0,
-        );
+        let ret = unsafe {
+            sys_mman::mmap(
+                core::ptr::null_mut(),
+                stack_size,
+                sys_mman::PROT_READ | sys_mman::PROT_WRITE,
+                sys_mman::MAP_PRIVATE | sys_mman::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
         if ret as isize == -1 {
             // "Insufficient resources"
             return Err(Errno(EAGAIN));
@@ -160,8 +162,8 @@ pub(crate) unsafe fn create(
         mmap_size: stack_size,
     };
 
-    let current_tcb = Tcb::current().expect("no TCB!");
-    let new_tcb = Tcb::new(current_tcb.tls_len).map_err(|_| Errno(ENOMEM))?;
+    let current_tcb = unsafe { Tcb::current() }.expect("no TCB!");
+    let new_tcb = unsafe { Tcb::new(current_tcb.tls_len) }.map_err(|_| Errno(ENOMEM))?;
     new_tcb.pthread.flags = flags.bits().into();
     new_tcb.pthread.stack_base = stack_base;
     new_tcb.pthread.stack_size = stack_size;
@@ -169,14 +171,13 @@ pub(crate) unsafe fn create(
     new_tcb.masters_ptr = current_tcb.masters_ptr;
     new_tcb.masters_len = current_tcb.masters_len;
     new_tcb.linker_ptr = current_tcb.linker_ptr;
-    new_tcb.mspace = current_tcb.mspace;
 
-    let stack_end = stack_base.add(stack_size);
-    let mut stack = stack_end as *mut usize;
+    let stack_end = unsafe { stack_base.add(stack_size) };
+    let mut stack = stack_end.cast::<usize>();
     {
         let mut push = |value: usize| {
-            stack = stack.sub(1);
-            stack.write(value);
+            stack = unsafe { stack.sub(1) };
+            unsafe { stack.write(value) };
         };
 
         if cfg!(target_arch = "aarch64") {
@@ -187,66 +188,61 @@ pub(crate) unsafe fn create(
             push(0);
         }
         push(0);
-        push(synchronization_mutex as *const _ as usize);
-        push(addr_of!(tid_mutex) as usize);
-        push(new_tcb as *mut _ as usize);
+        push(0);
+        push(ptr::from_ref(synchronization_mutex) as usize);
+        push(ptr::from_mut(new_tcb) as usize);
 
         push(arg as usize);
         push(start_routine as usize);
 
-        push(new_thread_shim as usize);
+        push(new_thread_shim as *const () as usize);
     }
 
-    let Ok(os_tid) = Sys::rlct_clone(stack) else {
+    let Ok(os_tid) = (unsafe { Sys::rlct_clone(stack, &mut new_tcb.os_specific) }) else {
         return Err(Errno(EAGAIN));
     };
     core::mem::forget(stack_raii);
 
-    tid_guard.write(os_tid);
-    drop(tid_guard);
     let _ = synchronization_mutex.lock();
 
     OS_TID_TO_PTHREAD
         .lock()
         .insert(os_tid, ForceSendSync(new_tcb));
 
-    Ok((&new_tcb.pthread) as *const _ as *mut _)
+    Ok(&raw const new_tcb.pthread as *mut _)
 }
+
 /// A shim to wrap thread entry points in logic to set up TLS, for example
 unsafe extern "C" fn new_thread_shim(
     entry_point: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
     arg: *mut c_void,
     tcb: *mut Tcb,
-    mutex1: *const Mutex<MaybeUninit<OsTid>>,
-    mutex2: *const Mutex<u64>,
+    synchronization_mutex: *const Mutex<u64>,
 ) -> ! {
-    let tid = (*(&*mutex1).lock()).assume_init();
+    let tcb = unsafe { tcb.as_mut() }.expect("non-null TLS is required");
 
-    if let Some(tcb) = tcb.as_mut() {
-        #[cfg(not(target_os = "redox"))]
-        {
-            tcb.activate();
+    #[cfg(not(target_os = "redox"))]
+    {
+        unsafe { tcb.activate() };
+    }
+    #[cfg(target_os = "redox")]
+    {
+        // `thr_fd` in `tcb` is set by [`Sys::rlct_clone`] *before* jumping to
+        // the entry point of the new thread.
+        unsafe {
+            tcb.activate(None);
         }
-        #[cfg(target_os = "redox")]
-        {
-            tcb.activate(
-                redox_rt::proc::FdGuard::new(tid.thread_fd)
-                    .to_upper()
-                    .unwrap(),
-            );
-            redox_rt::signal::setup_sighandler(&tcb.os_specific, false);
-        }
+        redox_rt::signal::setup_sighandler(&tcb.os_specific, false);
     }
 
-    let procmask = (&*mutex2).as_ptr().read();
+    #[cfg(target_os = "redox")]
+    let procmask = unsafe { (&*synchronization_mutex).as_ptr().read() };
 
-    if let Some(tcb) = tcb.as_mut() {
-        tcb.copy_masters().unwrap();
-    }
+    unsafe { tcb.copy_masters() }.unwrap();
 
-    (*tcb).pthread.os_tid.get().write(Sys::current_os_tid());
+    unsafe { tcb.pthread.os_tid.get().write(Sys::current_os_tid()) };
 
-    (&*mutex2).manual_unlock();
+    unsafe { (&*synchronization_mutex).manual_unlock() };
 
     #[cfg(target_os = "redox")]
     {
@@ -254,9 +250,9 @@ unsafe extern "C" fn new_thread_shim(
             .expect("failed to set procmask in child thread");
     }
 
-    let retval = entry_point(arg);
+    let retval = unsafe { entry_point(arg) };
 
-    exit_current_thread(Retval(retval))
+    unsafe { exit_current_thread(Retval(retval)) }
 }
 pub unsafe fn join(thread: &Pthread) -> Result<Retval, Errno> {
     // We don't have to return EDEADLK, but unlike e.g. pthread_t lifetime checking, it's a
@@ -275,7 +271,7 @@ pub unsafe fn join(thread: &Pthread) -> Result<Retval, Errno> {
     // pthread_t of this thread, will no longer be valid. In practice, we can thus deallocate the
     // thread state.
 
-    dealloc_thread(thread);
+    unsafe { dealloc_thread(thread) };
 
     Ok(retval)
 }
@@ -297,45 +293,73 @@ pub unsafe fn testcancel() {
     if this_thread.has_queued_cancelation.load(Ordering::Acquire)
         && this_thread.has_enabled_cancelation.load(Ordering::Acquire)
     {
-        cancel_current_thread();
+        unsafe { cancel_current_thread() };
     }
 }
 
 pub unsafe fn exit_current_thread(retval: Retval) -> ! {
     // Run pthread_cleanup_push/pthread_cleanup_pop destructors.
-    header::run_destructor_stack();
+    unsafe { header::run_destructor_stack() };
 
-    header::tls::run_all_destructors();
+    unsafe { header::tls::run_all_destructors() };
 
     let this = current_thread().expect("failed to obtain current thread when exiting");
     let stack_base = this.stack_base;
     let stack_size = this.stack_size;
 
+    // dealloc_thread() or waitval.post() might unmaps the tcb so extract the thread_fd now
+    #[cfg(target_os = "redox")]
+    let status_fd = {
+        let _guard = redox_rt::signal::tmp_disable_signals();
+        let thread_fd = RtTcb::current().thread_fd();
+        thread_fd.dup_into_upper(b"status").unwrap()
+    };
+
     if this.flags.load(Ordering::Acquire) & PthreadFlags::DETACHED.bits() != 0 {
         // When detached, the thread state no longer makes any sense, and can immediately be
         // deallocated.
-        dealloc_thread(this);
+        unsafe { dealloc_thread(this) };
     } else {
         // When joinable, the return value should be made available to other threads.
-        this.waitval.post(retval);
+        unsafe { this.waitval.post(retval) };
     }
 
-    Sys::exit_thread(stack_base.cast(), stack_size)
+    #[cfg(target_os = "redox")]
+    unsafe {
+        redox_rt::thread::exit_this_thread_inner(stack_base.cast(), stack_size, status_fd)
+    }
+    unsafe { Sys::exit_thread(stack_base.cast(), stack_size) }
 }
 
 unsafe fn dealloc_thread(thread: &Pthread) {
     // TODO: How should this be handled on Linux?
-    OS_TID_TO_PTHREAD.lock().remove(&thread.os_tid.get().read());
+    unsafe {
+        OS_TID_TO_PTHREAD.lock().remove(&thread.os_tid.get().read());
+    }
+    #[cfg(target_os = "redox")]
+    unsafe {
+        let tcb = thread.tcb_selfref.get().read();
+        if !tcb.is_null() {
+            loop {
+                match syscall::funmap(tcb as usize, syscall::PAGE_SIZE) {
+                    Ok(_) => break,
+                    // might be not guarded by tmp_disable_signals()
+                    Err(syscall::Error { errno: EINTR }) => continue,
+                    Err(e) => log::warn!("Cannot dealloc_thread: {e:?}"),
+                }
+            }
+        }
+    }
 }
 pub const SIGRT_RLCT_CANCEL: usize = 33;
 pub const SIGRT_RLCT_TIMER: usize = 34;
 
 unsafe extern "C" fn cancel_sighandler(_: c_int) {
-    cancel_current_thread();
+    unsafe { cancel_current_thread() };
 }
 unsafe fn cancel_current_thread() {
     // Terminate the thread
-    exit_current_thread(Retval(header::PTHREAD_CANCELED));
+    unsafe { exit_current_thread(Retval(header::PTHREAD_CANCELED)) };
 }
 
 pub unsafe fn cancel(thread: &Pthread) -> Result<(), Errno> {
@@ -343,7 +367,7 @@ pub unsafe fn cancel(thread: &Pthread) -> Result<(), Errno> {
     thread.has_queued_cancelation.store(true, Ordering::Release);
 
     if thread.has_enabled_cancelation.load(Ordering::Acquire) {
-        Sys::rlct_kill(thread.os_tid.get().read(), SIGRT_RLCT_CANCEL)?;
+        (unsafe { Sys::rlct_kill(thread.os_tid.get().read(), SIGRT_RLCT_CANCEL) })?;
     }
 
     Ok(())
@@ -390,6 +414,7 @@ pub fn set_cancel_state(state: c_int) -> Result<c_int, Errno> {
     })
 }
 pub fn set_cancel_type(ty: c_int) -> Result<c_int, Errno> {
+    #[expect(unused_variables, reason = "function not yet fully implemented")]
     let this_thread = current_thread().expect("current thread not present");
 
     // TODO
@@ -401,12 +426,15 @@ pub fn set_cancel_type(ty: c_int) -> Result<c_int, Errno> {
     }
     Ok(header::PTHREAD_CANCEL_DEFERRED)
 }
+#[expect(unused_variables, reason = "function not yet fully implemented")]
 pub fn get_cpu_clkid(thread: &Pthread) -> Result<clockid_t, Errno> {
     // TODO
     Err(Errno(ENOENT))
 }
+#[expect(unused_variables, reason = "function not yet fully implemented")]
 pub fn get_sched_param(thread: &Pthread) -> Result<(clockid_t, sched_param), Errno> {
-    todo!()
+    // TODO should be possible to return sched_param
+    Err(Errno(ENOSYS))
 }
 
 // TODO: Hash map?

@@ -6,10 +6,9 @@ use core::{
 use crate::{
     error::Errno,
     header::{errno::*, pthread::*, time::timespec},
-    pthread::*,
 };
 
-use crate::platform::{Pal, Sys, types::*};
+use crate::platform::{Pal, Sys, types::c_int};
 
 use super::FutexWaitResult;
 
@@ -33,10 +32,10 @@ const RECURSIVE_COUNT_MAX_INCLUSIVE: u32 = u32::MAX;
 const SPIN_COUNT: usize = 0;
 
 impl RlctMutex {
-    pub(crate) fn new(attr: &RlctMutexAttr) -> Result<Self, Errno> {
+    pub(crate) const fn new(attr: &RlctMutexAttr) -> Result<Self, Errno> {
         let RlctMutexAttr {
-            prioceiling,
-            protocol,
+            prioceiling: _,
+            protocol: _,
             pshared: _,
             robust,
             ty,
@@ -62,21 +61,21 @@ impl RlctMutex {
         })
     }
     pub fn prioceiling(&self) -> Result<c_int, Errno> {
-        println!("TODO: Implement pthread_getprioceiling");
+        todo_skip!(0, "pthread_getprioceiling: not implemented");
         Ok(0)
     }
     pub fn replace_prioceiling(&self, _: c_int) -> Result<c_int, Errno> {
-        println!("TODO: Implement pthread_setprioceiling");
+        todo_skip!(0, "pthread_setprioceiling: not implemented");
         Ok(0)
     }
     pub fn make_consistent(&self) -> Result<(), Errno> {
-        println!("TODO: Implement robust mutexes");
+        todo_skip!(0, "pthread robust mutexes: not implemented");
         Ok(())
     }
     fn lock_inner(&self, deadline: Option<&timespec>) -> Result<(), Errno> {
         let this_thread = os_tid_invalid_after_fork();
 
-        let mut spins_left = SPIN_COUNT;
+        //let mut spins_left = SPIN_COUNT;
 
         loop {
             let result = self.inner.compare_exchange_weak(

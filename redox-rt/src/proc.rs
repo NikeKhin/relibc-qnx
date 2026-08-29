@@ -1,21 +1,17 @@
-use core::{
-    cell::SyncUnsafeCell,
-    cmp,
-    fmt::Debug,
-    mem::{MaybeUninit, size_of},
-};
+use core::{cell::SyncUnsafeCell, cmp, fmt::Debug, ops::Range};
 
 use crate::{
     DYNAMIC_PROC_INFO, RtTcb, StaticProcInfo,
     arch::*,
     auxv_defs::*,
-    protocol::{ProcCall, ThreadCall},
     read_proc_meta,
-    sys::{proc_call, thread_call},
+    sys::{fstat, open, sys_call, sys_call_wo},
 };
+use redox_protocols::protocol::{O_CLOEXEC, ProcCall, ThreadCall};
 
 use alloc::{boxed::Box, vec};
 
+use goblin::elf::header::ET_DYN;
 //TODO: allow use of either 32-bit or 64-bit programs
 #[cfg(target_pointer_width = "32")]
 use goblin::elf32::{
@@ -29,8 +25,8 @@ use goblin::elf64::{
 };
 
 use syscall::{
-    CallFlags, F_GETFD, GrantDesc, GrantFlags, MAP_FIXED_NOREPLACE, MAP_SHARED, Map, O_CLOEXEC,
-    PAGE_SIZE, PROT_EXEC, PROT_READ, PROT_WRITE, SetSighandlerData,
+    CallFlags, GrantDesc, GrantFlags, MAP_FIXED_NOREPLACE, MAP_SHARED, Map, PAGE_SIZE, PROT_EXEC,
+    PROT_READ, PROT_WRITE, SetSighandlerData,
     error::*,
     flag::{MapFlags, SEEK_SET},
 };
@@ -42,11 +38,13 @@ pub enum FexecResult {
     },
 }
 pub struct InterpOverride {
-    phs: Box<[u8]>,
+    phdrs_vaddr: usize,
     at_entry: usize,
     at_phnum: usize,
     at_phent: usize,
     name: Box<[u8]>,
+    min_mmap_addr: usize,
+    grants_fd: usize,
 }
 
 pub struct ExtraInfo<'a> {
@@ -61,8 +59,17 @@ pub struct ExtraInfo<'a> {
     pub thr_fd: usize,
     /// Process handle
     pub proc_fd: usize,
+    /// Namespace handle
+    pub ns_fd: Option<usize>,
+    /// CWD handle
+    pub cwd_fd: Option<usize>,
+    /// Filetable handle
+    pub filetable_fd: Option<usize>,
+    /// If the process for which the image is to be loaded the same as the currently running process
+    pub same_process: bool,
 }
 
+#[expect(clippy::too_many_arguments)]
 pub fn fexec_impl(
     image_file: FdGuardUpper,
     thread_fd: &FdGuardUpper,
@@ -72,7 +79,7 @@ pub fn fexec_impl(
     envs: &[&[u8]],
     extrainfo: &ExtraInfo,
     interp_override: Option<InterpOverride>,
-) -> Result<FexecResult> {
+) -> Result<Option<FexecResult>> {
     // Here, we do the minimum part of loading an application, which is what the kernel used to do.
     // We load the executable into memory (albeit at different offsets in this executable), fix
     // some misalignments, and then switch address space.
@@ -81,10 +88,18 @@ pub fn fexec_impl(
     pread_all(&image_file, 0, &mut header_bytes)?;
     let header = Header::from_bytes(&header_bytes);
 
-    let grants_fd = {
-        let current_addrspace_fd = thread_fd.dup(b"addrspace")?;
-        current_addrspace_fd.dup(b"empty")?.to_upper()?
+    if header.e_ident[..4] != [0x7F, 0x45, 0x4C, 0x46] {
+        // Not an ELF, according to posix_spawn() just throw error here
+        return Err(Error::new(ENOEXEC));
+    }
+
+    let grants_fd = if let Some(interp) = interp_override.as_ref() {
+        FdGuard::new(interp.grants_fd).to_upper()?
+    } else {
+        let current_addrspace_fd = thread_fd.dup_into_upper(b"addrspace")?;
+        current_addrspace_fd.dup_into_upper(b"empty")?
     };
+    grants_fd.fcntl(syscall::F_SETFD, O_CLOEXEC)?;
 
     // Never allow more than 1 MiB of program headers.
     const MAX_PH_SIZE: usize = 1024 * 1024;
@@ -102,12 +117,62 @@ pub fn fexec_impl(
     let phs = &mut phs_raw[size_of::<Header>()..];
 
     // TODO: Remove clone, but this would require more as_refs and as_muts
-    let mut min_mmap_addr = PAGE_SIZE;
+    let mut min_mmap_addr = interp_override
+        .as_ref()
+        .map(|interp| interp.min_mmap_addr)
+        .unwrap_or(PAGE_SIZE);
     let mut update_min_mmap_addr = |addr: usize, size: usize| {
         min_mmap_addr = cmp::max(min_mmap_addr, (addr + size).next_multiple_of(PAGE_SIZE));
     };
 
-    pread_all(&image_file, u64::from(header.e_phoff), phs).map_err(|_| Error::new(EIO))?;
+    #[cfg(target_pointer_width = "64")]
+    let header_e_phoff = header.e_phoff;
+    #[cfg(target_pointer_width = "32")]
+    let header_e_phoff = u64::from(header.e_phoff);
+    pread_all(&image_file, header_e_phoff, phs).map_err(|_| Error::new(EIO))?;
+
+    let mut span: Option<Range<usize>> = None;
+    for ph_idx in 0..phnum {
+        let ph_bytes = &phs[ph_idx * phentsize..(ph_idx + 1) * phentsize];
+        let segment: &ProgramHeader =
+            plain::from_bytes(ph_bytes).map_err(|_| Error::new(EINVAL))?;
+        if segment.p_type != PT_LOAD {
+            continue;
+        }
+
+        let voff = segment.p_vaddr as usize % PAGE_SIZE;
+        let vaddr = segment.p_vaddr as usize - voff;
+        let vsize = (segment.p_memsz as usize + voff).next_multiple_of(segment.p_align as usize);
+        let b = vaddr..vaddr + vsize;
+
+        span = Some(if let Some(a) = span {
+            a.start.min(b.start)..a.end.max(b.end)
+        } else {
+            b
+        });
+    }
+    let span = span.expect("ELF executables must contain at least one `PT_LOAD` segment");
+    let span_size = (span.end - span.start).next_multiple_of(PAGE_SIZE);
+
+    let base_addr = if header.e_type == ET_DYN {
+        // PIE
+        let addr = mmap_anon_remote(&grants_fd, 0, 0, span_size, MapFlags::PROT_NONE)?;
+        update_min_mmap_addr(addr, span_size);
+        addr
+    } else {
+        mmap_anon_remote(
+            &grants_fd,
+            0,
+            span.start,
+            span_size,
+            MapFlags::MAP_FIXED_NOREPLACE,
+        )?;
+        update_min_mmap_addr(span.start, span_size);
+        0
+    };
+
+    let mut phdrs_vaddr = 0;
+    let mut interpreter = None;
 
     for ph_idx in 0..phnum {
         let ph_bytes = &phs[ph_idx * phentsize..(ph_idx + 1) * phentsize];
@@ -130,18 +195,13 @@ pub fn fexec_impl(
             // PT_INTERP must come before any PT_LOAD, so we don't have to iterate twice.
             PT_INTERP => {
                 let mut interp = vec![0_u8; segment.p_filesz as usize];
-                pread_all(&image_file, u64::from(segment.p_offset), &mut interp)?;
+                #[cfg(target_pointer_width = "64")]
+                let segment_p_offset = segment.p_offset;
+                #[cfg(target_pointer_width = "32")]
+                let segment_p_offset = u64::from(segment.p_offset);
+                pread_all(&image_file, segment_p_offset, &mut interp)?;
 
-                return Ok(FexecResult::Interp {
-                    path: interp.into_boxed_slice(),
-                    interp_override: InterpOverride {
-                        at_entry: header.e_entry as usize,
-                        at_phnum: phnum,
-                        at_phent: phentsize,
-                        phs: phs_raw.into_boxed_slice(),
-                        name: path.into(),
-                    },
-                });
+                interpreter = Some(interp.into_boxed_slice());
             }
             PT_LOAD => {
                 let voff = segment.p_vaddr as usize % PAGE_SIZE;
@@ -160,10 +220,17 @@ pub fn fexec_impl(
                 mmap_anon_remote(
                     &grants_fd,
                     0,
-                    vaddr,
+                    base_addr + vaddr,
                     total_page_count * PAGE_SIZE,
-                    flags | MapFlags::MAP_FIXED_NOREPLACE,
+                    flags | MapFlags::MAP_FIXED,
                 )?;
+
+                if segment.p_offset <= header.e_phoff
+                    && header.e_phoff < segment.p_offset + segment.p_filesz
+                {
+                    phdrs_vaddr =
+                        (header.e_phoff - segment.p_offset + segment.p_vaddr) as usize + base_addr;
+                }
 
                 // TODO: Attempt to mmap with MAP_PRIVATE directly from the image file instead.
 
@@ -171,21 +238,38 @@ pub fn fexec_impl(
                     let (_guard, dst_memory) = unsafe {
                         MmapGuard::map_mut_anywhere(
                             &grants_fd,
-                            vaddr,                                       // offset
+                            base_addr + vaddr,                           // offset
                             (voff + filesz).next_multiple_of(PAGE_SIZE), // size
                         )?
                     };
+                    #[cfg(target_pointer_width = "64")]
+                    let segment_p_offset = segment.p_offset;
+                    #[cfg(target_pointer_width = "32")]
+                    let segment_p_offset = u64::from(segment.p_offset);
                     pread_all(
                         &image_file,
-                        u64::from(segment.p_offset),
+                        segment_p_offset,
                         &mut dst_memory[voff..voff + filesz],
                     )?;
                 }
-
-                update_min_mmap_addr(vaddr, total_page_count * PAGE_SIZE);
             }
             _ => continue,
         }
+    }
+
+    if let Some(interpreter_path) = interpreter {
+        return Ok(Some(FexecResult::Interp {
+            path: interpreter_path,
+            interp_override: InterpOverride {
+                at_entry: base_addr + header.e_entry as usize,
+                at_phnum: phnum,
+                at_phent: phentsize,
+                phdrs_vaddr,
+                name: path.into(),
+                min_mmap_addr,
+                grants_fd: grants_fd.take(),
+            },
+        }));
     }
 
     mmap_anon_remote(
@@ -199,7 +283,7 @@ pub fn fexec_impl(
     let mut sp = STACK_TOP;
     let mut stack_page = Option::<MmapGuard>::None;
 
-    let mut push = |word: usize| {
+    let mut push = |word: usize| -> Result<()> {
         let old_page_no = sp / PAGE_SIZE;
         sp -= size_of::<usize>();
         let new_page_no = sp / PAGE_SIZE;
@@ -237,43 +321,21 @@ pub fn fexec_impl(
         Ok(())
     };
 
-    let pheaders_to_convey = if let Some(ref r#override) = interp_override {
-        &*r#override.phs
-    } else {
-        &*phs_raw
-    };
-    let pheaders_size_aligned = pheaders_to_convey.len().next_multiple_of(PAGE_SIZE);
-    let pheaders = mmap_anon_remote(
-        &grants_fd,
-        0,
-        0,
-        pheaders_size_aligned,
-        MapFlags::PROT_READ | MapFlags::PROT_WRITE,
-    )?;
-    update_min_mmap_addr(pheaders, pheaders_size_aligned);
-    unsafe {
-        let (_guard, memory) =
-            MmapGuard::map_mut_anywhere(&grants_fd, pheaders, pheaders_size_aligned)?;
-
-        memory[..pheaders_to_convey.len()].copy_from_slice(pheaders_to_convey);
-    }
-    mprotect_remote(
-        &grants_fd,
-        pheaders,
-        pheaders_size_aligned,
-        MapFlags::PROT_READ,
-    )?;
-
     push(0)?;
     push(AT_NULL)?;
-    push(header.e_entry as usize)?;
     if let Some(ref r#override) = interp_override {
-        push(AT_BASE)?;
         push(r#override.at_entry)?;
+        push(AT_ENTRY)?;
+        push(base_addr)?;
+        push(AT_BASE)?;
+        push(r#override.phdrs_vaddr)?;
+        push(AT_PHDR)?;
+    } else {
+        push(base_addr + header.e_entry as usize)?;
+        push(AT_ENTRY)?;
+        push(phdrs_vaddr)?;
+        push(AT_PHDR)?;
     }
-    push(AT_ENTRY)?;
-    push(pheaders + size_of::<Header>())?;
-    push(AT_PHDR)?;
     push(
         interp_override
             .as_ref()
@@ -305,7 +367,7 @@ pub fn fexec_impl(
     let mut argc = 0;
 
     {
-        let mut append = |source_slice: &[u8]| {
+        let mut append = |source_slice: &[u8]| -> Result<usize> {
             // TODO
             let address = target_args_env_address + offset;
 
@@ -350,10 +412,16 @@ pub fn fexec_impl(
         push(extrainfo.umask as usize)?;
         push(AT_REDOX_UMASK)?;
 
-        push(extrainfo.thr_fd as usize)?;
+        push(extrainfo.thr_fd)?;
         push(AT_REDOX_THR_FD)?;
-        push(extrainfo.proc_fd as usize)?;
+        push(extrainfo.proc_fd)?;
         push(AT_REDOX_PROC_FD)?;
+        push(extrainfo.ns_fd.unwrap_or(usize::MAX))?;
+        push(AT_REDOX_NS_FD)?;
+        push(extrainfo.cwd_fd.unwrap_or(usize::MAX))?;
+        push(AT_REDOX_CWD_FD)?;
+        push(extrainfo.filetable_fd.unwrap_or(usize::MAX))?;
+        push(AT_REDOX_FILETABLE_FD)?;
 
         push(0)?;
 
@@ -371,7 +439,7 @@ pub fn fexec_impl(
 
     push(argc)?;
 
-    if let Ok(sighandler_fd) = thread_fd.dup(b"sighandler") {
+    if let Ok(sighandler_fd) = thread_fd.dup_into_upper(b"sighandler") {
         let _ = sighandler_fd.write(&SetSighandlerData {
             user_handler: 0,
             excp_handler: 0,
@@ -387,72 +455,95 @@ pub fn fexec_impl(
         let new_name = interp_override.as_ref().map_or(path, |o| &o.name);
         let len = new_name.len().min(32);
         buf[..len].copy_from_slice(&new_name[..len]);
-        // XXX: takes &mut [] since it can mutate, but we could unsafe{}ly pass it directly
-        // otherwise
-        let _ = proc_call(
+        let _ = sys_call_wo(
             proc_fd.as_raw_fd(),
-            &mut buf,
+            &buf,
             CallFlags::empty(),
             &[ProcCall::Rename as u64],
         );
     }
 
     // TODO: Error handling
-    let _ = proc_call(
+    let _ = sys_call(
         proc_fd.as_raw_fd(),
-        &mut [],
         CallFlags::empty(),
         &[ProcCall::DisableSetpgid as u64],
     );
 
     if interp_override.is_some() {
-        let mmap_min_fd = grants_fd.dup(b"mmap-min-addr")?;
+        let mmap_min_fd = grants_fd.dup_into_upper(b"mmap-min-addr")?;
         let _ = mmap_min_fd.write(&usize::to_ne_bytes(min_mmap_addr));
     }
 
-    let addrspace_selection_fd = thread_fd.dup(b"current-addrspace")?.to_upper()?;
+    let addrspace_selection_fd = thread_fd.dup_into_upper(b"current-addrspace")?;
 
     let _ = addrspace_selection_fd.write(&create_set_addr_space_buf(
         grants_fd.as_raw_fd(),
-        header.e_entry as usize,
+        base_addr + header.e_entry as usize,
         sp,
     ));
 
     // Close all O_CLOEXEC file descriptors. TODO: close_range?
-    {
+    if extrainfo.same_process {
         // NOTE: This approach of implementing O_CLOEXEC will not work in multithreaded
         // scenarios. While execve() is undefined according to POSIX if there exist sibling
         // threads, it could still be allowed by keeping certain file descriptors and instead
         // set the active file table.
-        let files_fd = syscall::dup(thread_fd.as_raw_fd(), b"filetable-binary")?;
-        let mut files_reader = FileBufReader::from_fd(files_fd);
-        loop {
-            let fd = match files_reader.read_le_u64()? {
-                None => break,
-                Some(fd) => fd,
-            };
-            let fd = usize::try_from(fd).unwrap();
+        let _siglock = crate::signal::tmp_disable_signals();
+        let fds_to_close = {
+            let guard = crate::current_filetable();
+            let mut fds = alloc::vec::Vec::new();
+            for (fd, flags) in guard.iter() {
+                if fd == addrspace_selection_fd.as_raw_fd() {
+                    continue; // Will be closed below
+                }
 
-            if fd == addrspace_selection_fd.as_raw_fd() || fd == files_fd {
-                continue; // Will be closed below
+                if flags & O_CLOEXEC == O_CLOEXEC || fd == image_file.as_raw_fd() {
+                    fds.push(fd);
+                }
             }
 
-            let flags = syscall::fcntl(fd, F_GETFD, 0)?;
+            fds
+        };
 
-            if flags & O_CLOEXEC == O_CLOEXEC {
-                let _ = syscall::close(fd);
+        let fds_to_close_bytes: &[u8] = unsafe {
+            core::slice::from_raw_parts(
+                fds_to_close.as_ptr() as *mut u8,
+                fds_to_close.len() * core::mem::size_of::<usize>(),
+            )
+        };
+
+        {
+            let filetable_fd = thread_fd.dup_into_upper(b"filetable-binary")?;
+            let _ = filetable_fd.call_wo(
+                fds_to_close_bytes,
+                CallFlags::empty(),
+                &[syscall::FileTableVerb::Close as u64],
+            );
+        }
+        {
+            let mut guard = crate::current_filetable();
+            for fd in fds_to_close {
+                let _ = guard.remove(fd);
             }
         }
+
+        unsafe {
+            deactivate_tcb(thread_fd)?;
+        }
+
+        let old_filetable_fd = {
+            let mut guard = crate::current_filetable();
+            guard.take()
+        };
+        drop(old_filetable_fd);
+
+        // Dropping this FD will cause the address space switch.
+        drop(addrspace_selection_fd);
+        unreachable!();
+    } else {
+        Ok(None)
     }
-
-    unsafe {
-        deactivate_tcb(&thread_fd)?;
-    }
-
-    // Dropping this FD will cause the address space switch.
-    drop(addrspace_selection_fd);
-
-    unreachable!();
 }
 fn write_usizes<const N: usize>(fd: &FdGuardUpper, usizes: [usize; N]) -> Result<usize> {
     fd.write(unsafe { plain::as_bytes(&usizes) })
@@ -616,6 +707,7 @@ impl<'a> MmapGuard<'a> {
 
         Ok(())
     }
+    #[expect(clippy::mut_from_ref)]
     pub unsafe fn map_mut_anywhere(
         fd: &'a FdGuardUpper,
         offset: usize,
@@ -637,6 +729,7 @@ impl<'a> MmapGuard<'a> {
     pub fn addr(&self) -> usize {
         self.base
     }
+    #[expect(clippy::len_without_is_empty, reason = "this len() is not costly")]
     pub fn len(&self) -> usize {
         self.size
     }
@@ -655,7 +748,7 @@ impl<'a> Drop for MmapGuard<'a> {
     }
 }
 
-struct FileBufReader {
+pub(crate) struct FileBufReader {
     fd: usize,
     buf: [u8; 8192],
     pos: usize,
@@ -674,10 +767,10 @@ impl FileBufReader {
 }
 
 impl FileBufReader {
-    fn read_le_u64(&mut self) -> syscall::Result<Option<u64>> {
+    pub fn read_le_u64(&mut self) -> Result<Option<u64>> {
         if self.pos >= self.cap {
             debug_assert!(self.pos == self.cap);
-            self.cap = crate::sys::posix_read(self.fd, &mut self.buf)?;
+            self.cap = syscall::read(self.fd, &mut self.buf)?;
             self.pos = 0;
         }
 
@@ -696,7 +789,6 @@ impl FileBufReader {
         Ok(Some(num))
     }
 }
-
 #[repr(transparent)]
 pub struct FdGuard<const UPPER: bool = false> {
     fd: usize,
@@ -707,10 +799,16 @@ impl FdGuard<false> {
     pub fn new(fd: usize) -> Self {
         Self { fd }
     }
-
     #[inline]
     pub fn open<T: AsRef<str>>(path: T, flags: usize) -> Result<Self> {
-        syscall::open(path, flags).map(Self::new)
+        open(path, flags).map(Self::new)
+    }
+
+    #[inline]
+    pub fn open_into_upper<T: AsRef<str>>(path: T, flags: usize) -> Result<FdGuardUpper> {
+        crate::sys::open_into_upper(path, flags)
+            .map(FdGuard::new)?
+            .to_upper()
     }
 
     #[inline]
@@ -718,7 +816,7 @@ impl FdGuard<false> {
         // Move to upper table if necessary
         let fd = if self.fd & syscall::UPPER_FDTBL_TAG == 0 {
             //TODO: use F_DUPFD_CLOEXEC?
-            let fd = syscall::fcntl(self.fd, syscall::F_DUPFD, syscall::UPPER_FDTBL_TAG)?;
+            let fd = crate::sys::fcntl(self.fd, syscall::F_DUPFD, syscall::UPPER_FDTBL_TAG)?;
             drop(self);
             fd
         } else {
@@ -735,18 +833,46 @@ impl FdGuard<false> {
 }
 impl<const UPPER: bool> FdGuard<UPPER> {
     #[inline]
+    pub fn openat<T: AsRef<str>>(
+        &self,
+        path: T,
+        flags: usize,
+        fcntl_flags: usize,
+    ) -> Result<FdGuard<false>> {
+        crate::sys::openat(self.fd, path, flags, fcntl_flags).map(FdGuard::new)
+    }
+    #[inline]
+    pub fn openat_into_upper<T: AsRef<str>>(
+        &self,
+        path: T,
+        flags: usize,
+        fcntl_flags: usize,
+    ) -> Result<FdGuardUpper> {
+        crate::sys::openat_into_upper(self.fd, path, flags, fcntl_flags)
+            .map(FdGuard::new)?
+            .to_upper()
+    }
+
+    #[inline]
     pub fn dup(&self, buf: &[u8]) -> Result<FdGuard<false>> {
-        syscall::dup(self.fd, buf).map(FdGuard::new)
+        crate::sys::dup(self.fd, buf).map(FdGuard::new)
+    }
+
+    #[inline]
+    pub fn dup_into_upper(&self, buf: &[u8]) -> Result<FdGuardUpper> {
+        crate::sys::dup_into_upper(self.fd, buf)
+            .map(FdGuard::new)?
+            .to_upper()
     }
 
     #[inline]
     pub fn fcntl(&self, cmd: usize, arg: usize) -> Result<usize> {
-        syscall::fcntl(self.fd, cmd, arg)
+        crate::sys::fcntl(self.fd, cmd, arg)
     }
 
     #[inline]
     pub fn fstat(&self, stat: &mut syscall::Stat) -> Result<usize> {
-        syscall::fstat(self.fd, stat)
+        fstat(self.fd, stat)
     }
 
     #[inline]
@@ -765,6 +891,21 @@ impl<const UPPER: bool> FdGuard<UPPER> {
     }
 
     #[inline]
+    pub fn call_ro(&self, payload: &mut [u8], flags: CallFlags, metadata: &[u64]) -> Result<usize> {
+        crate::sys::sys_call_ro(self.fd, payload, flags, metadata)
+    }
+
+    #[inline]
+    pub fn call_wo(&self, payload: &[u8], flags: CallFlags, metadata: &[u64]) -> Result<usize> {
+        crate::sys::sys_call_wo(self.fd, payload, flags, metadata)
+    }
+
+    #[inline]
+    pub fn call_rw(&self, payload: &mut [u8], flags: CallFlags, metadata: &[u64]) -> Result<usize> {
+        crate::sys::sys_call_rw(self.fd, payload, flags, metadata)
+    }
+
+    #[inline]
     pub fn as_raw_fd(&self) -> usize {
         self.fd
     }
@@ -779,7 +920,7 @@ impl<const UPPER: bool> FdGuard<UPPER> {
 impl<const UPPER: bool> Drop for FdGuard<UPPER> {
     #[inline]
     fn drop(&mut self) {
-        let _ = syscall::close(self.fd);
+        let _ = crate::sys::close(self.fd);
     }
 }
 impl Debug for FdGuard<false> {
@@ -798,9 +939,7 @@ pub fn create_set_addr_space_buf(
     sp: usize,
 ) -> [u8; size_of::<usize>() * 3] {
     let mut buf = [0u8; size_of::<usize>() * 3];
-
     buf.copy_from_slice([space, sp, ip].map(usize::to_ne_bytes).as_flattened());
-
     buf
 }
 pub fn create_set_addr_space_buf_for_fork(
@@ -821,7 +960,7 @@ pub fn fork_impl(args: &ForkArgs<'_>) -> Result<usize> {
     let old_mask = crate::signal::get_sigmask()?;
     let pid = unsafe {
         Error::demux(__relibc_internal_fork_wrapper(
-            args as *const ForkArgs as usize,
+            core::ptr::from_ref::<ForkArgs>(args) as usize,
         ))?
     };
 
@@ -840,7 +979,7 @@ pub enum ForkArgs<'a> {
 }
 
 pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
-    let (cur_filetable_fd, new_proc_fd, new_thr_fd, new_pid);
+    let (cur_filetable_fd, new_filetable_fd, new_proc_fd, new_thr_fd, new_pid);
 
     {
         let cur_thr_fd = match args {
@@ -859,7 +998,8 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
         // Copy existing files into new file table, but do not reuse the same file table (i.e. new
         // parent FDs will not show up for the child).
         let scratchpad = {
-            cur_filetable_fd = cur_thr_fd.dup(b"filetable")?;
+            cur_filetable_fd = cur_thr_fd.dup_into_upper(b"filetable-binary")?;
+            new_filetable_fd = cur_filetable_fd.dup_into_upper(b"copy")?;
 
             // This must be done before the address space is copied.
             let proc_fd = new_proc_fd.as_ref().map_or(usize::MAX, |p| p.as_raw_fd());
@@ -867,34 +1007,32 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
 
             ForkScratchpad {
                 cur_filetable_fd: cur_filetable_fd.as_raw_fd(),
+                new_filetable_fd: new_filetable_fd.as_raw_fd(),
                 new_proc_fd: proc_fd,
                 new_thr_fd: new_thr_fd.as_raw_fd(),
             }
         };
-
         #[cfg(any(
             target_arch = "x86_64",
             target_arch = "aarch64",
             target_arch = "riscv64"
         ))]
         let arg1 = {
-            let scratchpad_ptr: *const ForkScratchpad = &scratchpad;
+            let scratchpad_ptr: *const ForkScratchpad = &raw const scratchpad;
             scratchpad_ptr as usize
         };
         #[cfg(target_arch = "x86")]
-        {
-            let scratchpad_ptr = initial_rsp as *mut ForkScratchpad;
-            unsafe {
-                scratchpad_ptr.write(scratchpad);
-            }
+        unsafe {
+            let scratchpad_ptr = initial_rsp.cast::<ForkScratchpad>();
+            scratchpad_ptr.write(scratchpad);
         }
 
         // CoW-duplicate address space.
         {
-            let new_addr_space_sel_fd = new_thr_fd.dup(b"current-addrspace")?;
+            let new_addr_space_sel_fd = new_thr_fd.dup_into_upper(b"current-addrspace")?;
 
-            let cur_addr_space_fd = cur_thr_fd.dup(b"addrspace")?.to_upper()?;
-            let new_addr_space_fd = cur_addr_space_fd.dup(b"exclusive")?.to_upper()?;
+            let cur_addr_space_fd = cur_thr_fd.dup_into_upper(b"addrspace")?;
+            let new_addr_space_fd = cur_addr_space_fd.dup_into_upper(b"exclusive")?;
 
             let mut grant_desc_buf = [GrantDesc::default(); 16];
             loop {
@@ -937,7 +1075,7 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
                         buf = alloc::format!("grant-fd-{:>08x}", grant.base).into_bytes();
                     }
 
-                    let grant_fd = cur_addr_space_fd.dup(&buf)?.to_upper()?;
+                    let grant_fd = cur_addr_space_fd.dup_into_upper(&buf)?;
 
                     let mut flags = MAP_SHARED | MAP_FIXED_NOREPLACE;
 
@@ -962,14 +1100,14 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
             ))]
             let buf = create_set_addr_space_buf_for_fork(
                 new_addr_space_fd.as_raw_fd(),
-                __relibc_internal_fork_ret as usize,
+                __relibc_internal_fork_ret as *const () as usize,
                 initial_rsp as usize,
                 arg1,
             );
             #[cfg(target_arch = "x86")]
             let buf = create_set_addr_space_buf(
                 new_addr_space_fd.as_raw_fd(),
-                __relibc_internal_fork_ret as usize,
+                __relibc_internal_fork_ret as *const () as usize,
                 initial_rsp as usize,
             );
             new_addr_space_sel_fd.write(&buf)?;
@@ -980,19 +1118,17 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
             // Do this after the address space is cloned, since the kernel will get a shared
             // reference to the TCB and whatever pages stores the signal proc control struct.
             {
-                let new_sighandler_fd = new_thr_fd.dup(b"sighandler")?;
+                let new_sighandler_fd = new_thr_fd.dup_into_upper(b"sighandler")?;
                 new_sighandler_fd.write(&crate::signal::current_setsighandler_struct())?;
             }
             if let Some(ref proc_fd) = new_proc_fd {
-                proc_call(
+                sys_call(
                     proc_fd.as_raw_fd(),
-                    &mut [],
                     CallFlags::empty(),
                     &[ProcCall::SyncSigPctl as u64],
                 )?;
-                thread_call(
+                sys_call(
                     new_thr_fd.as_raw_fd(),
-                    &mut [],
                     CallFlags::empty(),
                     &[ThreadCall::SyncSigTctl as u64],
                 )?;
@@ -1000,48 +1136,47 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
         }
         {
             // Copy environment registers.
-            let cur_env_regs_fd = cur_thr_fd.dup(b"regs/env")?;
-            let new_env_regs_fd = new_thr_fd.dup(b"regs/env")?;
+            let cur_env_regs_fd = cur_thr_fd.dup_into_upper(b"regs/env")?;
+            let new_env_regs_fd = new_thr_fd.dup_into_upper(b"regs/env")?;
 
             let mut env_regs = syscall::EnvRegisters::default();
             cur_env_regs_fd.read(&mut env_regs)?;
             new_env_regs_fd.write(&env_regs)?;
         }
     }
-    // Copy the file table. We do this last to ensure that all previously used file descriptors are
-    // closed. The only exception -- the filetable selection fd and the current filetable fd --
-    // will be closed by the child process.
     {
         // TODO: Use file descriptor forwarding or something similar to avoid copying the file
         // table in the kernel.
-        let new_filetable_fd = cur_filetable_fd.dup(b"copy")?;
-        let new_filetable_sel_fd = new_thr_fd.dup(b"current-filetable")?;
+        let new_filetable_sel_fd = new_thr_fd.dup_into_upper(b"current-filetable")?;
         new_filetable_sel_fd.write(&usize::to_ne_bytes(new_filetable_fd.as_raw_fd()))?;
     }
-    let start_fd = new_thr_fd.dup(b"start")?;
+    new_filetable_fd.call_wo(
+        &new_filetable_fd.as_raw_fd().to_ne_bytes(),
+        syscall::CallFlags::FD | syscall::CallFlags::FD_CLONE,
+        &[new_filetable_fd.as_raw_fd() as u64],
+    )?;
+    let start_fd = new_thr_fd.dup_into_upper(b"start")?;
     start_fd.write(&[0])?;
-
     Ok(new_pid)
 }
 
 pub struct NewChildProc {
-    proc_fd: Option<FdGuardUpper>,
+    pub proc_fd: Option<FdGuardUpper>,
 
-    thr_fd: FdGuardUpper,
-    pid: usize,
+    pub thr_fd: FdGuardUpper,
+    pub pid: usize,
 }
 
 pub fn new_child_process(args: &ForkArgs<'_>) -> Result<NewChildProc> {
     match *args {
         ForkArgs::Managed => {
             let proc_info = crate::static_proc_info();
-            assert!(
-                proc_info.has_proc_fd,
-                "cannot use ForkArgs::Managed without an existing proc info"
-            );
-            let this_proc_fd = unsafe { proc_info.proc_fd.assume_init_ref() };
-            let child_proc_fd = this_proc_fd.dup(b"fork")?.to_upper()?;
-            let only_thread_fd = child_proc_fd.dup(b"thread-0")?.to_upper()?;
+            let this_proc_fd = proc_info
+                .proc_fd
+                .as_ref()
+                .expect("cannot use ForkArgs::Managed without an existing proc info");
+            let child_proc_fd = this_proc_fd.dup_into_upper(b"fork")?;
+            let only_thread_fd = child_proc_fd.dup_into_upper(b"thread-0")?;
             let meta = read_proc_meta(&child_proc_fd)?;
             Ok(NewChildProc {
                 proc_fd: Some(child_proc_fd),
@@ -1054,12 +1189,12 @@ pub fn new_child_process(args: &ForkArgs<'_>) -> Result<NewChildProc> {
 
         #[cfg(not(feature = "proc"))]
         ForkArgs::Init { this_thr_fd, auth } => {
-            let thr_fd = auth.dup(b"new-context")?.to_upper()?;
+            let thr_fd = auth.dup_into_upper(b"new-context")?;
             let buf = syscall::ProcSchemeAttrs {
                 pid: 0,
                 euid: 0,
                 egid: 0,
-                ens: 1,
+                prio: !0, // Value is overwritten later
                 debug_name: {
                     let mut buf = [0; 32];
                     let src = b"[init]";
@@ -1067,8 +1202,8 @@ pub fn new_child_process(args: &ForkArgs<'_>) -> Result<NewChildProc> {
                     buf
                 },
             };
-            let attr_fd =
-                thr_fd.dup(alloc::format!("auth-{}-attrs", auth.as_raw_fd()).as_bytes())?;
+            let attr_fd = thr_fd
+                .dup_into_upper(alloc::format!("auth-{}-attrs", auth.as_raw_fd()).as_bytes())?;
             attr_fd.write(&buf)?;
             Ok(NewChildProc {
                 thr_fd,
@@ -1079,33 +1214,36 @@ pub fn new_child_process(args: &ForkArgs<'_>) -> Result<NewChildProc> {
     }
 }
 
-pub unsafe fn make_init() -> (&'static FdGuardUpper, &'static FdGuardUpper) {
+pub unsafe fn make_init(proc_cap: usize) -> (&'static FdGuardUpper, &'static FdGuardUpper) {
     let proc_fd = FdGuard::new(
-        syscall::open("/scheme/proc/init", syscall::O_CLOEXEC).expect("failed to create init"),
+        crate::sys::openat_into_upper(proc_cap, "init", 0, 0).expect("failed to create init"),
     )
     .to_upper()
     .unwrap();
-    syscall::sendfd(
+
+    crate::sys::sys_call_wo(
         proc_fd.as_raw_fd(),
-        RtTcb::current().thread_fd().dup(&[]).unwrap().take(),
-        0,
-        0,
+        &RtTcb::current()
+            .thread_fd()
+            .dup_into_upper(&[])
+            .unwrap()
+            .take()
+            .to_ne_bytes(),
+        syscall::CallFlags::FD,
+        &[],
     )
     .expect("failed to assign current thread to init process");
 
     let managed_thr_fd = proc_fd
-        .dup(b"thread-0")
-        .expect("failed to get managed thread for init")
-        .to_upper()
-        .unwrap();
+        .dup_into_upper(b"thread-0")
+        .expect("failed to get managed thread for init");
 
     let managed_thr_fd = unsafe { (*RtTcb::current().thr_fd.get()).insert(managed_thr_fd) };
 
     unsafe {
         STATIC_PROC_INFO.get().write(crate::StaticProcInfo {
             pid: 1,
-            proc_fd: MaybeUninit::new(proc_fd),
-            has_proc_fd: true,
+            proc_fd: Some(proc_fd),
         })
     };
     *DYNAMIC_PROC_INFO.lock() = crate::DynamicProcInfo {
@@ -1116,15 +1254,15 @@ pub unsafe fn make_init() -> (&'static FdGuardUpper, &'static FdGuardUpper) {
         rgid: 0,
         egid: 0,
         sgid: 0,
+        ns_fd: None,
     };
     (
-        unsafe { (*STATIC_PROC_INFO.get()).proc_fd.assume_init_ref() },
+        unsafe { (*STATIC_PROC_INFO.get()).proc_fd.as_ref().unwrap() },
         managed_thr_fd,
     )
 }
 pub(crate) static STATIC_PROC_INFO: SyncUnsafeCell<StaticProcInfo> =
     SyncUnsafeCell::new(StaticProcInfo {
         pid: 0,
-        proc_fd: MaybeUninit::zeroed(),
-        has_proc_fd: false,
+        proc_fd: None,
     });

@@ -1,68 +1,91 @@
 /* c_cc { */
+/// EOF character.
+/// End of file. Causes the pending tty buffer to be sent to the waiting user
+/// program without waiting for end-of-line.
+/// Canonical mode only.
 pub const VEOF: usize = 0;
+/// EOL character.
+/// Additional end-of-line character.
+/// Canonical mode only.
 pub const VEOL: usize = 1;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/termios.3.html>.
+///
+/// EOL2 character.
+/// Another end-of-line character.
 pub const VEOL2: usize = 2;
+/// ERASE character.
+/// Erases the previous not-yet-erased character, but does not erase past `EOF`
+/// or beginning-of-line.
+/// Canonical mode only.
 pub const VERASE: usize = 3;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/termios.3.html>.
+///
+/// WERASE character.
+/// Word erase.
 pub const VWERASE: usize = 4;
+/// KILL character.
+/// Erases the input since the last `EOF` or beginning-of-line.
+/// Canonical mode only.
 pub const VKILL: usize = 5;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/termios.3.html>.
+///
+/// REPRINT character.
+/// Reprints unread characters.
 pub const VREPRINT: usize = 6;
-pub const VSWTC: usize = 7;
+/// INTR character.
+/// Send a `SIGINT` signal.
+/// Canonical and Non-Canonical mode.
 pub const VINTR: usize = 8;
+/// QUIT character.
+/// Send a `SIGQUIT` signal.
+/// Canonical and Non-Canonical mode.
 pub const VQUIT: usize = 9;
-pub const VSUSP: usize = 10;
+/// START character.
+/// Restarts output stopped by the STOP character.
+/// Canonical and Non-Canonical mode.
 pub const VSTART: usize = 12;
+/// STOP character.
+/// Stops the output until the START character is typed.
+/// Canonical and Non-Canonical mode.
 pub const VSTOP: usize = 13;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/termios.3.html>.
+///
+/// LNEXT character.
+/// Literal next. Quotes the next input character, depriving it of a possible
+/// special meaning.
 pub const VLNEXT: usize = 14;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/termios.3.html>.
+///
+/// DISCARD character (not supported under Linux).
+/// Toggles discarding pending output.
 pub const VDISCARD: usize = 15;
+/// MIN value.
+/// Minimum number of characters for noncanonical read.
+/// Non-Canonical mode only.
 pub const VMIN: usize = 16;
+/// TIME value.
+/// Timeout in decideconds for noncanonical read.
+/// Non-Canonical mode only.
 pub const VTIME: usize = 17;
-pub const NCCS: usize = 32;
 /* } c_cc */
 
 /* c_iflag { */
-pub const IGNBRK: usize = 0o000_001;
-pub const BRKINT: usize = 0o000_002;
-pub const IGNPAR: usize = 0o000_004;
-pub const PARMRK: usize = 0o000_010;
-pub const INPCK: usize = 0o000_020;
-pub const ISTRIP: usize = 0o000_040;
-pub const INLCR: usize = 0o000_100;
-pub const IGNCR: usize = 0o000_200;
-pub const ICRNL: usize = 0o000_400;
+/// Enable start/stop output control.
 pub const IXON: usize = 0o001_000;
+/// Enable start/stop input control.
 pub const IXOFF: usize = 0o002_000;
-pub const IXANY: usize = 0o004_000;
 /* } c_iflag */
 
 /* c_oflag { */
-pub const OPOST: usize = 0o000_001;
+/// Map NL to CR-NL on output.
 pub const ONLCR: usize = 0o000_002;
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/termios.3.html>.
+///
+/// Map lowercase characters to uppercase on output.
 pub const OLCUC: usize = 0o000_004;
-pub const OCRNL: usize = 0o000_010;
-pub const ONOCR: usize = 0o000_020;
-pub const ONLRET: usize = 0o000_040;
-pub const OFILL: usize = 0o0000_100;
-pub const OFDEL: usize = 0o0000_200;
 /* } c_oflag */
 
 /* c_cflag { */
-pub const B0: usize = 0o000_000;
-pub const B50: usize = 0o000_001;
-pub const B75: usize = 0o000_002;
-pub const B110: usize = 0o000_003;
-pub const B134: usize = 0o000_004;
-pub const B150: usize = 0o000_005;
-pub const B200: usize = 0o000_006;
-pub const B300: usize = 0o000_007;
-pub const B600: usize = 0o000_010;
-pub const B1200: usize = 0o000_011;
-pub const B1800: usize = 0o000_012;
-pub const B2400: usize = 0o000_013;
-pub const B4800: usize = 0o000_014;
-pub const B9600: usize = 0o000_015;
-pub const B19200: usize = 0o000_016;
-pub const B38400: usize = 0o000_017;
-
 pub const B57600: usize = 0o0_020;
 pub const B115200: usize = 0o0_021;
 pub const B230400: usize = 0o0_022;
@@ -79,33 +102,44 @@ pub const B3000000: usize = 0o0_034;
 pub const B3500000: usize = 0o0_035;
 pub const B4000000: usize = 0o0_036;
 
+/// Character size.
 pub const CSIZE: usize = 0o001_400;
-pub const CS5: usize = 0o000_000;
+/// 6 bits.
 pub const CS6: usize = 0o000_400;
+/// 7 bits.
 pub const CS7: usize = 0o001_000;
+/// 8 bits.
 pub const CS8: usize = 0o001_400;
 
+/// Send two stop bits, else one.
 pub const CSTOPB: usize = 0o002_000;
+/// Enable receiver.
 pub const CREAD: usize = 0o004_000;
+/// Parity enable.
 pub const PARENB: usize = 0o010_000;
+/// Odd parity, else even.
 pub const PARODD: usize = 0o020_000;
+/// Hang up on last close.
 pub const HUPCL: usize = 0o040_000;
-
+/// Ignore modem status lines.
 pub const CLOCAL: usize = 0o0100000;
 /* } c_clfag */
 
 /* c_lflag { */
+/// Enable signals.
 pub const ISIG: usize = 0x0000_0080;
+/// Canoncal input (erase and kill processing).
 pub const ICANON: usize = 0x0000_0100;
-pub const ECHO: usize = 0x0000_0008;
+/// Echo erase character as error-correcting backspace.
 pub const ECHOE: usize = 0x0000_0002;
+/// Echo KILL.
 pub const ECHOK: usize = 0x0000_0004;
+/// Echo NL.
 pub const ECHONL: usize = 0x0000_0010;
+/// Disable flush after interrupt or quit.
 pub const NOFLSH: usize = 0x8000_0000;
+/// Send `SIGTTOU` for background output.
 pub const TOSTOP: usize = 0x0040_0000;
+/// Enable extended input character processing.
 pub const IEXTEN: usize = 0x0000_0400;
 /* } c_lflag */
-
-// POSIX extensions
-/// Sentinel value to disable a control char.
-pub const _POSIX_VDISABLE: u8 = 0;

@@ -7,19 +7,26 @@ CARGOFLAGS?=$(CARGO_COMMON_FLAGS)
 CC_WRAPPER?=
 RUSTCFLAGS?=
 LINKFLAGS?=-lgcc
+USE_RUST_LIBM?=
 TESTBIN?=
 export OBJCOPY?=objcopy
 
 export CARGO_TARGET_DIR?=$(shell pwd)/target
 BUILD?=$(CARGO_TARGET_DIR)/$(TARGET)
 CARGOFLAGS+=--target=$(TARGET)
+EXCEPT_MATH=-not -name "math"
+FEATURE_MATH=
+ifneq ($(USE_RUST_LIBM),)
+FEATURE_MATH=--features math_libm
+EXCEPT_MATH=
+endif
 
 TARGET_HEADERS?=$(BUILD)/include
 export CFLAGS=-I$(TARGET_HEADERS)
 
 PROFILE?=release
 
-HEADERS_UNPARSED=$(shell find src/header -mindepth 1 -maxdepth 1 -type d -not -name "_*" -printf "%f\n")
+HEADERS_UNPARSED=$(shell find src/header -mindepth 1 -maxdepth 1 -type d -not -name "_*" $(EXCEPT_MATH) -printf "%f\n")
 HEADERS_DEPS=$(shell find src/header -type f \( -name "cbindgen.toml" -o -name "*.rs" \))
 #HEADERS=$(patsubst %,%.h,$(subst _,/,$(HEADERS_UNPARSED)))
 
@@ -33,22 +40,24 @@ BUILTINS_VERSION=0.1.70
 
 all: | headers libs
 
-headers: $(HEADERS_DEPS)
+headers: $(BUILD)/$(PROFILE)/librelibc.a $(HEADERS_DEPS)
 	rm -rf $(TARGET_HEADERS)
 	mkdir -p $(TARGET_HEADERS)
 	cp -r include/* $(TARGET_HEADERS)
+ifeq ($(USE_RUST_LIBM),)
 	cp "openlibm/include"/*.h $(TARGET_HEADERS)
 	cp "openlibm/src"/*.h $(TARGET_HEADERS)
+endif
 	@set -e ; \
 	for header in $(HEADERS_UNPARSED); do \
-		echo "\033[0;36;49mWriting Header $$header\033[0m"; \
 		if test -f "src/header/$$header/cbindgen.toml"; then \
+			printf "\033[0;36;49mWriting Header $$header\033[0m\n"; \
 			out=`echo "$$header" | sed 's/_/\//g'`; \
 			out="$(TARGET_HEADERS)/$$out.h"; \
 			cat "src/header/$$header/cbindgen.toml" cbindgen.globdefs.toml \
 				 | cbindgen "src/header/$$header/mod.rs" --config=/dev/stdin --output "$$out"; \
 		fi \
-	done; echo "\033[0;36;49mAll headers written\033[0m";
+	done; printf "\033[0;36;49mAll headers written\033[0m\n";
 
 clean:
 	$(CARGO) clean
@@ -70,20 +79,24 @@ libs: \
 	$(BUILD)/$(PROFILE)/libc.so \
 	$(BUILD)/$(PROFILE)/crt0.o \
 	$(BUILD)/$(PROFILE)/crti.o \
-	$(BUILD)/$(PROFILE)/crtn.o \
-	$(BUILD)/$(PROFILE)/ld_so
+	$(BUILD)/$(PROFILE)/crtn.o
 
 install-libs: headers libs
 	mkdir -pv "$(DESTDIR)/lib"
 	cp -v "$(BUILD)/$(PROFILE)/libc.a" "$(DESTDIR)/lib"
 	cp -v "$(BUILD)/$(PROFILE)/libc.so" "$(DESTDIR)/lib"
 	ln -vnfs libc.so "$(DESTDIR)/lib/libc.so.6"
+	ln -vnfs libc.so "$(DESTDIR)/lib/$(LD_SONAME)"
 	cp -v "$(BUILD)/$(PROFILE)/crt0.o" "$(DESTDIR)/lib"
 	ln -vnfs crt0.o "$(DESTDIR)/lib/crt1.o"
+	ln -vnfs crt0.o "$(DESTDIR)/lib/Scrt1.o"
 	cp -v "$(BUILD)/$(PROFILE)/crti.o" "$(DESTDIR)/lib"
 	cp -v "$(BUILD)/$(PROFILE)/crtn.o" "$(DESTDIR)/lib"
-	cp -v "$(BUILD)/$(PROFILE)/ld_so" "$(DESTDIR)/$(LD_SO_PATH)"
+ifeq ($(USE_RUST_LIBM),)
 	cp -v "$(BUILD)/openlibm/libopenlibm.a" "$(DESTDIR)/lib/libm.a"
+else
+	$(AR) -rcs "$(DESTDIR)/lib/libm.a"
+endif
 	# Empty libraries for dl, pthread, and rt
 	$(AR) -rcs "$(DESTDIR)/lib/libdl.a"
 	$(AR) -rcs "$(DESTDIR)/lib/libpthread.a"
@@ -91,8 +104,8 @@ install-libs: headers libs
 
 install-tests: tests
 	$(MAKE) -C tests
-	mkdir -p "$(DESTDIR)/bin/relibc-tests"
-	cp -vr tests/bins_static/* "$(DESTDIR)/bin/relibc-tests/"
+	mkdir -p "$(DESTDIR)/relibc-tests"
+	cp -vr tests/build_$(TARGET)/* "$(DESTDIR)/relibc-tests/"
 
 install: install-headers install-libs
 
@@ -121,21 +134,24 @@ test-once: sysroot/$(TARGET)
 	$(MAKE) -C tests run-once TESTBIN=$(TESTBIN)
 
 
-$(BUILD)/$(PROFILE)/libc.so: $(BUILD)/$(PROFILE)/librelibc.a $(BUILD)/openlibm/libopenlibm.a
+$(BUILD)/$(PROFILE)/libc.so: $(BUILD)/$(PROFILE)/ld_so.o $(BUILD)/$(PROFILE)/libc.a
+	# Specifying a dynamic list makes all non-local `STV_DEFAULT`
+	# definitions non-preemptible, except for the symbols listed in
+	# `dynlst.txt`. So, the symbols defined in `dynlst.txt` may be
+	# interposed by other definitions at runtime (either from the
+	# executable or some shared library).
 	$(CC) -nostdlib \
 		-shared \
 		-Wl,--gc-sections \
+		-Wl,--dynamic-list=dynlst.txt \
 		-Wl,-z,pack-relative-relocs \
 		-Wl,--sort-common \
-		-Wl,--allow-multiple-definition \
 		-Wl,--whole-archive $^ -Wl,--no-whole-archive \
 		-Wl,-soname,libc.so.6 \
 		$(LINKFLAGS) \
 		-o $@
 
-# Debug targets
-
-$(BUILD)/debug/libc.a: $(BUILD)/debug/librelibc.a $(BUILD)/openlibm/libopenlibm.a
+$(BUILD)/$(PROFILE)/libc.a: $(BUILD)/$(PROFILE)/librelibc.a $(BUILD)/openlibm/libopenlibm.a
 	echo "create $@" > "$@.mri"
 	for lib in $^; do\
 		echo "addlib $$lib" >> "$@.mri"; \
@@ -144,8 +160,10 @@ $(BUILD)/debug/libc.a: $(BUILD)/debug/librelibc.a $(BUILD)/openlibm/libopenlibm.
 	echo "end" >> "$@.mri"
 	$(AR) -M < "$@.mri"
 
+# Debug targets
+
 $(BUILD)/debug/librelibc.a: $(SRC)
-	$(CARGO) rustc $(CARGOFLAGS) -- --emit link=$@ -g -C debug-assertions=no $(RUSTCFLAGS)
+	$(CARGO) rustc $(CARGOFLAGS) $(FEATURE_MATH) -- --emit link=$@ -g -C debug-assertions=no $(RUSTCFLAGS)
 	./renamesyms.sh "$@" "$(BUILD)/debug/deps/"
 	./stripcore.sh "$@"
 	touch $@
@@ -166,22 +184,10 @@ $(BUILD)/debug/ld_so.o: $(SRC)
 	$(CARGO) rustc --manifest-path ld_so/Cargo.toml $(CARGOFLAGS) -- --emit obj=$@ -C panic=abort -g -C debug-assertions=no $(RUSTCFLAGS)
 	touch $@
 
-$(BUILD)/debug/ld_so: $(BUILD)/debug/ld_so.o $(BUILD)/debug/crti.o $(BUILD)/debug/libc.a $(BUILD)/debug/crtn.o
-	$(LD) --no-relax -T ld_so/ld_script/$(TARGET).ld --allow-multiple-definition --gc-sections $^ -o $@
-
 # Release targets
 
-$(BUILD)/release/libc.a: $(BUILD)/release/librelibc.a $(BUILD)/openlibm/libopenlibm.a
-	echo "create $@" > "$@.mri"
-	for lib in $^; do\
-		echo "addlib $$lib" >> "$@.mri"; \
-	done
-	echo "save" >> "$@.mri"
-	echo "end" >> "$@.mri"
-	$(AR) -M < "$@.mri"
-
 $(BUILD)/release/librelibc.a: $(SRC)
-	$(CARGO) rustc --release $(CARGOFLAGS) -- --emit link=$@ $(RUSTCFLAGS)
+	$(CARGO) rustc --release $(CARGOFLAGS) $(FEATURE_MATH) -- --emit link=$@ $(RUSTCFLAGS)
 	@# TODO: Better to only allow a certain whitelisted set of symbols? Perhaps
 	@# use some cbindgen hook, specify them manually, or grep for #[unsafe(no_mangle)].
 	./renamesyms.sh "$@" "$(BUILD)/release/deps/"
@@ -204,9 +210,6 @@ $(BUILD)/release/ld_so.o: $(SRC)
 	$(CARGO) rustc --release --manifest-path ld_so/Cargo.toml $(CARGOFLAGS) -- --emit obj=$@ -C panic=abort $(RUSTCFLAGS)
 	touch $@
 
-$(BUILD)/release/ld_so: $(BUILD)/release/ld_so.o $(BUILD)/release/crti.o $(BUILD)/release/libc.a $(BUILD)/release/crtn.o
-	$(LD) --no-relax -T ld_so/ld_script/$(TARGET).ld --allow-multiple-definition --gc-sections $^ -o $@
-
 # Other targets
 
 $(BUILD)/openlibm: openlibm
@@ -216,6 +219,12 @@ $(BUILD)/openlibm: openlibm
 	mv $@.partial $@
 	touch $@
 
-$(BUILD)/openlibm/libopenlibm.a: $(BUILD)/openlibm $(BUILD)/release/librelibc.a
+ifeq ($(USE_RUST_LIBM),)
+$(BUILD)/openlibm/libopenlibm.a: $(BUILD)/openlibm headers $(BUILD)/$(PROFILE)/librelibc.a
 	$(MAKE) -s AR=$(AR) CC="$(CC_WRAPPER) $(CC)" LD=$(LD) CPPFLAGS="$(CPPFLAGS) -fno-stack-protector -I$(shell pwd)/include -I$(TARGET_HEADERS)" -C $< libopenlibm.a
-	./renamesyms.sh "$@" "$(BUILD)/release/deps/"
+	./renamesyms.sh "$@" "$(BUILD)/$(PROFILE)/deps/"
+else
+$(BUILD)/openlibm/libopenlibm.a:
+	mkdir -p "$(BUILD)/openlibm"
+	$(AR) -rcs "$(BUILD)/openlibm/libopenlibm.a"
+endif

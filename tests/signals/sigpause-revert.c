@@ -1,5 +1,3 @@
-#define _XOPEN_SOURCE 700
-
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -16,7 +14,8 @@
 
 volatile sig_atomic_t handler_called = false;
 
-void handler() {
+void handler(int sig) {
+	(void) sig;
     handler_called = true;
 	return;
 }

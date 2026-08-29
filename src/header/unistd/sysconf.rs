@@ -1,4 +1,6 @@
-/// sysconf.h: <https://pubs.opengroup.org/onlinepubs/9799919799/functions/sysconf.html>.
+//! `sysconf.h` implementation.
+//!
+//! See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/sysconf.html>.
 
 #[cfg(target_os = "redox")]
 #[path = "sysconf/redox.rs"]
@@ -8,6 +10,9 @@ mod sys;
 #[path = "sysconf/linux.rs"]
 mod sys;
 
+pub mod constants;
+
+pub use constants::*;
 pub use sys::*;
 
 use core::ffi::{c_int, c_long};

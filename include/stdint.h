@@ -50,12 +50,7 @@ typedef __UINT8_TYPE__ u_int8_t;
 typedef __UINT16_TYPE__ uint16_t;
 typedef __UINT16_TYPE__ u_int16_t;
 #endif
-#ifdef __UINT32_TYPE__
-typedef __UINT32_TYPE__ uint32_t;
-typedef __UINT32_TYPE__ u_int32_t;
-// Required by openlibm
-typedef __UINT32_TYPE__ __uint32_t;
-#endif
+#include <bits/uint32-t.h> // for uint32_t
 #ifdef __UINT64_TYPE__
 typedef __UINT64_TYPE__ uint64_t;
 typedef __UINT64_TYPE__ u_int64_t;
@@ -87,9 +82,7 @@ typedef __UINT_FAST64_TYPE__ uint_fast64_t;
 
 /* 7.8.1.4 Integer types capable of holding object pointers */
 
-#ifdef __INTPTR_TYPE__
-typedef __INTPTR_TYPE__ intptr_t;
-#endif
+#include <bits/intptr-t.h> // for intptr_t
 #ifdef __UINTPTR_TYPE__
 typedef __UINTPTR_TYPE__ uintptr_t;
 #endif
@@ -367,9 +360,11 @@ typedef __UINTMAX_TYPE__ uintmax_t;
 #undef WINT_WIDTH
 #define WINT_WIDTH __WINT_WIDTH__
 
+#ifdef __ILP32__
+#define SIZE_MAX UINT32_MAX
+#else
 #define SIZE_MAX UINT64_MAX
 #endif
-
-typedef long sig_atomic_t;
+#endif
 
 #endif /* _GCC_STDINT_H */

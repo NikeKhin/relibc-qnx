@@ -13,18 +13,20 @@ use dlmalloc::DlmallocCApi;
 
 pub type Dlmalloc = DlmallocCApi<sys::System>;
 
+#[expect(clippy::declare_interior_mutable_const)]
 pub const NEWALLOCATOR: Allocator = Allocator::new();
 
 pub struct Allocator(SyncUnsafeCell<Mutex<Dlmalloc>>);
 
 impl Allocator {
+    #[expect(clippy::new_without_default)]
     pub const fn new() -> Self {
-        Allocator(SyncUnsafeCell::new(Mutex::new(Dlmalloc::new(
+        Self(SyncUnsafeCell::new(Mutex::new(Dlmalloc::new(
             sys::System::new(),
         ))))
     }
 
-    pub fn get(&self) -> *mut Mutex<Dlmalloc> {
+    pub fn get(&self) -> *const Mutex<Dlmalloc> {
         self.0.get()
     }
 }
@@ -33,22 +35,26 @@ unsafe impl GlobalAlloc for Allocator {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.align() <= align_of::<max_align_t>() {
-            (*self.get()).lock().malloc(layout.size())
+            unsafe { (*self.get()).lock().malloc(layout.size()) }
         } else {
-            (*self.get()).lock().memalign(layout.align(), layout.size())
+            unsafe { (*self.get()).lock().memalign(layout.align(), layout.size()) }
         }
     }
 
     #[inline]
+    #[expect(
+        unused_variables,
+        reason = "Layout part of GlobalAlloc trait but Dlmalloc free() doesn't require it"
+    )]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        (*self.get()).lock().free(ptr)
+        unsafe { (*self.get()).lock().free(ptr) }
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = self.alloc(layout);
-        if !ptr.is_null() && (*self.get()).lock().calloc_must_clear(ptr) {
-            write_bytes(ptr, 0, layout.size());
+        let ptr = unsafe { self.alloc(layout) };
+        if !ptr.is_null() && unsafe { (*self.get()).lock().calloc_must_clear(ptr) } {
+            unsafe { write_bytes(ptr, 0, layout.size()) };
         }
         ptr
     }
@@ -56,19 +62,18 @@ unsafe impl GlobalAlloc for Allocator {
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if layout.align() <= align_of::<max_align_t>() {
-            (*self.get()).lock().realloc(ptr, new_size)
+            unsafe { (*self.get()).lock().realloc(ptr, new_size) }
         } else {
-            let new = self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
+            let new =
+                unsafe { self.alloc(Layout::from_size_align_unchecked(new_size, layout.align())) };
             let old_size = layout.size();
-            let old_align = layout.align();
 
             if !new.is_null() {
                 let size = cmp::min(old_size, new_size);
-                copy_nonoverlapping(ptr, new, size);
+                unsafe { copy_nonoverlapping(ptr, new, size) };
             }
 
-            drop((old_size, old_align));
-            (*self.get()).lock().free(ptr);
+            unsafe { (*self.get()).lock().free(ptr) };
 
             new
         }
@@ -76,18 +81,18 @@ unsafe impl GlobalAlloc for Allocator {
 }
 
 pub unsafe fn alloc(size: size_t) -> *mut c_void {
-    (*ALLOCATOR.get()).lock().malloc(size).cast()
+    unsafe { (*ALLOCATOR.get()).lock().malloc(size) }.cast()
 }
 
 pub unsafe fn alloc_align(size: size_t, alignment: size_t) -> *mut c_void {
-    (*ALLOCATOR.get()).lock().memalign(alignment, size).cast()
+    unsafe { (*ALLOCATOR.get()).lock().memalign(alignment, size) }.cast()
 }
 
 pub unsafe fn realloc(ptr: *mut c_void, size: size_t) -> *mut c_void {
     if ptr.is_null() {
-        (*ALLOCATOR.get()).lock().malloc(size).cast()
+        unsafe { (*ALLOCATOR.get()).lock().malloc(size) }.cast()
     } else {
-        (*ALLOCATOR.get()).lock().realloc(ptr.cast(), size).cast()
+        unsafe { (*ALLOCATOR.get()).lock().realloc(ptr.cast(), size) }.cast()
     }
 }
 
@@ -95,12 +100,12 @@ pub unsafe fn free(ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
-    (*ALLOCATOR.get()).lock().free(ptr.cast())
+    unsafe { (*ALLOCATOR.get()).lock().free(ptr.cast()) }
 }
 
 pub unsafe fn alloc_usable_size(ptr: *mut c_void) -> size_t {
     if ptr.is_null() {
         return 0;
     }
-    (*ALLOCATOR.get()).lock().usable_size(ptr.cast())
+    unsafe { (*ALLOCATOR.get()).lock().usable_size(ptr.cast()) }
 }

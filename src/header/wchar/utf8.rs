@@ -1,11 +1,15 @@
 //UTF implementation parts for wchar.h.
 //Partially ported from the Sortix libc
 
-use core::{char, slice, str, usize};
+use core::{char, slice, str};
 
 use crate::{
+    casting::CCharPtrToU8,
     header::errno,
-    platform::{self, types::*},
+    platform::{
+        self,
+        types::{c_char, wchar_t},
+    },
 };
 
 use super::mbstate_t;
@@ -41,22 +45,22 @@ fn utf8_char_width(b: u8) -> usize {
 }
 
 //It's guaranteed that we don't have any nullpointers here
-pub unsafe fn mbrtowc(pwc: *mut wchar_t, s: *const c_char, n: usize, ps: *mut mbstate_t) -> usize {
-    let size = utf8_char_width(*s as u8);
+pub unsafe fn mbrtowc(pwc: *mut wchar_t, s: *const c_char, n: usize, _ps: *mut mbstate_t) -> usize {
+    let size = utf8_char_width(unsafe { CCharPtrToU8::from_const(s) });
     if size > n {
         platform::ERRNO.set(errno::EILSEQ);
-        return -2isize as usize;
+        return (-2isize).cast_unsigned();
     }
     if size == 0 {
         platform::ERRNO.set(errno::EILSEQ);
-        return -1isize as usize;
+        return (-1isize).cast_unsigned();
     }
 
-    let slice = slice::from_raw_parts(s as *const u8, size);
+    let slice = unsafe { slice::from_raw_parts(s.cast::<u8>(), size) };
     let decoded = str::from_utf8(slice);
     if decoded.is_err() {
         platform::ERRNO.set(errno::EILSEQ);
-        return -1isize as usize;
+        return (-1isize).cast_unsigned();
     }
 
     let wc = decoded.unwrap();
@@ -64,24 +68,24 @@ pub unsafe fn mbrtowc(pwc: *mut wchar_t, s: *const c_char, n: usize, ps: *mut mb
     let result: wchar_t = wc.chars().next().unwrap() as wchar_t;
 
     if !pwc.is_null() {
-        *pwc = result;
+        unsafe { *pwc = result };
     }
 
     if result != 0 { size } else { 0 }
 }
 
 //It's guaranteed that we don't have any nullpointers here
-pub unsafe fn wcrtomb(s: *mut c_char, wc: wchar_t, ps: *mut mbstate_t) -> usize {
+pub unsafe fn wcrtomb(s: *mut c_char, wc: wchar_t, _ps: *mut mbstate_t) -> usize {
     let dc = char::from_u32(wc as u32);
 
     if dc.is_none() {
         platform::ERRNO.set(errno::EILSEQ);
-        return -1isize as usize;
+        return (-1isize).cast_unsigned();
     }
 
     let c = dc.unwrap();
     let size = c.len_utf8();
-    let slice = slice::from_raw_parts_mut(s as *mut u8, size);
+    let slice = unsafe { slice::from_raw_parts_mut(s.cast::<u8>(), size) };
 
     c.encode_utf8(slice);
 

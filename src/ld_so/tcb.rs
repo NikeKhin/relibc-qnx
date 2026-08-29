@@ -1,5 +1,3 @@
-#![deny(unsafe_op_in_unsafe_fn)]
-
 use alloc::vec::Vec;
 use core::{
     cell::UnsafeCell,
@@ -13,7 +11,7 @@ use generic_rt::GenericTcb;
 use crate::{
     header::sys_mman,
     ld_so::linker::Linker,
-    platform::{Dlmalloc, Pal, Sys},
+    platform::{Pal, Sys},
     pthread::{OsTid, Pthread},
     sync::{mutex::Mutex, waitval::Waitval},
 };
@@ -40,10 +38,10 @@ impl Master {
 }
 
 #[cfg(target_os = "linux")]
-type OsSpecific = ();
+pub type OsSpecific = ();
 
 #[cfg(target_os = "redox")]
-type OsSpecific = redox_rt::signal::RtSigarea;
+pub type OsSpecific = redox_rt::signal::RtSigarea;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -52,14 +50,12 @@ pub struct Tcb {
     pub generic: GenericTcb<OsSpecific>,
     /// Pointer to a list of initial TLS data
     pub masters_ptr: *mut Master,
-    /// Size of the masters list in bytes (multiple of mem::size_of::<Master>())
+    /// Size of the masters list in bytes (multiple of `mem::size_of::<Master>()`)
     pub masters_len: usize,
     /// Index of last copied Master
     pub num_copied_masters: usize,
     /// Pointer to dynamic linker
     pub linker_ptr: *const Mutex<Linker>,
-    /// pointer to rust memory allocator structure
-    pub mspace: *const Mutex<Dlmalloc>,
     /// Underlying pthread_t struct, pthread_self() returns &self.pthread
     pub pthread: Pthread,
 
@@ -80,12 +76,12 @@ impl Tcb {
     /// Create a new TCB
     ///
     /// `size` is the size of the TLS in bytes.
-    #[allow(unsafe_op_in_unsafe_fn)]
+    #[expect(unsafe_op_in_unsafe_fn)]
     pub unsafe fn new(size: usize) -> Result<&'static mut Self, DlError> {
         let page_size = Sys::getpagesize();
         let (_abi_page, tls, tcb_page) = Self::os_new(size.next_multiple_of(page_size))?;
 
-        let tcb_ptr = tcb_page.as_mut_ptr() as *mut Self;
+        let tcb_ptr = tcb_page.as_mut_ptr().cast::<Self>();
         ptr::write(
             tcb_ptr,
             Self {
@@ -100,7 +96,6 @@ impl Tcb {
                 masters_len: 0,
                 num_copied_masters: 0,
                 linker_ptr: ptr::null(),
-                mspace: ptr::null(),
                 pthread: Pthread {
                     waitval: Waitval::new(),
                     flags: Default::default(),
@@ -109,6 +104,7 @@ impl Tcb {
                     stack_base: core::ptr::null_mut(),
                     stack_size: 0,
                     os_tid: UnsafeCell::new(OsTid::default()),
+                    tcb_selfref: UnsafeCell::new(tcb_ptr),
                 },
 
                 dtv_ptr: ptr::null_mut(),
@@ -153,36 +149,41 @@ impl Tcb {
     /// Copy data from masters
     pub unsafe fn copy_masters(&mut self) -> Result<(), DlError> {
         //TODO: Complain if masters or tls exist without the other
-        if let Some(tls) = unsafe { self.tls() } {
-            if let Some(masters) = self.masters() {
-                for master in masters
-                    .iter()
-                    .skip(self.num_copied_masters)
-                    .filter(|master| master.image_size != 0)
-                {
-                    let range = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
-                        // x86{_64} TLS layout is backwards
-                        self.tls_len - master.offset
-                            ..self.tls_len - master.offset + master.image_size
-                    } else {
-                        master.offset..master.offset + master.image_size
-                    };
-                    if let Some(tls_data) = tls.get_mut(range) {
-                        let data = unsafe { master.data() };
-                        trace!(
-                            "tls master: {:p}, {:#x}: {:p}, {:#x}",
-                            data.as_ptr(),
-                            data.len(),
-                            tls_data.as_mut_ptr(),
-                            tls_data.len()
-                        );
-                        tls_data.copy_from_slice(data);
-                    } else {
-                        return Err(DlError::Malformed);
-                    }
+        if let Some(tls) = unsafe { self.tls() }
+            && let Some(masters) = self.masters()
+        {
+            for (i, master) in masters.iter().skip(self.num_copied_masters).enumerate() {
+                if master.image_size == 0 {
+                    continue;
                 }
-                self.num_copied_masters = masters.len();
+
+                let master_idx = self.num_copied_masters + i;
+                let range = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+                    // x86{_64} TLS layout is backwards
+                    self.tls_len - master.offset..self.tls_len - master.offset + master.image_size
+                } else if cfg!(target_arch = "aarch64") {
+                    // AArch64 p_vaddr is ignored for first master, this is experimentally determined
+                    let start = if master_idx == 0 { 0 } else { master.offset };
+                    start..start + master.image_size
+                } else {
+                    master.offset..master.offset + master.image_size
+                };
+                if let Some(tls_data) = tls.get_mut(range) {
+                    let data = unsafe { master.data() };
+                    #[cfg(feature = "trace_tls")]
+                    log::trace!(
+                        "tls master: {:p}, {:#x}: {:p}, {:#x}",
+                        data.as_ptr(),
+                        data.len(),
+                        tls_data.as_mut_ptr(),
+                        tls_data.len()
+                    );
+                    tls_data.copy_from_slice(data);
+                } else {
+                    return Err(DlError::Malformed);
+                }
             }
+            self.num_copied_masters = masters.len();
         }
 
         Ok(())
@@ -209,7 +210,7 @@ impl Tcb {
     /// Activate TLS
     pub unsafe fn activate(
         &mut self,
-        #[cfg(target_os = "redox")] thr_fd: redox_rt::proc::FdGuardUpper,
+        #[cfg(target_os = "redox")] thr_fd: Option<redox_rt::proc::FdGuardUpper>,
     ) {
         unsafe {
             Self::os_arch_activate(
@@ -232,6 +233,9 @@ impl Tcb {
                     let offset = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
                         // x86{_64} TLS layout is backwards
                         self.tls_len - master.offset
+                    } else if cfg!(target_arch = "aarch64") {
+                        // AArch64 p_vaddr is ignored for first master
+                        if i == 0 { 0 } else { master.offset }
                     } else {
                         master.offset
                     };
@@ -267,7 +271,7 @@ impl Tcb {
     }
 
     /// Mapping with correct flags for TCB and TLS
-    #[allow(unsafe_op_in_unsafe_fn)]
+    #[expect(unsafe_op_in_unsafe_fn)]
     unsafe fn map(size: usize) -> Result<&'static mut [u8], DlError> {
         let ptr = Sys::mmap(
             ptr::null_mut(),
@@ -279,8 +283,8 @@ impl Tcb {
         )
         .map_err(|_| DlError::Oom)?;
 
-        ptr::write_bytes(ptr as *mut u8, 0, size);
-        Ok(slice::from_raw_parts_mut(ptr as *mut u8, size))
+        ptr::write_bytes(ptr.cast::<u8>(), 0, size);
+        Ok(slice::from_raw_parts_mut(ptr.cast::<u8>(), size))
     }
 
     /// OS specific code to create a new TLS and TCB - Linux and Redox
@@ -325,6 +329,7 @@ impl Tcb {
     /// ```
     ///
     /// For x86_64, the ABI page is not used.
+    #[allow(clippy::type_complexity)]
     #[cfg(any(target_os = "linux", target_os = "redox"))]
     unsafe fn os_new(
         size: usize,
@@ -363,10 +368,12 @@ impl Tcb {
         os: &OsSpecific,
         tls_end: usize,
         tls_len: usize,
-        thr_fd: redox_rt::proc::FdGuardUpper,
+        thr_fd: Option<redox_rt::proc::FdGuardUpper>,
     ) {
         unsafe {
-            os.thr_fd.get().write(Some(thr_fd));
+            if let Some(thr_fd) = thr_fd {
+                os.thr_fd.get().write(Some(thr_fd));
+            }
             redox_rt::tcb_activate(os, tls_end, tls_len)
         }
     }

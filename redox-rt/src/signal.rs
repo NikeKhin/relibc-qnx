@@ -8,14 +8,14 @@ use syscall::{
 use crate::{
     RtTcb, Tcb,
     arch::*,
-    current_proc_fd,
-    protocol::{
-        ProcCall, RtSigInfo, SIGCHLD, SIGCONT, SIGKILL, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG,
-        SIGWINCH, ThreadCall,
-    },
-    static_proc_info,
+    current_proc_fd, static_proc_info,
     sync::Mutex,
-    sys::{proc_call, this_thread_call},
+    sys::{sys_call, sys_call_rw, this_thread_call},
+};
+
+use redox_protocols::protocol::{
+    ProcCall, RtSigInfo, SIGCHLD, SIGCONT, SIGKILL, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, SIGURG,
+    SIGWINCH, ThreadCall,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -24,7 +24,7 @@ static CPUID_EAX1_ECX: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomi
 pub fn sighandler_function() -> usize {
     // TODO: HWCAP?
 
-    __relibc_internal_sigentry as usize
+    __relibc_internal_sigentry as *const () as usize
 }
 
 /// ucontext_t representation
@@ -108,11 +108,9 @@ unsafe fn inner(stack: &mut SigStack) {
     let os = unsafe { &Tcb::current().unwrap().os_specific };
 
     let stack_ptr = NonNull::from(&mut *stack);
-    stack.link = core::mem::replace(
-        unsafe { &mut (*os.arch.get()).last_sigstack },
-        Some(stack_ptr),
-    )
-    .map_or_else(core::ptr::null_mut, |x| x.as_ptr());
+    stack.link = unsafe { &mut (*os.arch.get()).last_sigstack }
+        .replace(stack_ptr)
+        .map_or_else(core::ptr::null_mut, |x| x.as_ptr());
 
     let signals_were_disabled = unsafe { (*os.arch.get()).disable_signals_depth > 0 };
 
@@ -177,9 +175,8 @@ unsafe fn inner(stack: &mut SigStack) {
         // }
         SigactionKind::Default if usize::from(sig) == SIGCONT => SignalHandler { handler: None },
         SigactionKind::Default => {
-            let _ = proc_call(
+            let _ = sys_call(
                 current_proc_fd().as_raw_fd(),
-                &mut [],
                 CallFlags::empty(),
                 &[ProcCall::Exit as u64, u64::from(sig) << 8],
             );
@@ -228,7 +225,7 @@ unsafe fn inner(stack: &mut SigStack) {
             sigaction(
                 stack.sig_num as c_int,
                 core::ptr::addr_of!(info).cast(),
-                stack as *mut SigStack as *mut (),
+                core::ptr::from_mut::<SigStack>(stack).cast::<()>(),
             )
         };
     } else if let Some(handler) = unsafe { handler.handler } {
@@ -242,15 +239,20 @@ unsafe fn inner(stack: &mut SigStack) {
     );
     core::sync::atomic::compiler_fence(Ordering::Acquire);
 
-    // Update allowset again.
+    // Update allowset again, and obtain the set of pending unblocked signals with this new
+    // allowset. If this is nonempty, we must deliver the signal here rather than wait for it
+    // asynchronously, as shown e.g. in https://gitlab.redox-os.org/redox-os/relibc/-/issues/239.
+    // We do this even if signals_were_disabled beforehand (where the caller hence explicitly
+    // must have jumped to this trampoline).
 
     let new_mask = stack.old_mask;
     let old_mask = get_allowset_raw(&os.control.word);
 
-    let _pending_when_restored_mask = set_allowset_raw(&os.control.word, old_mask, new_mask);
-
-    // TODO: If resetting the sigmask caused signals to be unblocked, then should they be delivered
-    // here? And would it be possible to tail-call-optimize that?
+    let pending_unblocked = {
+        let thread_pending = set_allowset_raw(&os.control.word, old_mask, new_mask);
+        let proc_pending = PROC_CONTROL_STRUCT.pending.load(Ordering::Relaxed);
+        (thread_pending | proc_pending) & new_mask
+    };
 
     unsafe { (*os.arch.get()).last_sig_was_restart = shall_restart };
 
@@ -259,8 +261,18 @@ unsafe fn inner(stack: &mut SigStack) {
 
     // TODO: Support restoring uc_stack?
 
-    // And re-enable them again
-    if !signals_were_disabled {
+    if pending_unblocked > 0 {
+        // If there were signals visible at the time we checked (otherwise it can be considered
+        // "asynchronous" and will be delivered the next time an EINTR is seen, or after the
+        // post-preemption check in the kernel), we delay clearing the INHIBIT_DELIVERY bit, and
+        // rearrange the saved instr ptr field on the stack and the sc_saved_rip field, so that it
+        // returns to the start of the trampoline in a way that makes it look like a new signal was
+        // immediately delivered. There's no need to worry about the __crit_* sections since
+        // INHIBIT_DELIVERY is still set.
+        arch_ret_to_sig(stack, &os.control);
+    } else if !signals_were_disabled {
+        // Re-enable signals again, except in the case where they were disabled and the trampoline
+        // was explicitly jumped to when handling EINTR.
         core::sync::atomic::compiler_fence(Ordering::Release);
         control_flags.store(
             control_flags.load(Ordering::Relaxed) & !SigcontrolFlags::INHIBIT_DELIVERY.bits(),
@@ -274,7 +286,7 @@ pub(crate) unsafe extern "C" fn inner_c(stack: usize) {
 }
 #[cfg(target_arch = "x86")]
 pub(crate) unsafe extern "fastcall" fn inner_fastcall(stack: usize) {
-    inner(&mut *(stack as *mut SigStack))
+    unsafe { inner(&mut *(stack as *mut SigStack)) }
 }
 
 pub fn get_sigmask() -> Result<u64> {
@@ -336,11 +348,12 @@ fn modify_sigmask(old: Option<&mut u64>, op: Option<impl FnOnce(u64) -> u64>) ->
 
     let next = !op(!prev);
 
-    let pending = set_allowset_raw(&ctl.word, prev, next);
+    let thread_pending = set_allowset_raw(&ctl.word, prev, next);
+    let proc_pending = PROC_CONTROL_STRUCT.pending.load(Ordering::Relaxed);
 
     // POSIX requires that at least one pending unblocked signal be delivered before
     // pthread_sigmask returns, if there is one.
-    if pending != 0 {
+    if (thread_pending | proc_pending) & next != 0 {
         unsafe {
             manually_enter_trampoline();
         }
@@ -393,13 +406,13 @@ fn convert_old(action: &RawAction) -> Sigaction {
     let handler = (old_first & !(u64::from(STORED_FLAGS) << 32)) as usize;
     let flags = SigactionFlags::from_bits_retain(((old_first >> 32) as u32) & STORED_FLAGS);
 
-    let kind = if handler == default_handler as usize {
+    let kind = if handler == default_handler as *const () as usize {
         SigactionKind::Default
     } else if flags.contains(SigactionFlags::IGNORED) {
         SigactionKind::Ignore
     } else {
         SigactionKind::Handled {
-            handler: unsafe { core::mem::transmute(handler as usize) },
+            handler: unsafe { core::mem::transmute::<usize, SignalHandler>(handler) },
         }
     };
 
@@ -476,7 +489,7 @@ fn sigaction_inner(
                 MASK_DONTCARE,
                 SigactionFlags::IGNORED,
                 if matches!(new.kind, SigactionKind::Default) {
-                    default_handler as usize
+                    default_handler as *const () as usize
                 } else {
                     0
                 },
@@ -486,7 +499,7 @@ fn sigaction_inner(
         (SIGTSTP | SIGTTOU | SIGTTIN, SigactionKind::Default) => (
             MASK_DONTCARE,
             SigactionFlags::SIG_SPECIFIC,
-            default_handler as usize,
+            default_handler as *const () as usize,
         ),
         (SIGCHLD, SigactionKind::Default) => {
             let nocldstop_bit = new.flags & SigactionFlags::SIG_SPECIFIC;
@@ -503,11 +516,11 @@ fn sigaction_inner(
             (
                 MASK_DONTCARE,
                 SigactionFlags::IGNORED | nocldstop_bit,
-                default_handler as usize,
+                default_handler as *const () as usize,
             )
         }
 
-        (_, SigactionKind::Default) => (new.mask, new.flags, default_handler as usize),
+        (_, SigactionKind::Default) => (new.mask, new.flags, default_handler as *const () as usize),
         (_, SigactionKind::Handled { .. }) => (new.mask, new.flags, explicit_handler),
     };
     let new_first = (handler as u64) | (u64::from(flags.bits() & STORED_FLAGS) << 32);
@@ -522,10 +535,15 @@ fn current_sigctl() -> &'static Sigcontrol {
 }
 
 pub struct TmpDisableSignalsGuard {
-    _inner: (),
+    active: bool,
 }
 
+/// Used to disable jumping to signal handler while the guard active
 pub fn tmp_disable_signals() -> TmpDisableSignalsGuard {
+    if !crate::TLS_ACTIVATED.load(Ordering::Relaxed) {
+        return TmpDisableSignalsGuard { active: false };
+    }
+
     unsafe {
         let ctl = &current_sigctl().control_flags;
         ctl.store(
@@ -538,10 +556,13 @@ pub fn tmp_disable_signals() -> TmpDisableSignalsGuard {
         (*Tcb::current().unwrap().os_specific.arch.get()).disable_signals_depth += 1;
     }
 
-    TmpDisableSignalsGuard { _inner: () }
+    TmpDisableSignalsGuard { active: true }
 }
 impl Drop for TmpDisableSignalsGuard {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         unsafe {
             let depth =
                 &mut (*Tcb::current().unwrap().os_specific.arch.get()).disable_signals_depth;
@@ -619,7 +640,7 @@ pub fn setup_sighandler(tcb: &RtTcb, first_thread: bool) {
                 SigactionFlags::empty()
             };
             action.first.store(
-                (u64::from(bits.bits()) << 32) | default_handler as u64,
+                (u64::from(bits.bits()) << 32) | default_handler as *const () as u64,
                 Ordering::Relaxed,
             );
         }
@@ -639,6 +660,8 @@ pub fn setup_sighandler(tcb: &RtTcb, first_thread: bool) {
 
     #[cfg(target_arch = "x86_64")]
     {
+        // On newer rust, cpuid is not unsafe
+        #[allow(unused_unsafe)]
         let cpuid_eax1_ecx = unsafe { core::arch::x86_64::__cpuid(1) }.ecx;
         CPUID_EAX1_ECX.store(cpuid_eax1_ecx, core::sync::atomic::Ordering::Relaxed);
         SUPPORTS_AVX.store(u8::from(cpuid_eax1_ecx & 1 << 28 != 0), Ordering::Relaxed);
@@ -648,15 +671,11 @@ pub fn setup_sighandler(tcb: &RtTcb, first_thread: bool) {
 
     let fd = tcb
         .thread_fd()
-        .dup(b"sighandler")
+        .dup_into_upper(b"sighandler")
         .expect("failed to open sighandler fd");
     fd.write(&data).expect("failed to write to sighandler fd");
-    this_thread_call(
-        &mut [],
-        CallFlags::empty(),
-        &[ThreadCall::SyncSigTctl as u64],
-    )
-    .expect("failed to sync signal tctl");
+    this_thread_call(CallFlags::empty(), &[ThreadCall::SyncSigTctl as u64])
+        .expect("failed to sync signal tctl");
 
     // TODO: Inherited set of ignored signals
     // TODO: handle error
@@ -670,7 +689,7 @@ pub fn current_setsighandler_struct() -> SetSighandlerData {
         thread_control_addr: core::ptr::addr_of!(
             unsafe { Tcb::current() }.unwrap().os_specific.control
         ) as usize,
-        proc_control_addr: &PROC_CONTROL_STRUCT as *const SigProcControl as usize,
+        proc_control_addr: &raw const PROC_CONTROL_STRUCT as usize,
     }
 }
 
@@ -747,7 +766,7 @@ pub fn currently_pending_blocked() -> u64 {
     let w0 = control.word[0].load(Ordering::Relaxed);
     let w1 = control.word[1].load(Ordering::Relaxed);
     let allow = (w0 >> 32) | ((w1 >> 32) << 32);
-    let thread_pending = (w0 & 0xffff_ffff) | ((w1 >> 32) & 0xffff_ffff);
+    let thread_pending = (w0 & 0xffff_ffff) | ((w1 & 0xffff_ffff) << 32);
     let proc_pending = PROC_CONTROL_STRUCT.pending.load(Ordering::Relaxed);
 
     core::sync::atomic::fence(Ordering::Acquire); // TODO: Correct ordering?
@@ -783,6 +802,34 @@ pub fn await_signal_async(inner_allowset: u64) -> Result<Unreachable> {
     res?;
     unreachable!()
 }
+
+/// Run a callback with the specified signal mask, atomically
+pub fn callback_or_signal_async<T, F: FnOnce() -> Result<T>>(
+    inner_allowset: u64,
+    callback: F,
+) -> Result<T> {
+    let _guard = tmp_disable_signals();
+    let control = &unsafe { Tcb::current().unwrap() }.os_specific.control;
+
+    let old_allowset = get_allowset_raw(&control.word);
+    set_allowset_raw(&control.word, old_allowset, inner_allowset);
+    let res = callback();
+    if let Err(err) = &res
+        && err.errno == EINTR
+    {
+        // Run trampoline if EINTR returned
+        unsafe {
+            manually_enter_trampoline();
+        }
+    }
+
+    // POSIX says it shall restore the mask to what it was prior to the call, which is interpreted
+    // as allowing any changes to sigprocmask inside the signal handler, to be discarded.
+    set_allowset_raw(&control.word, inner_allowset, old_allowset);
+
+    res
+}
+
 /*#[unsafe(no_mangle)]
 pub extern "C" fn __redox_rt_debug_sigctl() {
     let tcb = &RtTcb::current().control;
@@ -806,7 +853,7 @@ pub fn await_signal_sync(inner_allowset: u64, timeout: Option<&TimeSpec>) -> Res
     }
 
     let res = match timeout {
-        Some(t) => syscall::nanosleep(&t, &mut TimeSpec::default()),
+        Some(t) => syscall::nanosleep(t, &mut TimeSpec::default()),
         None => syscall::nanosleep(
             &TimeSpec {
                 tv_sec: i64::MAX,
@@ -830,6 +877,7 @@ pub fn await_signal_sync(inner_allowset: u64, timeout: Option<&TimeSpec>) -> Res
         // Normally ETIMEDOUT but not for sigtimedwait.
         .ok_or(Error::new(EAGAIN))
 }
+
 fn try_claim_multiple(
     mut proc_pending: u64,
     mut thread_pending: u64,
@@ -861,8 +909,8 @@ fn try_claim_single(sig_idx: u32, thread_control: Option<&Sigcontrol>) -> Option
         let rt_inf: RtSigInfo = unsafe {
             let mut buf = [0_u8; size_of::<RtSigInfo>()];
             buf[..4].copy_from_slice(&(sig_idx - 32).to_ne_bytes());
-            proc_call(
-                static_proc_info().proc_fd.assume_init_ref().as_raw_fd(),
+            sys_call_rw(
+                static_proc_info().proc_fd.as_ref().unwrap().as_raw_fd(),
                 &mut buf,
                 CallFlags::empty(),
                 &[ProcCall::Sigdeq as u64],
@@ -885,12 +933,18 @@ fn try_claim_single(sig_idx: u32, thread_control: Option<&Sigcontrol>) -> Option
         let info = SenderInfo::from_raw(match thread_control {
             Some(ctl) => {
                 // Only this thread can clear pending bits, so this will always succeed.
-                let info = ctl.sender_infos[sig_idx as usize].load(Ordering::Acquire);
-                // TODO: Ordering
+                let info = match ctl.sender_infos.get(sig_idx as usize) {
+                    Some(i) => i.load(Ordering::Relaxed),
+                    // TODO: Protocol will need to be extended in order to allow passing si_uid and
+                    // si_pid for per-thread (non-queued) realtime signals.
+                    None => 0,
+                };
+                // TODO: Ordering?
                 ctl.word[sig_group as usize].fetch_and(!(1 << (sig_idx % 32)), Ordering::Release);
                 info
             }
             None => {
+                // Must have sig_group == 0 here due to the above if stmt
                 let info =
                     PROC_CONTROL_STRUCT.sender_infos[sig_idx as usize].load(Ordering::Acquire);
                 if PROC_CONTROL_STRUCT

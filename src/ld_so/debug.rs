@@ -5,11 +5,11 @@ use core::ptr;
 #[repr(C)]
 pub enum RTLDState {
     /// Mapping change is complete.
-    RT_CONSISTENT,
+    RtConsistent,
     /// Beginning to add a new object.
-    RT_ADD,
+    RtAdd,
     /// Beginning to remove an object mapping.
-    RT_DELETE,
+    RtDelete,
 }
 
 /// Data structure for sharing debugging information from the
@@ -39,9 +39,9 @@ pub struct RTLDDebug {
 impl RTLDDebug {
     const NEW: Self = RTLDDebug {
         r_version: 1,
-        r_map: 0 as *mut LinkMap,
+        r_map: ptr::null_mut::<LinkMap>(),
         r_brk: _dl_debug_state,
-        state: RTLDState::RT_CONSISTENT,
+        state: RTLDState::RtConsistent,
         r_ldbase: 0,
     };
 
@@ -99,8 +99,8 @@ impl LinkMap {
         Box::into_raw(map)
     }
     fn link(&mut self, map: &mut LinkMap) {
-        map.l_prev = self as *mut LinkMap;
-        self.l_next = map as *mut LinkMap;
+        map.l_prev = ptr::from_mut::<LinkMap>(self);
+        self.l_next = ptr::from_mut::<LinkMap>(map);
     }
     fn new_with_args(l_addr: usize, name: &str, l_ld: usize) -> *mut Self {
         let map = LinkMap::new();
@@ -108,7 +108,7 @@ impl LinkMap {
             (*map).l_addr = l_addr;
             (*map).l_ld = l_ld;
             let c_name = CString::new(name).unwrap();
-            (*map).l_name = c_name.into_raw() as *const c_char;
+            (*map).l_name = c_name.into_raw().cast_const();
         }
         map
     }

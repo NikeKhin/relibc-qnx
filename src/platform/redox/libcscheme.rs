@@ -1,9 +1,7 @@
-use super::libredox;
-use crate::{c_str::CStr, header::stdlib::getenv, platform::types::*};
-use core::{ptr, slice};
-use syscall::{EINVAL, EIO, ENOENT, Error, Result, flag::*};
+use crate::{c_str::CStr, header::stdlib::getenv, platform::types::c_char};
+use syscall::{EIO, ENOENT, Error, Result, flag::O_SYMLINK};
 
-pub const LIBC_SCHEME: &'static str = "libc:";
+pub const LIBC_SCHEME: &str = "/scheme/libc";
 
 const ENV_MAX_LEN: i32 = i32::MAX;
 
@@ -11,13 +9,11 @@ macro_rules! env_str {
     ($lit:expr) => {
         #[allow(unused_unsafe)]
         {
-            let val_bytes = unsafe { getenv(concat!($lit, "\0").as_ptr() as *const c_char) };
-            if val_bytes != ptr::null_mut() {
-                if let Ok(val_str) = unsafe { CStr::from_ptr(val_bytes) }.to_str() {
-                    Some(val_str)
-                } else {
-                    None
-                }
+            let val_bytes = unsafe { getenv(concat!($lit, "\0").as_ptr().cast::<c_char>()) };
+            if val_bytes.is_null() {
+                None
+            } else if let Ok(val_str) = unsafe { CStr::from_ptr(val_bytes) }.to_str() {
+                Some(val_str)
             } else {
                 None
             }
@@ -39,12 +35,12 @@ pub fn open(path: &str, flags: usize) -> Result<usize> {
 
     // Linux seems to allow you to read from or write to any of /dev/{stdin,stderr,stdout}
     match basename {
-        "stderr" => syscall::dup(2, &[]),
-        "stdin" => syscall::dup(0, &[]),
-        "stdout" => syscall::dup(1, &[]),
+        "stderr" => redox_rt::sys::dup(2, &[]),
+        "stdin" => redox_rt::sys::dup(0, &[]),
+        "stdout" => redox_rt::sys::dup(1, &[]),
         "tty" => {
             if let Some(tty) = env_str!("TTY") {
-                return syscall::open(tty, flags);
+                return redox_rt::sys::open(tty, flags);
             }
             Err(Error::new(ENOENT))
         }

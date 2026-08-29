@@ -13,9 +13,9 @@ use syscall::{
 use crate::{
     Tcb,
     proc::{FdGuard, FdGuardUpper, ForkArgs, fork_inner},
-    protocol::{ProcCall, RtSigInfo},
     signal::{PROC_CONTROL_STRUCT, PosixStackt, RtSigarea, SigStack, get_sigaltstack, inner_c},
 };
+use redox_protocols::protocol::{ProcCall, RtSigInfo};
 
 use super::ForkScratchpad;
 
@@ -75,12 +75,13 @@ pub struct ArchIntRegs {
 pub unsafe fn deactivate_tcb(open_via_dup: &FdGuardUpper) -> Result<()> {
     let mut env = syscall::EnvRegisters::default();
 
-    let file = open_via_dup.dup(b"regs/env")?;
+    let file = open_via_dup.dup_into_upper(b"regs/env")?;
 
     env.fsbase = 0;
     env.gsbase = 0;
 
-    file.write(&mut env)?;
+    file.write(&env)?;
+    crate::TLS_ACTIVATED.store(false, core::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -90,7 +91,7 @@ unsafe extern "sysv64" fn fork_impl(args: &ForkArgs, initial_rsp: *mut usize) ->
 
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe extern "sysv64" fn child_hook(scratchpad: &ForkScratchpad) {
-    let _ = syscall::close(scratchpad.cur_filetable_fd);
+    let _ = crate::sys::close(scratchpad.cur_filetable_fd);
     crate::child_hook_common(crate::ChildHookCommonArgs {
         new_thr_fd: FdGuard::new(scratchpad.new_thr_fd),
         new_proc_fd: if scratchpad.new_proc_fd == usize::MAX {
@@ -98,6 +99,9 @@ unsafe extern "sysv64" fn child_hook(scratchpad: &ForkScratchpad) {
         } else {
             Some(FdGuard::new(scratchpad.new_proc_fd))
         },
+        new_filetable_fd: FdGuard::new(scratchpad.new_filetable_fd)
+            .to_upper()
+            .unwrap(),
     });
 }
 
@@ -464,15 +468,15 @@ pub unsafe fn arch_pre(stack: &mut SigStack, area: &mut SigArea) -> PosixStackt 
     // atomicity inside the critical section, consisting of one instruction at 'crit_first', one at
     // 'crit_second', and one at 'crit_third', see asm.
 
-    if stack.regs.rip == __relibc_internal_sigentry_crit_first as usize {
+    if stack.regs.rip == __relibc_internal_sigentry_crit_first as *const () as usize {
         // Reexecute pop rsp and jump steps. This case needs to be different from the one below,
         // since rsp has not been overwritten with the previous context's stack, just yet. At this
         // point, we know [rsp+0] contains the saved RSP, and [rsp-8] contains the saved RIP.
         let stack_ptr = stack.regs.rsp as *const usize;
         stack.regs.rsp = unsafe { stack_ptr.read() };
         stack.regs.rip = unsafe { stack_ptr.sub(1).read() };
-    } else if stack.regs.rip == __relibc_internal_sigentry_crit_second as usize
-        || stack.regs.rip == __relibc_internal_sigentry_crit_third as usize
+    } else if stack.regs.rip == __relibc_internal_sigentry_crit_second as *const () as usize
+        || stack.regs.rip == __relibc_internal_sigentry_crit_third as *const () as usize
     {
         // Almost finished, just reexecute the jump before tmp_rip is overwritten by this
         // deeper-level signal.
@@ -480,6 +484,17 @@ pub unsafe fn arch_pre(stack: &mut SigStack, area: &mut SigArea) -> PosixStackt 
     }
 
     get_sigaltstack(area, stack.regs.rsp).into()
+}
+
+/// Rearrange the restore-stack and sigarea in a way that makes it look like a new signal was
+/// immediately delivered after restoring the allowset to what it was prior to the original signal delivery.
+pub fn arch_ret_to_sig(stack: &mut SigStack, control: &Sigcontrol) {
+    let orig_rip = core::mem::replace(
+        &mut stack.regs.rip,
+        __relibc_internal_sigentry as *const () as usize,
+    );
+    control.saved_ip.set(orig_rip);
+    control.saved_archdep_reg.set(stack.regs.rflags);
 }
 
 pub(crate) static SUPPORTS_AVX: AtomicU8 = AtomicU8::new(0);

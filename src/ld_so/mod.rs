@@ -3,7 +3,6 @@
 // FIXME(andypython): remove this when #![allow(warnings, unused_variables)] is
 // dropped from src/lib.rs.
 #![warn(warnings, unused_variables)]
-#![deny(unsafe_op_in_unsafe_fn)]
 
 use core::{mem, ptr};
 use object::{
@@ -14,7 +13,7 @@ use object::{
 
 use self::tcb::{Master, Tcb};
 use crate::{
-    header::sys_auxv::AT_NULL,
+    header::sys_auxv::{AT_NULL, AT_PHDR, AT_PHENT, AT_PHNUM},
     platform::{Pal, Sys},
     start::Stack,
 };
@@ -22,14 +21,11 @@ use crate::{
 pub const PATH_SEP: char = ':';
 
 mod access;
-pub mod callbacks;
 pub mod debug;
-mod dso;
+pub mod dso;
 pub mod linker;
 pub mod start;
 pub mod tcb;
-
-pub use generic_rt::{ExpectTlsFree, panic_notls};
 
 static mut STATIC_TCB_MASTER: Master = Master {
     ptr: ptr::null_mut(),
@@ -40,7 +36,7 @@ static mut STATIC_TCB_MASTER: Master = Master {
 
 #[cfg_attr(target_os = "nto", expect(dead_code))]
 #[inline(never)]
-pub fn static_init(
+fn static_init(
     sp: &'static Stack,
     #[cfg(target_os = "redox")] thr_fd: redox_rt::proc::FdGuardUpper,
 ) {
@@ -59,18 +55,18 @@ pub fn static_init(
         }
 
         match kind {
-            3 => phdr_opt = Some(value),
-            4 => phent_opt = Some(value),
-            5 => phnum_opt = Some(value),
+            AT_PHDR => phdr_opt = Some(value),
+            AT_PHENT => phent_opt = Some(value),
+            AT_PHNUM => phnum_opt = Some(value),
             _ => (),
         }
 
         auxv = unsafe { auxv.add(1) };
     }
 
-    let phdr = phdr_opt.expect_notls("failed to find AT_PHDR");
-    let phent = phent_opt.expect_notls("failed to find AT_PHENT");
-    let phnum = phnum_opt.expect_notls("failed to find AT_PHNUM");
+    let phdr = phdr_opt.expect("failed to find AT_PHDR");
+    let phent = phent_opt.expect("failed to find AT_PHENT");
+    let phnum = phnum_opt.expect("failed to find AT_PHNUM");
 
     for i in 0..phnum {
         let ph_addr = phdr + phent * i;
@@ -97,17 +93,17 @@ pub fn static_init(
                     ph.p_vaddr(endian) as usize,
                 )
             },
-            _ => panic_notls(format_args!("unknown AT_PHENT size {}", phent)),
+            _ => panic!("unknown AT_PHENT size {}", phent),
         };
 
         let page_size = Sys::getpagesize();
         let voff = p_vaddr % page_size;
         // let vaddr = ph.p_vaddr as usize - voff;
-        let vsize = ((p_memsz + voff + page_size - 1) / page_size) * page_size;
+        let vsize = (p_memsz + voff).div_ceil(page_size) * page_size;
 
         if p_type == elf::PT_TLS {
             let valign = if p_align > 0 {
-                ((p_memsz + (p_align - 1)) / p_align) * p_align
+                p_memsz.div_ceil(p_align) * p_align
             } else {
                 p_memsz
             };
@@ -117,14 +113,13 @@ pub fn static_init(
                 STATIC_TCB_MASTER.image_size = p_filesz;
                 STATIC_TCB_MASTER.offset = valign;
 
-                let tcb = Tcb::new(vsize).expect_notls("failed to allocate TCB");
+                let tcb = Tcb::new(vsize).expect("failed to allocate TCB");
                 tcb.masters_ptr = ptr::addr_of_mut!(STATIC_TCB_MASTER);
                 tcb.masters_len = mem::size_of::<Master>();
-                tcb.copy_masters()
-                    .expect_notls("failed to copy TLS master data");
+                tcb.copy_masters().expect("failed to copy TLS master data");
                 tcb.activate(
                     #[cfg(target_os = "redox")]
-                    thr_fd,
+                    Some(thr_fd),
                 );
             }
 
@@ -145,7 +140,7 @@ pub unsafe fn init(
     {
         const ARCH_GET_FS: usize = 0x1003;
         let mut val = 0usize;
-        syscall!(ARCH_PRCTL, ARCH_GET_FS, &mut val as *mut usize);
+        syscall!(ARCH_PRCTL, ARCH_GET_FS, &raw mut val);
         tp = val;
     }
     #[cfg(target_arch = "aarch64")]
@@ -161,10 +156,10 @@ pub unsafe fn init(
 
         {
             let file = thr_fd
-                .dup(b"regs/env")
-                .expect_notls("failed to open handle for process registers");
+                .dup_into_upper(b"regs/env")
+                .expect("failed to open handle for process registers");
 
-            file.read(&mut env).expect_notls("failed to read gsbase");
+            file.read(&mut env).expect("failed to read gsbase");
         }
 
         tp = env.gsbase as usize;
@@ -175,10 +170,10 @@ pub unsafe fn init(
 
         {
             let file = thr_fd
-                .dup(b"regs/env")
-                .expect_notls("failed to open handle for process registers");
+                .dup_into_upper(b"regs/env")
+                .expect("failed to open handle for process registers");
 
-            file.read(&mut env).expect_notls("failed to read fsbase");
+            file.read(&mut env).expect("failed to read fsbase");
         }
 
         tp = env.fsbase as usize;
@@ -211,10 +206,10 @@ pub unsafe fn init(
 }
 
 pub unsafe fn fini() {
-    if let Some(tcb) = unsafe { Tcb::current() } {
-        if !tcb.linker_ptr.is_null() {
-            let linker = unsafe { (*tcb.linker_ptr).lock() };
-            linker.fini();
-        }
+    if let Some(tcb) = unsafe { Tcb::current() }
+        && !tcb.linker_ptr.is_null()
+    {
+        let linker = unsafe { (*tcb.linker_ptr).lock() };
+        linker.fini();
     }
 }

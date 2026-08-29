@@ -5,17 +5,55 @@
 use core::{mem, ptr, slice};
 
 use crate::{
-    header::{fcntl, limits, pthread, signal, sys_ioctl, sys_wait, termios, unistd, utmp},
-    platform::{self, types::*},
+    header::{
+        bits_sigset_t, fcntl, limits, pthread, signal,
+        stdlib::{grantpt, posix_openpt, ptsname_r, unlockpt},
+        sys_ioctl, sys_wait, termios, unistd, utmp,
+    },
+    platform::{
+        self,
+        types::{c_char, c_int, c_void},
+    },
 };
 
-#[cfg(target_os = "linux")]
-#[path = "linux.rs"]
-mod imp;
+unsafe fn openpty_inner(name: &mut [u8]) -> Result<(c_int, c_int), ()> {
+    // TODO: wrap in auto-close struct
+    let master = unsafe { posix_openpt(fcntl::O_RDWR | fcntl::O_NOCTTY) };
+    if master < 0 {
+        return Err(());
+    }
 
-#[cfg(target_os = "redox")]
-#[path = "redox.rs"]
-mod imp;
+    let ret = grantpt(master);
+    if ret == -1 {
+        unistd::close(master);
+        return Err(());
+    }
+    let ret = unsafe { unlockpt(master) };
+    if ret == -1 {
+        unistd::close(master);
+        return Err(());
+    }
+
+    let ret = unsafe { ptsname_r(master, name.as_mut_ptr().cast(), name.len()) };
+    if ret < 0 {
+        unistd::close(master);
+        return Err(());
+    }
+
+    let slave = unsafe {
+        fcntl::open(
+            name.as_ptr().cast::<c_char>(),
+            fcntl::O_RDWR | fcntl::O_NOCTTY,
+            0,
+        )
+    };
+    if slave < 0 {
+        unistd::close(master);
+        return Err(());
+    }
+
+    Ok((master, slave))
+}
 
 /// See <https://www.man7.org/linux/man-pages/man3/openpty.3.html>.
 #[unsafe(no_mangle)]
@@ -24,32 +62,31 @@ pub unsafe extern "C" fn openpty(
     aslave: *mut c_int,
     namep: *mut c_char,
     termp: *const termios::termios,
-    winp: *const sys_ioctl::winsize,
+    winp: *const termios::winsize,
 ) -> c_int {
     let mut tmp_name = [0; limits::PATH_MAX];
     let name = if !namep.is_null() {
-        slice::from_raw_parts_mut(namep as *mut u8, limits::PATH_MAX)
+        unsafe { slice::from_raw_parts_mut(namep.cast::<u8>(), limits::PATH_MAX) }
     } else {
         &mut tmp_name
     };
 
-    let (master, slave) = match imp::openpty(name) {
-        Ok(ok) => ok,
-        Err(()) => return -1,
+    let Ok((master, slave)) = (unsafe { openpty_inner(name) }) else {
+        return -1;
     };
 
     if !termp.is_null() {
-        termios::tcsetattr(slave, termios::TCSANOW, termp);
+        unsafe { termios::tcsetattr(slave, termios::TCSANOW, termp) };
     }
 
     if !winp.is_null() {
-        sys_ioctl::ioctl(slave, sys_ioctl::TIOCSWINSZ, winp as *mut c_void);
+        unsafe { sys_ioctl::ioctl(slave, sys_ioctl::TIOCSWINSZ, winp as *mut c_void) };
     }
 
-    *amaster = master;
-    *aslave = slave;
+    unsafe { *amaster = master };
+    unsafe { *aslave = slave };
 
-    return 0;
+    0
 }
 
 /// See <https://www.man7.org/linux/man-pages/man3/openpty.3.html>.
@@ -58,7 +95,7 @@ pub unsafe extern "C" fn forkpty(
     pm: *mut c_int,
     name: *mut c_char,
     tio: *const termios::termios,
-    ws: *const sys_ioctl::winsize,
+    ws: *const termios::winsize,
 ) -> c_int {
     let mut m = 0;
     let mut s = 0;
@@ -66,60 +103,66 @@ pub unsafe extern "C" fn forkpty(
     let mut p: [c_int; 2] = [0; 2];
     let mut cs = 0;
     let mut pid = -1;
-    let mut set = signal::sigset_t::default();
-    let mut oldset = signal::sigset_t::default();
+    let mut set = bits_sigset_t::sigset_t::default();
+    let mut oldset = bits_sigset_t::sigset_t::default();
 
-    if openpty(&mut m, &mut s, name, tio, ws) < 0 {
+    if unsafe { openpty(&raw mut m, &raw mut s, name, tio, ws) } < 0 {
         return -1;
     }
 
-    signal::sigfillset(&mut set);
-    signal::pthread_sigmask(signal::SIG_BLOCK, &mut set, &mut oldset);
-    pthread::pthread_setcancelstate(pthread::PTHREAD_CANCEL_DISABLE, &mut cs);
+    unsafe { signal::sigfillset(&raw mut set) };
+    unsafe { signal::pthread_sigmask(signal::SIG_BLOCK, &raw const set, &raw mut oldset) };
+    unsafe { pthread::pthread_setcancelstate(pthread::PTHREAD_CANCEL_DISABLE, &raw mut cs) };
 
-    if unistd::pipe2(p.as_mut_ptr(), fcntl::O_CLOEXEC) != 0 {
+    if unsafe { unistd::pipe2(p.as_mut_ptr(), fcntl::O_CLOEXEC) } != 0 {
         unistd::close(s);
     } else {
-        pid = unistd::fork();
+        pid = unsafe { unistd::fork() };
         if pid == 0 {
             unistd::close(m);
             unistd::close(p[0]);
-            if utmp::login_tty(s) != 0 {
-                unistd::write(
-                    p[1],
-                    platform::ERRNO.as_ptr().cast(),
-                    mem::size_of_val(&platform::ERRNO),
-                );
+            if unsafe { utmp::login_tty(s) } != 0 {
+                unsafe {
+                    unistd::write(
+                        p[1],
+                        platform::ERRNO.as_ptr().cast(),
+                        mem::size_of_val(&platform::ERRNO),
+                    )
+                };
                 unistd::_exit(127);
             }
             unistd::close(p[1]);
-            pthread::pthread_setcancelstate(cs, ptr::null_mut());
-            signal::pthread_sigmask(signal::SIG_SETMASK, &mut oldset, ptr::null_mut());
+            unsafe { pthread::pthread_setcancelstate(cs, ptr::null_mut()) };
+            unsafe {
+                signal::pthread_sigmask(signal::SIG_SETMASK, &raw const oldset, ptr::null_mut())
+            };
             return 0;
         }
 
         unistd::close(s);
         unistd::close(p[1]);
 
-        if unistd::read(
-            p[0],
-            &mut ec as *mut c_int as *mut c_void,
-            mem::size_of::<c_int>(),
-        ) > 0
+        if unsafe {
+            unistd::read(
+                p[0],
+                ptr::from_mut::<c_int>(&mut ec).cast::<c_void>(),
+                mem::size_of::<c_int>(),
+            )
+        } > 0
         {
             let mut status = 0;
-            sys_wait::waitpid(pid, &mut status, 0);
+            unsafe { sys_wait::waitpid(pid, &raw mut status, 0) };
             pid = -1;
             platform::ERRNO.set(ec);
         }
         unistd::close(p[0]);
     }
     if pid > 0 {
-        *pm = m;
+        unsafe { *pm = m };
     } else {
         unistd::close(m);
     }
-    pthread::pthread_setcancelstate(cs, ptr::null_mut());
-    signal::pthread_sigmask(signal::SIG_SETMASK, &mut oldset, ptr::null_mut());
+    unsafe { pthread::pthread_setcancelstate(cs, ptr::null_mut()) };
+    unsafe { signal::pthread_sigmask(signal::SIG_SETMASK, &raw const oldset, ptr::null_mut()) };
     pid
 }

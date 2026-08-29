@@ -3,9 +3,11 @@ use crate::{
     error::{Errno, ResultExt},
     header::{
         fcntl::O_CREAT,
+        sys_stat::stat,
         unistd::{SEEK_CUR, SEEK_END, SEEK_SET},
     },
     io,
+    out::Out,
     platform::{Pal, Sys, types::*},
 };
 use core::ops::Deref;
@@ -18,7 +20,7 @@ pub struct File {
 }
 
 impl File {
-    pub fn new(fd: c_int) -> Self {
+    pub const fn new(fd: c_int) -> Self {
         Self {
             fd,
             reference: false,
@@ -31,8 +33,20 @@ impl File {
             .map_err(Errno::sync)
     }
 
+    pub fn openat(dirfd: c_int, path: CStr, oflag: c_int) -> Result<Self, Errno> {
+        Sys::openat(dirfd, path, oflag, 0)
+            .map(Self::new)
+            .map_err(Errno::sync)
+    }
+
     pub fn create(path: CStr, oflag: c_int, mode: mode_t) -> Result<Self, Errno> {
         Sys::open(path, oflag | O_CREAT, mode)
+            .map(Self::new)
+            .map_err(Errno::sync)
+    }
+
+    pub fn createat(dirfd: c_int, path: CStr, oflag: c_int, mode: mode_t) -> Result<Self, Errno> {
+        Sys::openat(dirfd, path, oflag | O_CREAT, mode)
             .map(Self::new)
             .map_err(Errno::sync)
     }
@@ -45,6 +59,12 @@ impl File {
         Sys::ftruncate(self.fd, size as off_t).map_err(Errno::sync)
     }
 
+    pub fn fstat(&self) -> Result<stat, Errno> {
+        let mut file_st = stat::default();
+        Sys::fstat(self.fd, Out::from_mut(&mut file_st)).map_err(Errno::sync)?;
+        Ok(file_st)
+    }
+
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self::new(Sys::dup(self.fd)?))
     }
@@ -52,7 +72,7 @@ impl File {
     /// Create a new file pointing to the same underlying descriptor. This file
     /// will know it's a "reference" and won't close the fd. It will, however,
     /// not prevent the original file from closing the fd.
-    pub unsafe fn get_ref(&self) -> Self {
+    pub const unsafe fn get_ref(&self) -> Self {
         Self {
             fd: self.fd,
             reference: true,

@@ -1,194 +1,328 @@
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    ffi::CString,
-    string::{String, ToString},
-    vec::Vec,
+use alloc::{borrow::Cow, string::ToString};
+use arrayvec::ArrayString;
+use core::{
+    ffi::c_int,
+    mem::ManuallyDrop,
+    str::{self, FromStr},
 };
-use core::{ffi::c_int, str};
-use redox_rt::signal::tmp_disable_signals;
+use redox_path::{RedoxReference, RedoxStr};
+use redox_protocols::protocol::O_CLOEXEC;
+use redox_rt::{proc::FdGuardUpper, signal::tmp_disable_signals};
 use syscall::{data::Stat, error::*, flag::*};
 
 use super::{FdGuard, Pal, Sys, libcscheme};
 use crate::{
+    c_str::CStr,
     error::Errno,
     fs::File,
     header::{fcntl, limits, sys_file},
     out::Out,
-    sync::Mutex,
+    sync::rwlock::{ReadGuard, RwLock},
 };
 
-pub use redox_path::{RedoxPath, canonicalize_using_cwd};
-
-// TODO: Define in syscall
-const PATH_MAX: usize = 4096;
+pub use redox_path::RedoxPath;
 
 // POSIX states chdir is both thread-safe and signal-safe. Thus we need to synchronize access to CWD, but at the
 // same time forbid signal handlers from running in the meantime, to avoid reentrant deadlock.
-pub fn chdir(path: &str) -> Result<()> {
+pub fn chdir(path: RedoxStr<'_>) -> Result<()> {
     let _siglock = tmp_disable_signals();
-    let mut cwd_guard = CWD.lock();
-
-    let canon = canonicalize_using_cwd(cwd_guard.as_deref(), path).ok_or(Error::new(ENOENT))?;
-    let canon_with_scheme = canonicalize_with_cwd_internal(cwd_guard.as_deref(), path)?;
-
-    let fd = syscall::open(&canon_with_scheme, O_STAT | O_CLOEXEC)?;
+    let mut cwd_guard = CWD.write();
+    let (redox, fd) = match path {
+        RedoxStr::Absolute(path) => {
+            let path = path.to_standard_canon();
+            let fd = FdGuard::open_into_upper(path.as_reference(), O_STAT);
+            (path.into_owned(), fd)
+        }
+        RedoxStr::Relative(redox_reference) => {
+            let Some(cwd) = cwd_guard.as_ref() else {
+                return Err(Error::new(ENOENT));
+            };
+            let fd = cwd
+                .fd
+                .openat_into_upper(redox_reference.as_ref(), O_STAT, 0);
+            let path = cwd.redox.canonicalize_as_cwd(redox_reference.into());
+            (path.into_owned(), fd)
+        }
+    };
+    log::trace!("chdir({:?}): {:?}", redox.as_reference().as_ref(), fd);
+    let fd = fd?;
     let mut stat = Stat::default();
-    if syscall::fstat(fd, &mut stat).is_err() || (stat.st_mode & MODE_TYPE) != MODE_DIR {
+    if fd.fstat(&mut stat).is_err() || (stat.st_mode & MODE_TYPE) != MODE_DIR {
         return Err(Error::new(ENOTDIR));
     }
-    let _ = syscall::close(fd);
+    let path = to_cwd_path(redox.as_reference().as_ref())?;
+    *cwd_guard = Some(Cwd { path, redox, fd });
+    Ok(())
+}
 
-    *cwd_guard = Some(canon.into_boxed_str());
-
+pub fn fchdir(fd: c_int) -> Result<()> {
+    let mut buf = CwdPath::zero_filled();
+    unsafe {
+        // SAFETY: Sys::fpath is using str::from_utf8 already
+        let res = Sys::fpath(fd, buf.as_bytes_mut())?;
+        buf.set_len(res);
+    }
+    let fd = FdGuard::new(redox_rt::sys::fcntl(
+        fd as usize,
+        syscall::F_DUPFD,
+        syscall::UPPER_FDTBL_TAG,
+    )?)
+    .to_upper()
+    .unwrap();
+    set_cwd_manual(buf, fd)?;
     Ok(())
 }
 
 // getcwd is similarly both thread-safe and signal-safe.
-pub fn getcwd(mut buf: Out<[u8]>) -> Option<usize> {
+pub fn getcwd(mut buf: Out<[u8]>) -> Result<usize> {
     let _siglock = tmp_disable_signals();
-    let cwd_guard = CWD.lock();
-    let cwd = cwd_guard.as_deref().unwrap_or("").as_bytes();
+    let guard = CWD.read();
+    let cwd = guard.as_ref().ok_or(Error::new(ENOENT))?;
+    let path_bytes = cwd.path.as_bytes();
 
-    let [mut before, mut after] = buf.split_at_checked(cwd.len())?;
+    let [mut before, mut after] = buf
+        .split_at_checked(path_bytes.len())
+        .ok_or(Error::new(ERANGE))?;
 
-    before.copy_from_slice(&cwd);
+    before.copy_from_slice(path_bytes);
     after.zero();
 
-    Some(cwd.len())
+    Ok(path_bytes.len())
 }
 
-// TODO: How much of this logic should be in redox-path?
-fn canonicalize_with_cwd_internal(cwd: Option<&str>, path: &str) -> Result<String> {
-    let path = canonicalize_using_cwd(cwd, path).ok_or(Error::new(ENOENT))?;
+// Get Cwd object
+pub fn current_dir() -> Result<ReadGuard<'static, Option<Cwd<'static>>>> {
+    let _siglock = tmp_disable_signals();
+    let guard = CWD.read();
 
-    let standard_scheme = path == "/scheme" || path.starts_with("/scheme/");
-    let legacy_scheme = path
-        .split("/")
-        .next()
-        .map(|c| c.contains(":"))
-        .unwrap_or(false);
+    if guard.as_ref().is_none() {
+        return Err(Error::new(ENOENT));
+    }
 
-    Ok(if standard_scheme || legacy_scheme {
-        path
+    Ok(guard)
+}
+
+pub type CwdPath = ArrayString<{ limits::PATH_MAX }>;
+
+pub struct Cwd<'a> {
+    pub path: CwdPath,
+    pub redox: RedoxPath<'a>,
+    pub fd: FdGuardUpper,
+}
+
+static CWD: RwLock<Option<Cwd<'_>>> = RwLock::new(None);
+
+pub fn to_cwd_path(path: &str) -> Result<CwdPath> {
+    ArrayString::from_str(path).or(Err(Error::new(ENAMETOOLONG)))
+}
+
+pub fn set_cwd_manual(path: CwdPath, fd: FdGuardUpper) -> Result<()> {
+    let Some(redox) = RedoxPath::from_absolute(path.to_string()) else {
+        return Err(Error::new(EBADF));
+    };
+    let _siglock = tmp_disable_signals();
+    *CWD.write() = Some(Cwd { path, redox, fd });
+    Ok(())
+}
+
+pub fn clone_cwd() -> Option<CwdPath> {
+    let _siglock = tmp_disable_signals();
+    CWD.read().as_ref().map(|cwd| cwd.path)
+}
+
+fn open_absolute(path: &str, flags: usize) -> Result<usize> {
+    if path.starts_with(libcscheme::LIBC_SCHEME) {
+        libcscheme::open(path, flags)
     } else {
-        let mut result = format!("/scheme/file{}", path);
-
-        // Trim trailing / to keep path canonical.
-        if result.as_bytes().last() == Some(&b'/') {
-            result.pop();
-        }
-
-        result
-    })
+        redox_rt::sys::open(path, flags)
+    }
 }
 
-pub fn canonicalize(path: &str) -> Result<String> {
-    let _siglock = tmp_disable_signals();
-    let cwd_guard = CWD.lock();
-    canonicalize_with_cwd_internal(cwd_guard.as_deref(), path)
+// Read symlink content
+fn read_link_content<'b>(
+    dirfd: Option<&FdGuard>,
+    path: &str,
+    is_relative: bool,
+) -> Result<RedoxStr<'b>> {
+    let resolve_flags = O_CLOEXEC | O_SYMLINK | O_RDONLY;
+    let fd = match (is_relative, dirfd) {
+        (false, _) => FdGuard::open(path, resolve_flags),
+        (true, None) => current_dir()?
+            .as_ref()
+            .unwrap()
+            .fd
+            .openat(path, resolve_flags, 0),
+        (true, Some(dirfd)) => dirfd.openat(path, resolve_flags, 0),
+    };
+    log::trace!(
+        "read_link_content ({:?} {:?} {}): {:?}",
+        dirfd,
+        path,
+        is_relative,
+        fd
+    );
+
+    let mut resolve_buf = [0_u8; limits::PATH_MAX + 1];
+    let count = fd?.read(&mut resolve_buf)?;
+    if count == resolve_buf.len() {
+        return Err(Error::new(ENAMETOOLONG));
+    }
+
+    // If the symbolic link path is non-UTF8, it cannot be opened, and is thus
+    // considered a "dangling symbolic link".
+    let path = core::str::from_utf8(&resolve_buf[..count]).map_err(|_| Error::new(ENOENT))?;
+    RedoxStr::new(path.to_string()).ok_or(Error::new(EBADF))
 }
 
-// TODO: arraystring?
-static CWD: Mutex<Option<Box<str>>> = Mutex::new(None);
-
-pub fn set_cwd_manual(cwd: Box<str>) {
-    let _siglock = tmp_disable_signals();
-    *CWD.lock() = Some(cwd);
-}
-
-pub fn clone_cwd() -> Option<Box<str>> {
-    let _siglock = tmp_disable_signals();
-    CWD.lock().clone()
-}
-
-// TODO: Move to redox-rt, or maybe part of it?
-pub fn open(path: &str, flags: usize) -> Result<usize> {
-    // TODO: SYMLOOP_MAX
-    const MAX_LEVEL: usize = 64;
-
-    let mut resolve_buf = [0_u8; 4096];
-    let mut path = path;
-
-    for _ in 0..MAX_LEVEL {
-        let canon = canonicalize_with_cwd_internal(CWD.lock().as_deref(), path)?;
-
-        let open_res = if canon.starts_with(libcscheme::LIBC_SCHEME) {
-            libcscheme::open(&canon, flags)
-        } else {
-            syscall::open(&*canon, flags)
-        };
-
-        match open_res {
+/// Resolve symlink and open as a fd. Requires `current_path_string` as canonicalized.
+fn resolve_sym_links<'a>(mut current_path_string: RedoxPath<'a>, flags: usize) -> Result<usize> {
+    // Sym resolve loop
+    for _ in 0..limits::SYMLOOP_MAX {
+        let dirname = current_path_string.dirname();
+        let cow: Cow<'_, str> = current_path_string.into();
+        let initial_res = open_absolute(&cow, flags);
+        log::trace!("resolve_sym_links({:?}): {:?}", cow, initial_res);
+        match initial_res {
             Ok(fd) => return Ok(fd),
-            Err(error) if error == Error::new(EXDEV) => {
-                let resolve_flags = O_CLOEXEC | O_SYMLINK | O_RDONLY;
-                let resolve_fd = FdGuard::new(syscall::open(&*canon, resolve_flags)?);
-
-                let bytes_read = resolve_fd.read(&mut resolve_buf)?;
-                // TODO: make resolve_buf PATH_MAX + 1 bytes?
-                if bytes_read == resolve_buf.len() {
-                    return Err(Error::new(ENAMETOOLONG));
-                }
-
-                // If the symbolic link path is non-UTF8, it cannot be opened, and is thus
-                // considered a "dangling symbolic link".
-                path = core::str::from_utf8(&resolve_buf[..bytes_read])
-                    .map_err(|_| Error::new(ENOENT))?;
+            Err(e) if e == Error::new(EXDEV) => {
+                // dirfd is None because it's canonicalized
+                let link_target = read_link_content(None, &cow, false)?;
+                current_path_string = dirname.canonicalize_as_cwd(link_target);
             }
-            Err(other_error) => return Err(other_error),
+            Err(e) => return Err(e),
         }
     }
+
     Err(Error::new(ELOOP))
 }
 
-pub fn dir_path_and_fd_path(socket_path: &str) -> Result<(String, String)> {
-    let _siglock = tmp_disable_signals();
-    let cwd_guard = CWD.lock();
-
-    let full_path = canonicalize_with_cwd_internal(cwd_guard.as_deref(), socket_path)?;
-
-    let redox_path = RedoxPath::from_absolute(&full_path).ok_or(Error::new(EINVAL))?;
-    let (_, mut ref_path) = redox_path.as_parts().ok_or(Error::new(EINVAL))?;
-    if ref_path.as_ref().is_empty() {
-        return Err(Error::new(EINVAL));
+// TODO: Move to redox-rt, or maybe part of it?
+pub fn openat(dirfd: c_int, path: RedoxStr<'_>, flags: usize) -> Result<usize> {
+    if path.is_empty() && flags as i32 & fcntl::AT_EMPTY_PATH != fcntl::AT_EMPTY_PATH {
+        return Err(Error::new(ENOENT));
     }
-    if redox_path.is_default_scheme() {
-        let dir_to_open = String::from(get_parent_path(&full_path).ok_or(Error::new(EINVAL))?);
-        Ok((dir_to_open, ref_path.as_ref().to_string()))
+
+    if !path.is_relative() {
+        return open(path, flags);
+    }
+
+    let _siglock = tmp_disable_signals();
+    let fcntl_flags = flags & syscall::O_FCNTL_MASK;
+    let path: Cow<'_, str> = path.into();
+
+    // First try
+    let initial_res = if dirfd == fcntl::AT_FDCWD {
+        current_dir()?
+            .as_ref()
+            .unwrap()
+            .fd
+            .openat(&path, flags, fcntl_flags)
+            .map(|fd: FdGuard| fd.take())
     } else {
-        let full_path = canonicalize_with_cwd_internal(cwd_guard.as_deref(), ref_path.as_ref())?;
-        let redox_path = RedoxPath::from_absolute(&full_path).ok_or(Error::new(EINVAL))?;
-        let (_, path) = redox_path.as_parts().ok_or(Error::new(EINVAL))?;
-        let dir_to_open = String::from(get_parent_path(&full_path).ok_or(Error::new(EINVAL))?);
-        Ok((dir_to_open, path.as_ref().to_string()))
+        redox_rt::sys::openat(dirfd as usize, &path, flags, fcntl_flags)
+    };
+
+    trace_log!(
+        "openat({dirfd:?}, {:?}, {}): {:?}",
+        &path,
+        decode_open_flags(flags),
+        initial_res
+    );
+
+    match initial_res {
+        Ok(fd) => Ok(fd),
+        Err(e) if e == Error::new(EXDEV) => {
+            let (link_path, dirfd) = if dirfd == fcntl::AT_FDCWD {
+                let link_path = read_link_content(None, &path, true);
+                (link_path, dirfd)
+            } else {
+                let fd = ManuallyDrop::new(FdGuard::new(dirfd as usize));
+                let link_path = read_link_content(Some(&fd), &path, true);
+                (link_path, ManuallyDrop::into_inner(fd).take() as i32)
+            };
+            let link_path = openat2_path(dirfd, link_path?, 0)?;
+            resolve_sym_links(link_path, flags)
+        }
+        Err(e) => Err(e),
     }
 }
 
-fn get_parent_path(path: &str) -> Option<&str> {
-    path.rfind('/').and_then(|index| {
-        if index == 0 {
-            // Path is something like "/file.txt" or the root "/".
-            // The parent is the root directory "/".
-            Some("/")
-        } else {
-            // Path is something like "/a/b/c.txt".
-            // Take the slice from the beginning up to the last '/'.
-            Some(&path[..index])
+// TODO: Move to redox-rt, or maybe part of it?
+pub fn open(path: RedoxStr<'_>, flags: usize) -> Result<usize> {
+    if path.is_empty() {
+        return Err(Error::new(ENOENT));
+    }
+
+    let is_relative = path.is_relative();
+    let _siglock = tmp_disable_signals();
+    let path: Cow<'_, str> = path.into();
+
+    // First try
+    let initial_res = if is_relative {
+        let fcntl_flags = flags & syscall::O_FCNTL_MASK;
+        current_dir()?
+            .as_ref()
+            .unwrap()
+            .fd
+            .openat(&path, flags, fcntl_flags)
+            .map(|fd: FdGuard| fd.take())
+    } else {
+        open_absolute(&path, flags)
+    };
+
+    trace_log!(
+        "open({:?}, {}): {:?}",
+        &path,
+        decode_open_flags(flags),
+        initial_res
+    );
+
+    match initial_res {
+        Ok(fd) => Ok(fd),
+        Err(e) if e == Error::new(EXDEV) => {
+            let link_path = read_link_content(None, &path, is_relative);
+            let link_path = openat2_path(fcntl::AT_FDCWD, link_path?, 0)?;
+            resolve_sym_links(link_path, flags)
         }
-    })
+        Err(e) => Err(e),
+    }
+}
+
+/// Return the directory (or scheme path) and the relative socket path to the scheme
+pub fn dir_path_and_fd_path(
+    socket_path: RedoxStr<'_>,
+) -> Result<(RedoxPath<'_>, RedoxReference<'_>)> {
+    let _siglock = tmp_disable_signals();
+    let redox_path = openat2_path(fcntl::AT_FDCWD, socket_path, 0)?;
+
+    let (scheme, ref_path) = redox_path.as_parts().ok_or(Error::new(EINVAL))?;
+    if ref_path.as_ref().is_empty() {
+        return Err(Error::new(EINVAL));
+    }
+    let ref_path = RedoxReference::new(ref_path.to_string()).unwrap();
+    let dir_to_open = ref_path.clone().dirname();
+    Ok((scheme.canonicalize_as_scheme(dir_to_open.into()), ref_path))
 }
 
 pub struct FileLock(c_int);
 
 impl FileLock {
     pub fn lock(fd: c_int, op: c_int) -> Result<Self> {
-        if op & sys_file::LOCK_SH | sys_file::LOCK_EX == 0 {
-            return Err(Error::new(EINVAL));
+        const LOCK_SH_NB: c_int = sys_file::LOCK_SH | sys_file::LOCK_NB;
+        const LOCK_EX_NB: c_int = sys_file::LOCK_EX | sys_file::LOCK_NB;
+        const LOCK_UN_NB: c_int = sys_file::LOCK_UN | sys_file::LOCK_NB;
+        match op {
+            sys_file::LOCK_SH
+            | sys_file::LOCK_EX
+            | sys_file::LOCK_UN
+            | LOCK_SH_NB
+            | LOCK_EX_NB
+            | LOCK_UN_NB => {
+                Sys::flock(fd, op)?;
+                Ok(Self(fd))
+            }
+            _ => Err(Error::new(EINVAL)),
         }
-
-        Sys::flock(fd, op)?;
-        Ok(Self(fd))
     }
 
     pub fn unlock(self) -> Result<()> {
@@ -198,7 +332,8 @@ impl FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let fd = self.0;
+        // FIXME should fd be fed into the flock call below?
+        let _fd = self.0;
         self.0 = -1;
         let _ = Sys::flock(self.0, sys_file::LOCK_UN);
     }
@@ -206,7 +341,11 @@ impl Drop for FileLock {
 /// Resolve `path` under `dirfd`.
 ///
 /// See [`openat2`] for more information.
-pub(super) fn openat2_path(dirfd: c_int, path: &str, at_flags: c_int) -> Result<String, Errno> {
+pub(super) fn openat2_path(
+    dirfd: c_int,
+    path: RedoxStr<'_>,
+    at_flags: c_int,
+) -> Result<RedoxPath<'_>, Errno> {
     // Ideally, the function calling this fn would check AT_EMPTY_PATH and just call fstat or
     // whatever with the fd.
     if path.is_empty() && at_flags & fcntl::AT_EMPTY_PATH != fcntl::AT_EMPTY_PATH {
@@ -218,20 +357,32 @@ pub(super) fn openat2_path(dirfd: c_int, path: &str, at_flags: c_int) -> Result<
     // isn't needed.
     if dirfd == fcntl::AT_FDCWD {
         // The special constant AT_FDCWD indicates that we should use the cwd.
-        let mut buf = [0; limits::PATH_MAX];
-        let len = getcwd(Out::from_mut(&mut buf)).ok_or(Errno(ENAMETOOLONG))?;
-        // SAFETY: Redox's cwd is stored as a str.
-        let cwd = unsafe { str::from_utf8_unchecked(&buf[..len]) };
-
-        canonicalize_using_cwd(Some(cwd), path).ok_or(Errno(EBADF))
+        let redox_path = match path {
+            RedoxStr::Absolute(redox_path) => redox_path,
+            RedoxStr::Relative(redox_reference) => {
+                let cwd_guard = CWD.read();
+                let cwd_path = cwd_guard.as_ref().map(|c| &c.redox);
+                let cwd_path = cwd_path.ok_or(Error::new(EINVAL))?;
+                cwd_path.canonicalize_as_cwd(redox_reference.into())
+            }
+        };
+        Ok(redox_path)
     } else {
         let mut buf = [0; limits::PATH_MAX];
         let len = Sys::fpath(dirfd, &mut buf)?;
         // SAFETY: fpath checks then copies valid UTF8.
         let dir = unsafe { str::from_utf8_unchecked(&buf[..len]) };
-
-        canonicalize_using_cwd(Some(dir), path).ok_or(Errno(EBADF))
+        let dir = RedoxPath::from_absolute(dir).ok_or(Errno(EBADF))?;
+        Ok(dir.canonicalize_as_cwd(path))
     }
+}
+
+fn at_flags_to_open_flags(at_flags: c_int) -> c_int {
+    let mut out: c_int = 0;
+    if at_flags & fcntl::AT_SYMLINK_NOFOLLOW == fcntl::AT_SYMLINK_NOFOLLOW {
+        out |= fcntl::O_NOFOLLOW | fcntl::O_PATH;
+    }
+    out
 }
 
 /// Canonicalize and open `path` with respect to `dirfd`.
@@ -242,35 +393,82 @@ pub(super) fn openat2_path(dirfd: c_int, path: &str, at_flags: c_int) -> Result<
 /// # Arguments
 /// * `dirfd` is a directory descriptor to which `path` is resolved.
 /// * `path` is a relative or absolute path. Relative paths are resolved in relation to `dirfd`
-/// while absolute paths skip `dirfd`.
+///   while absolute paths skip `dirfd`.
 /// * `at_flags` constrains how `path` is resolved.
 /// * `oflags` are flags that are passed to open.
 ///
 /// # Constants
 /// `at_flags`:
 /// * AT_EMPTY_PATH returns the path at `dirfd` itself if `path` is empty. If `path` is not
-/// empty, it's resolved w.r.t `dirfd` like normal.
+///   empty, it's resolved w.r.t `dirfd` like normal.
 ///
 /// `dirfd`:
 /// `AT_FDCWD` is a special constant for `dirfd` that resolves `path` under the current working
 /// directory.
 pub(super) fn openat2(
     dirfd: c_int,
-    path: &str,
+    path: CStr,
     at_flags: c_int,
     oflags: c_int,
 ) -> Result<File, Errno> {
-    let path = openat2_path(dirfd, path, at_flags)?;
-    let path = CString::new(path).map_err(|_| Errno(ENOENT))?;
-
     // Translate at flags into open flags; openat will do this on its own most likely.
-    let oflags = if at_flags & fcntl::AT_SYMLINK_NOFOLLOW == fcntl::AT_SYMLINK_NOFOLLOW {
-        fcntl::O_CLOEXEC | fcntl::O_NOFOLLOW | fcntl::O_PATH | fcntl::O_SYMLINK | oflags
-    } else {
-        fcntl::O_CLOEXEC | oflags
-    };
+    let oflags = at_flags_to_open_flags(at_flags) | fcntl::O_CLOEXEC | oflags;
+    File::openat(dirfd, path, oflags)
+}
 
-    // TODO:
-    // * Switch open to openat.
-    File::open(path.as_c_str().into(), oflags)
+#[cfg(any(debug_assertions, not(feature = "no_trace")))]
+pub fn decode_open_flags(mut value: usize) -> alloc::string::String {
+    let flags = [
+        ("O_NONBLOCK", O_NONBLOCK),
+        ("O_APPEND", O_APPEND),
+        ("O_SHLOCK", O_SHLOCK),
+        ("O_EXLOCK", O_EXLOCK),
+        ("O_ASYNC", O_ASYNC),
+        ("O_FSYNC", O_FSYNC),
+        ("O_CLOEXEC", O_CLOEXEC),
+        ("O_CREAT", O_CREAT),
+        ("O_TRUNC", O_TRUNC),
+        ("O_EXCL", O_EXCL),
+        ("O_DIRECTORY", O_DIRECTORY),
+        ("O_STAT", O_STAT),
+        ("O_SYMLINK", O_SYMLINK),
+        ("O_NOFOLLOW", O_NOFOLLOW),
+    ];
+
+    let mut result = alloc::string::String::new();
+
+    let accmode = value & O_ACCMODE;
+    match accmode {
+        O_RDONLY => result.push_str("O_RDONLY"),
+        O_WRONLY => result.push_str("O_WRONLY"),
+        O_RDWR => result.push_str("O_RDWR"),
+        _ => {}
+    }
+    value &= !O_ACCMODE;
+    for (name, flag) in flags.iter() {
+        if (value & flag) == *flag {
+            if !result.is_empty() {
+                result.push_str(" | ");
+            }
+            result.push_str(name);
+            value &= !flag;
+        }
+    }
+
+    const PERM: usize = MODE_PERM as usize;
+    if (value & PERM) != 0 {
+        if !result.is_empty() {
+            result.push_str(" | ");
+        }
+        result.push_str(&format!("0o{:o}", value & PERM));
+    }
+    value &= !PERM;
+    if value != 0 {
+        if !result.is_empty() {
+            result.push_str(" | ");
+        }
+        result.push_str(&format!("0x{:x}", value));
+    }
+
+    result
 }

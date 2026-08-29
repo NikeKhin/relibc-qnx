@@ -1,8 +1,5 @@
 //! Synchronization primitives.
 
-// TODO: set this for entire crate when possible
-#![deny(unsafe_op_in_unsafe_fn)]
-
 pub mod barrier;
 pub mod cond;
 // TODO: Merge with pthread_mutex
@@ -30,9 +27,11 @@ use crate::{
     platform::{Pal, Sys, types::c_int},
 };
 use core::{
+    hint,
     mem::MaybeUninit,
     ops::Deref,
-    sync::atomic::{self, AtomicI32, AtomicI32 as AtomicInt, AtomicU32},
+    ptr,
+    sync::atomic::{AtomicI32, AtomicI32 as AtomicInt, AtomicU32},
 };
 
 const FUTEX_WAIT: c_int = 0;
@@ -81,7 +80,7 @@ impl FutexAtomicTy for AtomicU32 {
 
         // AtomicU32::as_mut_ptr internally calls UnsafeCell::get, which itself simply does (&self
         // as *const Self as *mut Self).
-        self as *const AtomicU32 as *mut u32
+        ptr::from_ref::<AtomicU32>(self) as *mut u32
     }
 }
 impl FutexAtomicTy for AtomicI32 {
@@ -95,7 +94,7 @@ impl FutexAtomicTy for AtomicI32 {
         #[cfg(target_os = "linux")]
         return AtomicI32::as_mut_ptr(self);*/
 
-        self as *const AtomicI32 as *mut i32
+        ptr::from_ref::<AtomicI32>(self) as *mut i32
     }
 }
 
@@ -112,8 +111,8 @@ pub unsafe fn futex_wait_ptr<T: FutexTy>(
         Ok(()) | Err(Errno(EINTR)) => FutexWaitResult::Waited,
         Err(Errno(EAGAIN)) => FutexWaitResult::Stale,
         Err(Errno(ETIMEDOUT)) if deadline_opt.is_some() => FutexWaitResult::TimedOut,
-        Err(other) => {
-            eprintln!("futex failed: {}", other.0);
+        Err(err) => {
+            todo_error!(0, err, "futex failed");
             FutexWaitResult::Waited
         }
     }
@@ -140,11 +139,10 @@ pub fn rttime() -> timespec {
     unsafe {
         let mut time = MaybeUninit::uninit();
 
-        // TODO: Handle error
-        Sys::clock_gettime(
+        if let Ok(()) = Sys::clock_gettime(
             crate::header::time::CLOCK_REALTIME,
             Out::from_uninit_mut(&mut time),
-        );
+        ) {}; // TODO handle error
 
         time.assume_init()
     }
@@ -157,7 +155,7 @@ where
 {
     // First, try spinning for really short durations
     for _ in 0..999 {
-        atomic::spin_loop_hint();
+        hint::spin_loop();
         if attempt(word) == AttemptStatus::Desired {
             return;
         }
@@ -216,9 +214,9 @@ impl AtomicLock {
     /// A general way to efficiently wait for what might be a long time, using two closures:
     ///
     /// - `attempt` = Attempt to modify the atomic value to any
-    /// desired state.
+    ///   desired state.
     /// - `mark_long` = Attempt to modify the atomic value to sign
-    /// that it want's to get notified when waiting is done.
+    ///   that it want's to get notified when waiting is done.
     ///
     /// Both of these closures are allowed to spuriously give a
     /// non-success return value, they are used only as optimization

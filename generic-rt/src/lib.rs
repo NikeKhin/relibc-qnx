@@ -1,6 +1,6 @@
 #![no_std]
 #![allow(internal_features)]
-#![feature(core_intrinsics)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use core::{
     arch::asm,
@@ -22,7 +22,7 @@ pub struct GenericTcb<Os> {
 }
 impl<Os> GenericTcb<Os> {
     /// Architecture specific code to read a usize from the TCB - aarch64
-    #[allow(unsafe_op_in_unsafe_fn)]
+    #[expect(unsafe_op_in_unsafe_fn)]
     #[inline(always)]
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn arch_read(offset: usize) -> usize {
@@ -37,7 +37,7 @@ impl<Os> GenericTcb<Os> {
     }
 
     /// Architecture specific code to read a usize from the TCB - x86
-    #[allow(unsafe_op_in_unsafe_fn)]
+    #[expect(unsafe_op_in_unsafe_fn)]
     #[inline(always)]
     #[cfg(target_arch = "x86")]
     pub unsafe fn arch_read(offset: usize) -> usize {
@@ -53,7 +53,7 @@ impl<Os> GenericTcb<Os> {
     }
 
     /// Architecture specific code to read a usize from the TCB - x86_64
-    #[allow(unsafe_op_in_unsafe_fn)]
+    #[expect(unsafe_op_in_unsafe_fn)]
     #[inline(always)]
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn arch_read(offset: usize) -> usize {
@@ -69,7 +69,7 @@ impl<Os> GenericTcb<Os> {
     }
 
     /// Architecture specific code to read a usize from the TCB - riscv64
-    #[allow(unsafe_op_in_unsafe_fn)]
+    #[expect(unsafe_op_in_unsafe_fn)]
     #[inline(always)]
     #[cfg(target_arch = "riscv64")]
     unsafe fn arch_read(offset: usize) -> usize {
@@ -95,38 +95,5 @@ impl<Os> GenericTcb<Os> {
     }
     pub unsafe fn current() -> Option<&'static mut Self> {
         unsafe { Some(&mut *Self::current_ptr()?) }
-    }
-}
-pub fn panic_notls(_msg: impl core::fmt::Display) -> ! {
-    // TODO: actually print _msg, perhaps by having panic_notls take a `T: DebugBackend` that can
-    // propagate until called by e.g. relibc start
-    core::intrinsics::abort();
-}
-
-pub trait ExpectTlsFree {
-    type Unwrapped;
-
-    fn expect_notls(self, msg: &str) -> Self::Unwrapped;
-}
-impl<T, E: core::fmt::Debug> ExpectTlsFree for Result<T, E> {
-    type Unwrapped = T;
-
-    fn expect_notls(self, msg: &str) -> T {
-        match self {
-            Ok(t) => t,
-            Err(err) => panic_notls(format_args!(
-                "{msg}: expect failed for Result with err: {err:?}",
-            )),
-        }
-    }
-}
-impl<T> ExpectTlsFree for Option<T> {
-    type Unwrapped = T;
-
-    fn expect_notls(self, msg: &str) -> T {
-        match self {
-            Some(t) => t,
-            None => panic_notls(format_args!("{msg}: expect failed for Option")),
-        }
     }
 }

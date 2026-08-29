@@ -41,14 +41,14 @@ impl Dns {
 
         push_n16!(self.transaction_id);
         push_n16!(self.flags);
-        push_n16!(self.queries.len() as u16);
-        push_n16!(self.answers.len() as u16);
+        push_n16!(u16::try_from(self.queries.len()).expect("shouldn't exceed u16::MAX"));
+        push_n16!(u16::try_from(self.answers.len()).expect("shouldn't exceed u16::MAX"));
         push_n16!(0);
         push_n16!(0);
 
         for query in self.queries.iter() {
             for part in query.name.split('.') {
-                push_u8!(part.len() as u8);
+                push_u8!(u8::try_from(part.len()).expect("shouldn't exceed u8::MAX"));
                 data.extend_from_slice(part.as_bytes());
             }
             push_u8!(0);
@@ -59,7 +59,7 @@ impl Dns {
     }
 
     pub fn parse(data: &[u8]) -> Result<Self, String> {
-        let name_ind = 0b1100_0000;
+        let name_ind = 0b1100_0000u8;
         let mut i = 0;
 
         macro_rules! pop_u8 {
@@ -106,7 +106,7 @@ impl Dns {
                     let name_len = pop_u8!();
                     if name_len & name_ind == name_ind {
                         i -= 1;
-                        i = (pop_n16!() - ((name_ind as u16) << 8)) as usize;
+                        i = (pop_n16!() - ((u16::from(name_ind)) << 8)) as usize;
                         continue;
                     }
                     if name_len == 0 {
@@ -132,8 +132,8 @@ impl Dns {
         let flags = pop_n16!();
         let queries_len = pop_n16!();
         let answers_len = pop_n16!();
-        pop_n16!();
-        pop_n16!();
+        let _ = pop_n16!();
+        let _ = pop_n16!();
 
         let mut queries = Vec::new();
         for _query_i in 0..queries_len {
