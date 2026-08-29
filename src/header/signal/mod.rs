@@ -26,7 +26,7 @@ use super::{
     stdio::{fprintf, stderr},
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "nto"))]
 #[path = "linux.rs"]
 pub mod sys;
 
@@ -108,7 +108,7 @@ pub struct sigaltstack {
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/signal.h.html>.
 #[repr(C)]
 #[derive(Clone)]
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "nto")))]
 pub struct sigevent {
     /// Signal value.
     pub sigev_value: sigval,
@@ -129,7 +129,7 @@ pub struct sigevent {
 /// See <https://docs.rs/libc/0.2.186/src/libc/unix/linux_like/mod.rs.html#300-322>.
 #[repr(C)]
 #[derive(Clone)]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "nto"))]
 pub struct sigevent {
     /// Signal value.
     pub sigev_value: sigval,

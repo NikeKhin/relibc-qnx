@@ -28,10 +28,28 @@ pub(crate) mod sys;
 #[path = "redox/mod.rs"]
 pub(crate) mod sys;
 
+#[cfg(all(target_os = "nto", target_env = "nto71"))]
+#[path = "qnx7/mod.rs"]
+pub(crate) mod sys;
+
+#[cfg(all(target_os = "nto", target_env = "nto80"))]
+#[path = "qnx8/mod.rs"]
+pub(crate) mod sys;
+
+#[cfg(all(
+    target_os = "nto",
+    not(any(target_env = "nto71", target_env = "nto80"))
+))]
+compile_error!(
+    "the QNX backend needs to know which kernel it is targeting: build with a \
+     target whose environment is `nto71` (QNX 7.1) or `nto80` (QNX 8.0), such \
+     as the specs in `targets/`."
+);
+
 pub use self::rlb::{Line, RawLineBuffer};
 pub mod rlb;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "nto"))]
 pub mod auxv_defs;
 
 #[cfg(target_os = "redox")]
@@ -412,5 +430,7 @@ pub unsafe fn init_inner(auxvs: Box<[[usize; 2]]>) {
     }
 }
 #[expect(clippy::boxed_local)]
-#[cfg(not(target_os = "redox"))]
+#[cfg(not(any(target_os = "redox", target_os = "nto")))]
 pub unsafe fn init(_auxvs: Box<[[usize; 2]]>) {}
+#[cfg(target_os = "nto")]
+pub use self::sys::init;

@@ -75,7 +75,7 @@ pub use self::{
     link::init,
     startup::{activate_tls, own_thread_pointer, static_init},
     thread::{
-        THREAD_NAME_MAX, get_name as thread_get_name, main_thread_stack,
+        get_name as thread_get_name, main_thread_stack,
         record_main_thread_stack, set_name as thread_set_name,
     },
 };

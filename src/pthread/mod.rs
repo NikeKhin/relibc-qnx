@@ -27,8 +27,12 @@ pub unsafe fn init() {
     //TODO: what is the best way to get these values?
     #[cfg(target_os = "redox")]
     let (stack_base, stack_size) = ((STACK_TOP - STACK_SIZE) as *mut c_void, STACK_SIZE);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "nto"))]
     let (stack_base, stack_size) = (ptr::null_mut(), 0);
+    // The main thread's `Pthread` keeps no stack, as relibc would unmap it on
+    // exit; its bounds are recorded aside for `pthread_getattr_np`.
+    #[cfg(target_os = "nto")]
+    crate::platform::sys::record_main_thread_stack();
 
     let thread = Pthread {
         waitval: Waitval::new(),
@@ -88,7 +92,7 @@ pub struct Pthread {
 pub struct OsTid {
     #[cfg(target_os = "redox")]
     pub thread_fd: usize,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "nto"))]
     pub thread_id: usize,
 }
 

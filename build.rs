@@ -7,6 +7,14 @@ fn main() {
     let target = env::var("TARGET").unwrap();
 
     println!("cargo:rerun-if-changed=src/c");
+    println!("cargo:rerun-if-env-changed=RELIBC_SKIP_C");
+    // QNX builds with the Rust toolchain alone (src/platform/qnx7/cshim.rs);
+    // RELIBC_SKIP_C typechecks other targets on a host without their C compiler.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("nto")
+        || env::var("RELIBC_SKIP_C").as_deref() == Ok("1")
+    {
+        return;
+    }
 
     let mut cc_builder = &mut cc::Build::new();
 

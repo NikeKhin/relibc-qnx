@@ -37,7 +37,7 @@ impl Master {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "nto"))]
 pub type OsSpecific = ();
 
 #[cfg(target_os = "redox")]
@@ -117,6 +117,8 @@ impl Tcb {
 
     /// Get the current TCB
     pub unsafe fn current() -> Option<&'static mut Self> {
+        #[cfg(target_os = "nto")]
+        crate::platform::sys::tls::restore_tpidr();
         unsafe { Some(&mut *GenericTcb::<OsSpecific>::current_ptr()?.cast()) }
     }
 
@@ -330,7 +332,7 @@ impl Tcb {
     ///
     /// For x86_64, the ABI page is not used.
     #[allow(clippy::type_complexity)]
-    #[cfg(any(target_os = "linux", target_os = "redox"))]
+    #[cfg(any(target_os = "linux", target_os = "redox", target_os = "nto"))]
     unsafe fn os_new(
         size: usize,
     ) -> Result<(&'static mut [u8], &'static mut [u8], &'static mut [u8]), DlError> {
@@ -348,6 +350,11 @@ impl Tcb {
         unsafe {
             syscall!(ARCH_PRCTL, ARCH_SET_FS, tls_end);
         }
+    }
+
+    #[cfg(target_os = "nto")]
+    unsafe fn os_arch_activate(_os: &(), tls_end: usize, tls_len: usize) {
+        unsafe { crate::platform::sys::activate_tls(tls_end, tls_len) }
     }
 
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
