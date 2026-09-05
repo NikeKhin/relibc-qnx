@@ -239,8 +239,8 @@ pub const HAS_TCTL_SIGSTACK: bool = false;
 /// Socket numbering the two network stacks disagree on, and the switches for
 /// the socket message protocol (see `socket.rs`).
 ///
-/// io-pkt follows NetBSD. These were not re-read from a 7.1 SDP: run
-/// `tools/qnx-abi` against one, or the `socket` self-test on a target.
+/// io-pkt follows NetBSD. These were not re-read from a 7.1 SDP; the
+/// self-test's `sockets` step checks them on a target.
 pub mod sock {
     use crate::platform::types::c_int;
 

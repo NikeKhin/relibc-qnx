@@ -4,7 +4,7 @@
 //!
 //! * [`abi`] — error numbers, kernel types and message layouts. The struct
 //!   definitions were extracted from the DWARF in the SDP's `libc.so.5.sym`
-//!   with `tools/qnx-dwarf-types.py`.
+//!   with `qnx/tools/qnx-dwarf-types.py`.
 //! * [`kercall`] — the AArch64 `svc #0x51` veneers.
 //! * [`kernel`] — typed wrappers over the individual kernel calls.
 //! * [`version`] — everything that changes between kernel releases: the

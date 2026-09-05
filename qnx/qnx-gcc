@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# C entry point; same static driver as qnx-g++.
+export QNX_FORCE_CC=1
+exec "$(cd "$(dirname "$0")" && pwd)/qnx-g++" "$@"

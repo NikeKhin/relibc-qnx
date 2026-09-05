@@ -19,7 +19,6 @@
 //!
 //! The kernel ABI here is taken from the SDP 8.0 binaries, not from hardware.
 //! Spawn and exec report `ENOSYS` until `_PROC_POSIX_SPAWN` is implemented.
-//! See `QNX_PORT.md` for what is verified and what is not.
 
 #[path = "../qnx7/abi/mod.rs"]
 pub mod abi;

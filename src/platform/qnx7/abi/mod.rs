@@ -5,7 +5,7 @@
 //! of the backend and by both the 7.1 and 8.0 version modules.
 //!
 //! The struct layouts come from the DWARF in the SDP's `libc.so.5.sym`, read
-//! with `tools/qnx-dwarf-types.py`. The flag values are macros, which DWARF
+//! with `qnx/tools/qnx-dwarf-types.py`. The flag values are macros, which DWARF
 //! cannot carry, so they were taken from the SDP headers and cross-checked
 //! against the vendor libc's disassembly wherever a call site pinned them down.
 

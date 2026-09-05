@@ -1,0 +1,35 @@
+# The start objects for the link modes core's crt0 does not cover, built by
+# build-qnx.sh, one per `relibc_crt` value:
+#
+#   rcrt1   a static PIE, which relocates itself before anything else runs
+#   gcrt1   a profiled program (-p, -pg), which starts gprof before main
+#   grcrt1  a profiled static PIE, which does both
+#   crtbeginS  a shared object's or PIE's own __dso_handle and unwind-table
+#              registration, which GCC's bare-metal toolchain does not ship
+#   cxxabi  relibc's replacements for the parts of GCC's libsupc++ that the
+#           bare-metal toolchain builds for a single thread, linked into C++
+#           programs and libraries only
+#
+# Deliberately outside relibc's workspace, like the self-test: these are not
+# part of libc.a.
+[workspace]
+
+[package]
+name = "qnx-crt"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "qnx_crt"
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(relibc_crt, values("rcrt1", "gcrt1", "grcrt1", "crtbeginS", "cxxabi"))'] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

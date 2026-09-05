@@ -1,0 +1,17 @@
+# Deliberately outside relibc's workspace: this is built against the finished
+# libc.a rather than as part of it.
+[workspace]
+
+[package]
+name = "qnx-selftest"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "qnx_selftest"
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[profile.release]
+panic = "abort"

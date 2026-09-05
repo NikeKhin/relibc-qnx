@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# relibc compiler driver for make and IDE builds.
+#
+# Point both the compiler and the linker at this script (or qnx-gcc).
+# Compile-only invocations (-c/-E/-S/-M) are passed through to
+# aarch64-none-elf-g++/gcc.
+#
+# Links are static by default:
+#   crt1 crti crtbegin [cxxabi] <objects> libc.a [libsupc++] libgcc_eh libgcc crtend crtn
+# (crtbegin/libsupc++/libgcc* come from the g++ installation, not from newlib libc;
+# C++ links, through qnx-g++, add relibc's cxxabi.o and libsupc++).
+# The other link modes are chosen as with gcc, and compile with -fPIC/-fPIE:
+#   -static-pie   rcrt1 crti crtbeginS ... libc.a ... crtend crtn, self-relocating
+#   -pie          Scrt1 crti crtbeginS ... libc.so ... crtend crtn, interpreter
+#                 $QNX_RELIBC_INTERP (default /usr/lib/ld-relibc.so.1) or
+#                 -Wl,-dynamic-linker,PATH
+#   -shared       crti crtbeginS ... libc.so ... crtend crtn
+#   -p, -pg       gcrt1 (grcrt1 with -static-pie) in place of crt1, for gprof
+#   -rdynamic     exports the program's symbols; a static PIE needs it to dlopen
+#
+# Default linker is GNU ld via gcc, using targets/aarch64-qnx-static.ld so the
+# image has PT_PHDR (QNX then fills AT_PHDR). rust-lld also works:
+#
+#   QNX_LINKER=lld   (needs rustc / RELIBC_LLD on PATH)
+#
+# Why not the stock aarch64-none-elf script:
+#   * GNU ld does not search -L for a bare crt1.o
+#   * IDE-generated link lines can put -lc and CRT flags before the .o list
+#   * -lc without -static still opens libc.so
+#   * -Wl,-dynamic-linker=... forces a dynamic binary
+#   * the default aarch64elf script emits ET_EXEC with no PT_PHDR
+set -euo pipefail
+
+# The relibc root: this driver lives in its qnx/ directory.
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# The build to link against: QNX 7.1 by default, the target TARGET_SPEC
+# names as for build-qnx.sh, or any build directory in RELIBC_OUT.
+TARGET=$(basename "${TARGET_SPEC:-targets/aarch64-unknown-nto-qnx710.json}" .json)
+OUT=${RELIBC_OUT:-${CARGO_TARGET_DIR:-$ROOT/target}/$TARGET/${PROFILE:-release}}
+LD_SCRIPT=${QNX_LD_SCRIPT:-$ROOT/targets/aarch64-qnx-static.ld}
+LINKER=${QNX_LINKER:-gnu}
+
+base=$(basename "$0")
+if [ -n "${QNX_FORCE_CC:-}" ]; then
+    REAL=${QNX_REAL_CC:-aarch64-none-elf-gcc}
+else
+    case "$base" in
+        *g++*|*c++*) REAL=${QNX_REAL_CXX:-aarch64-none-elf-g++} ;;
+        *)           REAL=${QNX_REAL_CC:-aarch64-none-elf-gcc} ;;
+    esac
+fi
+
+link=1
+for a in "$@"; do
+    case "$a" in
+        -c|-S|-E|-M|-MM|-MG|--version|-dumpmachine|-dumpversion|-print-search-dirs|-print-file-name=*|-print-libgcc-file-name)
+            link=0
+            ;;
+    esac
+done
+
+if [ "$link" -eq 0 ]; then
+    # The bare-metal compiler has no -pthread; what it means when compiling
+    # for a hosted target is _REENTRANT, threads being in libc.
+    cc_args=()
+    for a in "$@"; do
+        case "$a" in
+            -pthread) cc_args+=(-D_REENTRANT) ;;
+            *) cc_args+=("$a") ;;
+        esac
+    done
+    exec "$REAL" ${cc_args[@]+"${cc_args[@]}"}
+fi
+
+for obj in crt1.o crti.o crtn.o libc.a; do
+    [ -f "$OUT/$obj" ] || {
+        echo "$0: missing $OUT/$obj (run qnx/build-qnx.sh)" >&2
+        exit 1
+    }
+done
+[ -f "$LD_SCRIPT" ] || {
+    echo "$0: missing linker script $LD_SCRIPT" >&2
+    exit 1
+}
+
+find_lld() {
+    if [ -n "${RELIBC_LLD:-}" ]; then
+        printf '%s\n' "$RELIBC_LLD"
+        return 0
+    fi
+    local r=""
+    if [ -n "${RUSTC:-}" ]; then
+        r=$RUSTC
+    elif command -v rustc >/dev/null 2>&1; then
+        r=$(command -v rustc)
+    elif [ -x "$HOME/.cargo/bin/rustc" ]; then
+        r=$HOME/.cargo/bin/rustc
+    else
+        return 1
+    fi
+    local host
+    host=$("$r" -vV | sed -n 's/host: //p')
+    local lld
+    lld=$("$r" --print sysroot)/lib/rustlib/$host/bin/rust-lld
+    [ -x "$lld" ] || return 1
+    printf '%s\n' "$lld"
+}
+
+mode=static
+profiled=0
+rdynamic=0
+INTERP=${QNX_RELIBC_INTERP:-/usr/lib/ld-relibc.so.1}
+for a in "$@"; do
+    case "$a" in
+        -shared) mode=shared ;;
+        -static-pie) [ "$mode" = shared ] || mode=static-pie ;;
+        -pie) [ "$mode" = static ] && mode=pie ;;
+        -p|-pg) profiled=1 ;;
+        -rdynamic) rdynamic=1 ;;
+        -Wl,-dynamic-linker,*|-Wl,--dynamic-linker,*) INTERP=${a#*-linker,} ;;
+        -Wl,-dynamic-linker=*|-Wl,--dynamic-linker=*) INTERP=${a#*-linker=} ;;
+    esac
+done
+
+args=()
+for a in "$@"; do
+    case "$a" in
+        -lc|-lm|-ldl|-lpthread|-lrt|-lstdc++|-lsupc++|-lgcc|-lgcc_eh|-lunwind)
+            continue
+            ;;
+        crtbegin.o|crtend.o|crtbeginS.o|crtendS.o|*/crtbegin.o|*/crtend.o)
+            continue
+            ;;
+        -static|-nostdlib|-pie|-shared|-static-pie|-p|-pg|-rdynamic|-nostartfiles|-nodefaultlibs)
+            continue
+            ;;
+        -Wl,-dynamic-linker*|-Wl,--dynamic-linker*|-dynamic-linker)
+            continue
+            ;;
+        -Wl,--eh-frame-hdr|--eh-frame-hdr|-Wl,--gc-sections|--gc-sections)
+            continue
+            ;;
+        -T*|-Wl,-T*|-Wl,--script*)
+            continue
+            ;;
+        crt0.o|crt1.o|crti.o|crtn.o|*/crt0.o|*/crt1.o|*/crti.o|*/crtn.o)
+            continue
+            ;;
+        Scrt1.o|rcrt1.o|gcrt1.o|mcrt1.o|grcrt1.o|*/Scrt1.o|*/rcrt1.o|*/gcrt1.o|*/mcrt1.o|*/grcrt1.o)
+            continue
+            ;;
+        -Wl,*)
+            if [ "$LINKER" = lld ]; then
+                IFS=',' read -r -a wl <<< "${a#-Wl,}"
+                args+=("${wl[@]}")
+            else
+                args+=("$a")
+            fi
+            ;;
+        -pthread)
+            # As when compiling: sources on the link line compile with it.
+            [ "$LINKER" = lld ] || args+=(-D_REENTRANT)
+            ;;
+        -D*|-I*|-O*|-W*|-g*|-std=*|-f*|-m*|-MMD|-MP|-MD|-MF|-MT|-MQ)
+            # Compiler options: sources on the link line compile with them,
+            # so -fPIC and -fPIE take effect. rust-lld has no use for them.
+            [ "$LINKER" = lld ] || args+=("$a")
+            ;;
+        -v|--verbose)
+            if [ "$LINKER" = lld ]; then
+                continue
+            fi
+            args+=("$a")
+            ;;
+        *)
+            args+=("$a")
+            ;;
+    esac
+done
+
+gcc_lib() {
+    local p
+    p=$("$REAL" -print-file-name="$1")
+    if [ -n "$p" ] && [ "$p" != "$1" ] && [ -f "$p" ]; then
+        printf '%s\n' "$p"
+    fi
+}
+
+# Compiler runtime, not libc. libstdc++ is still the newlib one — do not add it.
+# C++ gets libsupc++, after relibc's cxxabi.o, which replaces the parts of it
+# the bare-metal toolchain builds for a single thread.
+CRTBEGIN=$(gcc_lib crtbegin.o || true)
+CRTEND=$(gcc_lib crtend.o || true)
+LIBGCC=$(gcc_lib libgcc.a || true)
+LIBGCC_EH=$(gcc_lib libgcc_eh.a || true)
+LIBSUPC=""
+CXXABI=""
+case "$REAL" in
+    *g++*|*c++*)
+        # build-qnx.sh's copy keeps relocated data out of read-only sections.
+        LIBSUPC="$OUT/sysroot/aarch64le/lib/libsupc++.a"
+        [ -f "$LIBSUPC" ] || LIBSUPC=$(gcc_lib libsupc++.a || true)
+        CXXABI="$OUT/cxxabi.o"
+        ;;
+esac
+
+# Start objects, libc and linker options for the mode. Everything that is
+# position-independent takes relibc's crtbeginS.o, since GCC's bare-metal
+# toolchain has none.
+LIBC="$OUT/libc.a"
+case "$mode" in
+    static)
+        START=("$OUT/crt1.o")
+        [ "$profiled" = 1 ] && START=("$OUT/gcrt1.o")
+        START+=("$OUT/crti.o" ${CRTBEGIN:+"$CRTBEGIN"})
+        MODE_FLAGS=()
+        ;;
+    static-pie)
+        START=("$OUT/rcrt1.o")
+        [ "$profiled" = 1 ] && START=("$OUT/grcrt1.o")
+        START+=("$OUT/crti.o" "$OUT/crtbeginS.o")
+        MODE_FLAGS=(-static -pie --no-dynamic-linker -z text)
+        ;;
+    pie)
+        START=("$OUT/Scrt1.o")
+        [ "$profiled" = 1 ] && START=("$OUT/gcrt1.o")
+        START+=("$OUT/crti.o" "$OUT/crtbeginS.o")
+        MODE_FLAGS=(-pie -dynamic-linker "$INTERP")
+        LIBC="$OUT/libc.so"
+        ;;
+    shared)
+        START=("$OUT/crti.o" "$OUT/crtbeginS.o")
+        # The bare-metal runtime is not position-independent: its symbols
+        # stay inside the library, where it can reach them PC-relative.
+        MODE_FLAGS=(-shared --exclude-libs=libgcc.a:libgcc_eh.a:libsupc++.a)
+        LIBC="$OUT/libc.so"
+        ;;
+esac
+[ -n "$CXXABI" ] && START+=("$CXXABI")
+[ "$rdynamic" = 1 ] && MODE_FLAGS+=(--export-dynamic)
+# -lsocket, -lutil and the other names libc covers find the sysroot's empty
+# archives.
+[ -d "$OUT/sysroot/aarch64le/lib" ] && MODE_FLAGS=(-L "$OUT/sysroot/aarch64le/lib" ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"})
+for f in "${START[@]}" "$LIBC"; do
+    [ -f "$f" ] || {
+        echo "$0: missing $f (run qnx/build-qnx.sh)" >&2
+        exit 1
+    }
+done
+
+group=("$LIBC")
+[ -n "$LIBSUPC" ] && group+=("$LIBSUPC")
+[ -n "$LIBGCC_EH" ] && group+=("$LIBGCC_EH")
+[ -n "$LIBGCC" ] && group+=("$LIBGCC")
+
+if [ "$LINKER" = lld ]; then
+    LLD=$(find_lld) || {
+        echo "$0: rust-lld not found (QNX_LINKER=lld). Set RELIBC_LLD or put rustc on PATH." >&2
+        exit 1
+    }
+    exec "$LLD" -flavor gnu --eh-frame-hdr ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"} \
+        "${START[@]}" \
+        ${args[@]+"${args[@]}"} \
+        --start-group "${group[@]}" --end-group \
+        ${CRTEND:+"$CRTEND"} "$OUT/crtn.o"
+fi
+
+if [ "$mode" = static ]; then
+    exec "$REAL" -nostdlib -static \
+        -Wl,--eh-frame-hdr -Wl,--gc-sections \
+        -Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096 \
+        ${MODE_FLAGS[@]+"${MODE_FLAGS[@]/#/-Wl,}"} \
+        -T "$LD_SCRIPT" \
+        "${START[@]}" \
+        ${args[@]+"${args[@]}"} \
+        -Wl,--start-group "${group[@]}" -Wl,--end-group \
+        ${CRTEND:+"$CRTEND"} "$OUT/crtn.o"
+fi
+
+wl=()
+for f in ${MODE_FLAGS[@]+"${MODE_FLAGS[@]}"}; do wl+=("-Wl,$f"); done
+exec "$REAL" -nostdlib \
+    -Wl,--eh-frame-hdr -Wl,--gc-sections \
+    -Wl,-z,max-page-size=4096 -Wl,-z,common-page-size=4096 \
+    ${wl[@]+"${wl[@]}"} \
+    "${START[@]}" \
+    ${args[@]+"${args[@]}"} \
+    -Wl,--start-group "${group[@]}" -Wl,--end-group \
+    ${CRTEND:+"$CRTEND"} "$OUT/crtn.o"

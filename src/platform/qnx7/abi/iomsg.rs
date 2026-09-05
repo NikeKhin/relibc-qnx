@@ -1,7 +1,7 @@
 //! Resource-manager and manager-process message layouts.
 //!
 //! Every type and constant here was extracted from the DWARF in the SDP's
-//! `libc.so.5.sym` with `tools/qnx-dwarf-types.py`, so the layouts are the
+//! `libc.so.5.sym` with `qnx/tools/qnx-dwarf-types.py`, so the layouts are the
 //! vendor's own and not a reconstruction. The `/* +n */` offsets in that tool's
 //! output are reproduced in the field comments where a struct has padding or
 //! reserved words that must be preserved.

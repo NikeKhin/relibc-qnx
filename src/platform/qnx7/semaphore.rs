@@ -2,7 +2,7 @@
 //!
 //! relibc implements unnamed semaphores but declares the named ones without
 //! implementing or exporting them, so the backend provides them, and
-//! `tools/qnx-headers/semaphore.h` their declarations.
+//! `qnx/tools/qnx-headers/semaphore.h` their declarations.
 //!
 //! A named semaphore is relibc's own semaphore at the start of a one-page
 //! shared memory object `/dev/shmem/sem.NAME` — QNX's shared memory namespace,

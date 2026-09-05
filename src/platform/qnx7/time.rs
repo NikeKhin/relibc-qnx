@@ -114,7 +114,7 @@ pub unsafe fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> Result<()
 }
 
 /// `clock_nanosleep()`, which relibc declares but neither implements nor
-/// exports; the backend provides it, and `tools/qnx-headers/time.h` its
+/// exports; the backend provides it, and `qnx/tools/qnx-headers/time.h` its
 /// declaration.
 ///
 /// The vendor implementation is `nanosleep`'s timeout with the caller's clock

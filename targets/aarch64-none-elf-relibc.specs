@@ -16,13 +16,17 @@
 # Compile with -fPIC or -fPIE for -static-pie, -pie and -shared. GCC's
 # bare-metal toolchain has no crtbeginS.o; relibc's is used instead. The
 # sysroot's library directory is searched first, so that -lm, -lpthread,
-# -lsocket and the rest find relibc's empty archives, not newlib's.
+# -lsocket and the rest find relibc's empty archives, not newlib's. The
+# -lstdc++ that g++ adds finds the sysroot's libstdc++.a, a linker script
+# for GCC's libsupc++ and relibc's cxxabi.o: the toolchain's own libstdc++
+# is built for newlib.
 #
 #   export RELIBC_OUT=.../target/aarch64-unknown-nto-qnx710/release
 #   aarch64-none-elf-g++ -specs=thisfile ...
 #   aarch64-none-elf-g++ -fPIE -pie -specs=thisfile ...
 #
-# CodeLite libraries: empty (no c, no stdc++). -lc can still pick up newlib.
+# Leave c out of an IDE project's library list: -lc can still pick up
+# newlib.
 
 *startfile:
 %{shared: %:getenv(RELIBC_OUT /crti.o) %:getenv(RELIBC_OUT /crtbeginS.o); static-pie: %{p|pg: %:getenv(RELIBC_OUT /grcrt1.o); : %:getenv(RELIBC_OUT /rcrt1.o)} %:getenv(RELIBC_OUT /crti.o) %:getenv(RELIBC_OUT /crtbeginS.o); pie: %{p|pg: %:getenv(RELIBC_OUT /gcrt1.o); : %:getenv(RELIBC_OUT /Scrt1.o)} %:getenv(RELIBC_OUT /crti.o) %:getenv(RELIBC_OUT /crtbeginS.o); : %{p|pg: %:getenv(RELIBC_OUT /gcrt1.o); : %:getenv(RELIBC_OUT /crt1.o)} crti%O%s crtbegin%O%s}
@@ -30,12 +34,9 @@
 *endfile:
 %{shared|static-pie|pie: crtend%O%s %:getenv(RELIBC_OUT /crtn.o); : crtend%O%s crtn%O%s}
 
-*libstdc++:
--lsupc++
-
 *link_gcc_c_sequence:
 %{shared|pie: --start-group %G -lsupc++ %:getenv(RELIBC_OUT /libc.so) %G --end-group; : --start-group %G -lsupc++ %:getenv(RELIBC_OUT /libc.a) %G --end-group}
 
 %rename link old_link
 *link:
--L %:getenv(RELIBC_OUT /sysroot/aarch64le/lib) %{static-pie: -static -pie --no-dynamic-linker -z text; pie: -pie -dynamic-linker /usr/lib/ld-relibc.so.1; shared: -shared; : %{!T: -T %:getenv(RELIBC_OUT /../../../targets/aarch64-qnx-static.ld)}} %{rdynamic:--export-dynamic} %(old_link)
+-L %:getenv(RELIBC_OUT /sysroot/aarch64le/lib) %{static-pie: -static -pie --no-dynamic-linker -z text; pie: -pie -dynamic-linker /usr/lib/ld-relibc.so.1; shared: -shared --exclude-libs=libgcc.a:libgcc_eh.a:libsupc++.a; : %{!T: -T %:getenv(RELIBC_OUT /../../../targets/aarch64-qnx-static.ld)}} %{rdynamic:--export-dynamic} %(old_link)
