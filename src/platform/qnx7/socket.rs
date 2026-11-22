@@ -604,7 +604,7 @@ impl PalSocket for Sys {
         };
         hdr.msg_controllen = 0;
         hdr.msg_flags = sk::msg_flags_from_kernel(reply_flags);
-        unsafe { crate::header::bits_iovec::scatter(iovs, data) };
+        unsafe { crate::header::bits_iovec::scatter(iovs, &data) };
         Ok(n)
     }
 

@@ -633,15 +633,6 @@ impl Linker {
         }
     }
 
-    /// The load address of every object currently loaded.
-    ///
-    /// Used by `dl_iterate_phdr`, which an unwinder calls to find the exception
-    /// tables covering a faulting address.
-    #[cfg(target_os = "nto")]
-    pub fn loaded_object_bases(&self) -> impl Iterator<Item = *const u8> + '_ {
-        self.objects.values().map(|obj| obj.base)
-    }
-
     /// Makes the running program, which `me` describes, the root object, so
     /// that a statically linked program can `dlopen`. The program is already
     /// relocated and initialised, its TLS is the first module of every

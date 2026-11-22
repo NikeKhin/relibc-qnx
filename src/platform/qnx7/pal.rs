@@ -7,13 +7,18 @@
 use super::{
     PAGE_SIZE, abi, connect, io, ioctl, kercall, kernel, mem, proc, sync, thread, time, version,
 };
+use core::{ptr, slice};
+
 use crate::platform::{Pal, types::*};
 use crate::{
     c_str::CStr,
     error::{Errno, Result},
     header::{
+        bits_iovec::{gather, iovec, scatter},
+        bits_sigset_t::sigset_t,
         errno::{EFAULT, EINVAL, ENOENT, ENOSYS, ERANGE},
         fcntl::{self, AT_EMPTY_PATH, AT_FDCWD, F_GETFL, F_GETLK, F_SETFL, F_SETLK, F_SETLKW},
+        poll::pollfd,
         signal::sigevent,
         sys_resource::{rlimit, rusage},
         sys_select::timeval,
@@ -40,6 +45,18 @@ impl Sys {
     /// `buf` must be what `cmd` expects.
     pub unsafe fn ioctl(fd: c_int, cmd: c_ulong, buf: *mut c_void) -> Result<c_int> {
         unsafe { ioctl::ioctl(fd, cmd, buf) }
+    }
+}
+
+/// `iovcnt` entries at `iov` as a slice; empty, whatever `iov` is, for none.
+///
+/// # Safety
+///
+/// `iovcnt` must be non-negative, and `iov` point at that many entries.
+unsafe fn iovecs<'a>(iov: *const iovec, iovcnt: c_int) -> &'a [iovec] {
+    match usize::try_from(iovcnt) {
+        Ok(0) | Err(_) => &[],
+        Ok(count) => unsafe { slice::from_raw_parts(iov, count) },
     }
 }
 
@@ -245,12 +262,13 @@ impl Pal for Sys {
         unsafe { sync::futex_wake(addr, num) }
     }
 
-    unsafe fn utimensat(
+    fn utimensat(
         dirfd: c_int,
         path: CStr,
-        times: *const timespec,
+        times: Option<&[timespec; 2]>,
         flag: c_int,
     ) -> Result<()> {
+        let times = times.map_or(ptr::null(), |times| times.as_ptr());
         if path.to_bytes().is_empty() || flag & AT_EMPTY_PATH != 0 {
             return io::futimens(dirfd, times);
         }
@@ -489,7 +507,9 @@ impl Pal for Sys {
         unsafe { mem::munmap(addr, len) }
     }
 
-    unsafe fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> Result<()> {
+    fn nanosleep(rqtp: &timespec, rmtp: Option<Out<timespec>>) -> Result<()> {
+        let rmtp = rmtp.map_or(ptr::null_mut(), |mut rmtp| rmtp.as_mut_ptr());
+        // SAFETY: `rqtp` is a reference, and `rmtp` null or writable.
         unsafe { time::nanosleep(rqtp, rmtp) }
     }
 
@@ -522,6 +542,22 @@ impl Pal for Sys {
         }
     }
 
+    /// Not supported yet. relibc used to build `poll` on `epoll`, which
+    /// Neutrino has no equivalent of (see `epoll.rs`), so it never worked
+    /// here; the native route is `ionotify` arming each descriptor.
+    fn poll(_fds: &mut [pollfd], _timeout: c_int) -> Result<c_int> {
+        Err(Errno(ENOSYS))
+    }
+
+    /// Not supported yet, as [`poll`](Self::poll).
+    fn ppoll(
+        _fds: &mut [pollfd],
+        _timeout: Option<&timespec>,
+        _sigmask: Option<&sigset_t>,
+    ) -> Result<c_int> {
+        Err(Errno(ENOSYS))
+    }
+
     fn posix_fallocate(fd: c_int, offset: u64, length: core::num::NonZeroU64) -> Result<()> {
         io::space(fd, abi::iomsg::space::ALLOC, offset, length.get()).map(|_| ())
     }
@@ -548,6 +584,17 @@ impl Pal for Sys {
 
     fn read(fildes: c_int, buf: &mut [u8]) -> Result<usize> {
         io::read(fildes, buf)
+    }
+
+    /// One read into a buffer as large as all of `iov`, then copied out, as
+    /// relibc did on every platform before `readv` moved into [`Pal`].
+    unsafe fn readv(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        // SAFETY: `readv` checked `iovcnt`, and `iov` holds that many entries.
+        let iovs = unsafe { iovecs(iov, iovcnt) };
+        let mut buf = unsafe { gather(iovs) };
+        let n = io::read(fildes, &mut buf)?;
+        unsafe { scatter(iovs, &buf) };
+        Ok(n)
     }
 
     fn pread(fildes: c_int, buf: &mut [u8], offset: off_t) -> Result<usize> {
@@ -665,6 +712,14 @@ impl Pal for Sys {
 
     fn write(fildes: c_int, buf: &[u8]) -> Result<usize> {
         io::write(fildes, buf)
+    }
+
+    /// One write of all of `iov`, gathered into one buffer, as relibc did on
+    /// every platform before `writev` moved into [`Pal`].
+    unsafe fn writev(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        // SAFETY: `writev` checked `iovcnt`, and `iov` holds that many entries.
+        let buf = unsafe { gather(iovecs(iov, iovcnt)) };
+        io::write(fildes, &buf)
     }
 
     fn pwrite(fildes: c_int, buf: &[u8], offset: off_t) -> Result<usize> {

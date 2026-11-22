@@ -17,21 +17,20 @@ impl PalEpoll for Sys {
         Err(Errno(ENOSYS))
     }
 
-    unsafe fn epoll_ctl(
+    fn epoll_ctl(
         _epfd: c_int,
         _op: c_int,
         _fd: c_int,
-        _event: *mut epoll_event,
+        _event: Option<&mut epoll_event>,
     ) -> Result<()> {
         Err(Errno(ENOSYS))
     }
 
-    unsafe fn epoll_pwait(
+    fn epoll_pwait(
         _epfd: c_int,
-        _events: *mut epoll_event,
-        _maxevents: c_int,
+        _events: &mut [epoll_event],
         _timeout: c_int,
-        _sigmask: *const sigset_t,
+        _sigmask: Option<&sigset_t>,
     ) -> Result<usize> {
         Err(Errno(ENOSYS))
     }

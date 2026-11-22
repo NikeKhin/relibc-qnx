@@ -41,7 +41,10 @@ UNSTABLE="-Z build-std=core,alloc,compiler_builtins -Z json-target-spec"
 FEATURES="--no-default-features --features math_libm,no_trace"
 # relibc's Redox-only git dependencies resolve to local stand-ins instead of
 # being fetched from gitlab.redox-os.org; see qnx/tools/cargo-redox-stubs.toml.
-STUBS="--config qnx/tools/cargo-redox-stubs.toml"
+# --locked: if the stand-ins fall behind Cargo.lock, fail instead of letting
+# Cargo rewrite the lockfile; qnx/tools/refresh-redox-stubs.py brings them
+# in line.
+STUBS="--locked --config qnx/tools/cargo-redox-stubs.toml"
 
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$(pwd)/target}
 OUT="$CARGO_TARGET_DIR/$TARGET/$PROFILE"
