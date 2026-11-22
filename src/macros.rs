@@ -117,7 +117,6 @@ macro_rules! trace_expr {
 
 // log::trace! but functions inside them will
 // not be evaluated or compiled unless enabled
-#[cfg(target_os = "redox")] // currently only used in redox
 macro_rules! trace_log {
     ($($arg:tt)+) => {
         #[cfg(not(feature = "no_trace"))]
@@ -140,63 +139,86 @@ macro_rules! skipws {
 
 #[macro_export]
 macro_rules! wcsto_impl {
-    ($type:ident, $ptr:expr, $base:expr) => {{
-        let has_minus = unsafe { *$ptr } == '-' as wchar_t;
-        let has_plus = unsafe { *$ptr } == '+' as wchar_t;
-        if has_minus || has_plus {
-            $ptr = unsafe { $ptr.add(1) };
-        }
+    ($type:ident, $ws:expr, $endptr:expr, $base:expr) => {{
+        use $crate::c_str::WStr;
+        let mut endptr: Option<&mut *mut wchar_t> = $endptr;
+        let mut ws = $ws;
+        ws = ws.trim_start_whitespace();
+
+        let mut set_endptr = |ws: WStr| {
+            if let Some(ref mut end) = endptr {
+                // This is stupid, but apparently strto* functions want
+                // const input but mut output, yet the man page says
+                // "stores the address of the first invalid character in *endptr"
+                // so obviously it doesn't want us to clone it.
+                **end = ws.as_ptr().cast_mut();
+            }
+        };
+
+        let has_minus = if let Some((sign, rest)) = ws.split_first_char() {
+            match sign {
+                '-' => {
+                    ws = rest;
+                    true
+                }
+                '+' => {
+                    ws = rest;
+                    false
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
 
         let type_is_signed = $type::MIN != 0;
 
         let mut base = $base;
 
-        if (base == 16 || base == 0)
-            && unsafe { *$ptr } == '0' as wchar_t
-            && (unsafe { *$ptr.add(1) } == 'x' as wchar_t
-                || unsafe { *$ptr.add(1) } == 'X' as wchar_t)
+        if let Some((zero, rest)) = ws.split_first_char()
+            && zero == '0'
+            && (base == 0 || base == 16)
+            && let Some((hex, after)) = rest.split_first_char()
+            && (hex == 'x' || hex == 'X')
         {
-            $ptr = unsafe { $ptr.add(2) };
+            ws = after;
             base = 16;
+        } else if let Some((zero, rest)) = ws.split_first_char()
+            && zero == '0'
+            && base == 0
+        {
+            ws = rest;
+            base = 8;
+        } else if base == 0 {
+            base = 10;
+        } else {
+            match base {
+                2..=36 => {}
+                _ => {
+                    platform::ERRNO.set(EINVAL);
+                    set_endptr(ws);
+                    return 0;
+                }
+            }
         }
 
-        if base == 0 {
-            base = if unsafe { *$ptr } == '0' as wchar_t {
-                8
-            } else {
-                10
-            };
-        };
-
         let mut result: $type = 0;
-        while let Some(digit) =
-            char::from_u32(unsafe { *$ptr } as u32).and_then(|c| c.to_digit(base.cast_unsigned()))
+        while let Some((first, rest)) = ws.split_first_char()
+            && let Some(digit) = first.to_digit(u32::try_from(base).expect("base within limits"))
         {
-            let new = result.checked_mul(base as $type).and_then(|result| {
-                if has_minus && type_is_signed {
-                    #[cfg(target_arch = "x86")]
-                    {
+            let new = result
+                .checked_mul($type::try_from(base).expect("base within limits"))
+                .and_then(|result| {
+                    if has_minus && type_is_signed {
                         result.checked_sub(
                             $type::try_from(digit).expect("single digit never overflows"),
                         )
-                    }
-                    #[cfg(not(target_arch = "x86"))]
-                    {
-                        result.checked_sub($type::from(digit))
-                    }
-                } else {
-                    #[cfg(target_arch = "x86")]
-                    {
+                    } else {
                         result.checked_add(
                             $type::try_from(digit).expect("single digit never overflows"),
                         )
                     }
-                    #[cfg(not(target_arch = "x86"))]
-                    {
-                        result.checked_add($type::from(digit))
-                    }
-                }
-            });
+                });
             result = match new {
                 Some(new) => new,
                 None => {
@@ -205,87 +227,82 @@ macro_rules! wcsto_impl {
                 }
             };
 
-            $ptr = unsafe { $ptr.add(1) };
+            ws = rest;
         }
         if has_minus && !type_is_signed {
             result = $type::MAX - result + 1;
         }
+        set_endptr(ws);
         result
     }};
 }
 
+// TODO: this should be replaced by a (type and const-) generic function.
 #[macro_export]
 macro_rules! strto_impl {
     // this variant is used by inttypes and stdlib
     (
-        $rettype:ty, $signed:expr, $maxval:expr, $minval:expr, $s:ident, $endptr:ident, $base:ident
+        $rettype:ty, $signed:expr, $maxval:expr, $minval:expr, $s:expr, $endptr:expr, $base:ident
     ) => {{
+        use $crate::c_str::CStr;
+
         // ensure these are constants
         const CHECK_SIGN: bool = $signed;
         const MAX_VAL: $rettype = $maxval;
         const MIN_VAL: $rettype = $minval;
 
-        let set_endptr = |idx: isize| {
-            if !$endptr.is_null() {
+        let mut endptr: Option<&mut *mut c_char> = $endptr;
+        let mut s: CStr = $s;
+
+        let mut set_endptr = |s: CStr| {
+            if let Some(ref mut end) = endptr {
                 // This is stupid, but apparently strto* functions want
                 // const input but mut output, yet the man page says
                 // "stores the address of the first invalid character in *endptr"
                 // so obviously it doesn't want us to clone it.
-                unsafe {
-                    *$endptr = $s.offset(idx).cast_mut();
-                }
+                **end = s.as_ptr().cast_mut();
             }
         };
 
-        let invalid_input = || {
+        let mut invalid_input = |s| {
             platform::ERRNO.set(EINVAL);
-            set_endptr(0);
+            set_endptr(s);
         };
 
         // only valid bases are 2 through 36
         if $base != 0 && !(2..=36).contains(&$base) {
-            invalid_input();
+            invalid_input(s);
             return 0;
         }
 
-        let mut idx = 0;
-
-        // skip any whitespace at the beginning of the string
-        while ctype::isspace(c_int::from(unsafe { *$s.offset(idx) })) != 0 {
-            idx += 1;
-        }
+        s = s.trim_start_whitespace();
 
         // check for +/-
-        let positive = match is_positive(unsafe { *$s.offset(idx) }) {
-            Some((pos, i)) => {
-                idx += i;
+        let positive = match parse_sign(s) {
+            Some((pos, next)) => {
+                s = next;
                 pos
             }
             None => {
-                invalid_input();
+                invalid_input(s);
                 return 0;
             }
         };
 
         // convert the string to a number
-        let num_str = unsafe { $s.offset(idx) };
         let res = match $base {
-            0 => unsafe { detect_base(num_str) }.and_then(|($base, i)| {
-                idx += i;
-                unsafe { convert_integer(num_str.offset(i), $base) }
-            }),
-            8 => unsafe { convert_octal(num_str) },
-            16 => unsafe { convert_hex(num_str) },
-            _ => unsafe { convert_integer(num_str, $base) },
+            0 => detect_base(s).and_then(|($base, next)| convert_integer(next, $base)),
+            8 => convert_octal(s),
+            16 => convert_hex(s),
+            _ => convert_integer(s, $base),
         };
 
         // check for error parsing octal/hex prefix
         // also check to ensure a number was indeed parsed
-        let Some((num, i, overflow)) = res else {
-            invalid_input();
+        let Some((num, s, overflow)) = res else {
+            invalid_input(s);
             return 0;
         };
-        idx += i;
 
         let overflow = if CHECK_SIGN {
             overflow || (num as c_long).is_negative()
@@ -310,7 +327,7 @@ macro_rules! strto_impl {
             }
         };
 
-        set_endptr(idx);
+        set_endptr(s);
 
         num
     }};
@@ -319,120 +336,119 @@ macro_rules! strto_impl {
 #[macro_export]
 macro_rules! strto_float_impl {
     ($type:ident, $s:expr, $endptr:expr) => {{
-        use $crate::casting::CCharToU8;
+        use $crate::c_str::CStr;
+        use $crate::header::locale;
 
         let mut s = $s;
-        let endptr = $endptr;
+        let mut endptr = $endptr;
 
-        while ctype::isspace(c_int::from(unsafe{*s})) != 0 {
-            s = unsafe{ s.offset(1)};
-        }
+        s = s.trim_start_whitespace();
 
         let mut result: $type = 0.0;
         let mut exponent: Option<$type> = None;
         let mut radix = 10;
 
-        let result_sign = match CCharToU8::cast(unsafe{*s}) {
-            b'-' => {
-                s = unsafe{s.offset(1)};
-                -1.0
-            }
-            b'+' => {
-                s = unsafe{s.offset(1)};
-                1.0
-            }
-            _ => 1.0,
+        let current_locale = locale::current_locale();
+
+        let result_sign = if let Some(rest) = s.strip_prefix(b"-") {
+            s = rest;
+            -1.0
+        } else if let Some(rest) = s.strip_prefix(b"+") {
+            s = rest;
+            1.0
+        } else {
+            1.0
         };
 
-        let rust_s = unsafe{CStr::from_ptr(s)}.to_string_lossy();
-
         // detect NaN, Inf
-        if rust_s.to_lowercase().starts_with("inf") {
+        if let Some(rest) = s.strip_case_insensitive_prefix(b"inf") {
             result = $type::INFINITY;
-            s = unsafe{s.offset(3)};
-        } else if rust_s.to_lowercase().starts_with("nan") {
+            s = rest;
+        } else if let Some(rest) = s.strip_case_insensitive_prefix(b"nan") {
             // we cannot signal negative NaN in LLVM backed languages
             // https://github.com/rust-lang/rust/issues/73328 , https://github.com/rust-lang/rust/issues/81261
             result = $type::NAN;
-            s = unsafe{s.offset(3)};
+            s = rest;
         } else {
-            if CCharToU8::cast(unsafe{*s}) == b'0' && CCharToU8::cast(unsafe{*s.offset(1)}) == b'x' {
-                s = unsafe{s.offset(2)};
+            if let Some(rest) = s.strip_prefix(b"0x") {
+                s = rest;
                 radix = 16;
             }
 
-            while let Some(digit) = (CCharToU8::cast(unsafe{*s}) as char).to_digit(radix) {
+            while let Some((first_char, rest)) = s.split_first_char() && let Some(digit) = first_char.to_digit(radix) {
                 result *= radix as $type;
                 result += digit as $type;
-                s = unsafe{s.offset(1)};
+                s = rest;
             }
 
-            if CCharToU8::cast(unsafe{*s}) == b'.' {
-                s = unsafe{s.offset(1)};
+            if let Some(rest) = s.strip_prefix(&current_locale.b_decimal_point) {
+                s = rest;
 
                 let mut i = 1.0;
-                while let Some(digit) = (CCharToU8::cast(unsafe{*s}) as char).to_digit(radix) {
+                while let Some((first_char, after)) = s.split_first_char() && let Some(digit) = first_char.to_digit(radix) {
                     i *= radix as $type;
                     result += digit as $type / i;
-                    s = unsafe{s.offset(1)};
+                    s = after;
                 }
             }
 
             let s_before_exponent = s;
 
-            exponent = match (CCharToU8::cast(unsafe{*s}), radix) {
-                (b'e' | b'E', 10) | (b'p' | b'P', 16) => {
-                    s = unsafe{s.offset(1)};
+            exponent = if let Some((first, remainder)) = s.split_first() {
+                match (first, radix) {
+                    (b'e' | b'E', 10) | (b'p' | b'P', 16) => {
+                        s = remainder;
 
-                    let is_exponent_positive = match CCharToU8::cast(unsafe{*s}) {
-                        b'-' => {
-                            s = unsafe{s.offset(1)};
+                        let is_exponent_positive = if let Some(rest) = s.strip_prefix(b"-") {
+                            s = rest;
                             false
-                        }
-                        b'+' => {
-                            s = unsafe{s.offset(1)};
+                        } else if let Some(rest) = s.strip_prefix(b"+") {
+                            s = rest;
                             true
-                        }
-                        _ => true,
-                    };
-
-                    // Exponent digits are always in base 10.
-                    if (CCharToU8::cast(unsafe{*s}) as char).is_digit(10) {
-                        let mut exponent_value = 0;
-
-                        while let Some(digit) = (CCharToU8::cast(unsafe{*s}) as char).to_digit(10) {
-                            exponent_value *= 10;
-                            exponent_value += digit;
-                            s = unsafe{s.offset(1)};
-                        }
-
-                        let exponent_base = match radix {
-                            10 => 10u128,
-                            16 => 2u128,
-                            _ => unreachable!(),
+                        } else {
+                            true
                         };
 
-                        if is_exponent_positive {
-                            Some(exponent_base.pow(exponent_value) as $type)
+                        // Exponent digits are always in base 10.
+                        if let Some(first_char) = s.first_char() && first_char.is_digit(10) {
+                            let mut exponent_value = 0;
+
+                            while let Some((first_char, after)) = s.split_first_char() && let Some(digit) = first_char.to_digit(10) {
+                                exponent_value *= 10;
+                                exponent_value += digit;
+                                s = after;
+                            }
+
+                            let exponent_base = match radix {
+                                10 => 10u128,
+                                16 => 2u128,
+                                _ => unreachable!(),
+                            };
+
+                            if is_exponent_positive {
+                                Some(exponent_base.pow(exponent_value) as $type)
+                            } else {
+                                Some(1.0 / (exponent_base.pow(exponent_value) as $type))
+                            }
                         } else {
-                            Some(1.0 / (exponent_base.pow(exponent_value) as $type))
+                            // Exponent had no valid digits after 'e'/'p' and '+'/'-', rollback
+                            s = s_before_exponent;
+                            None
                         }
-                    } else {
-                        // Exponent had no valid digits after 'e'/'p' and '+'/'-', rollback
-                        s = s_before_exponent;
-                        None
                     }
+                    _ => None,
                 }
-                _ => None,
+            } else {
+                None
             };
         }
 
-        if !endptr.is_null() {
+        if let Some(ref mut end) = endptr {
             // This is stupid, but apparently strto* functions want
             // const input but mut output, yet the man page says
             // "stores the address of the first invalid character in *endptr"
             // so obviously it doesn't want us to clone it.
-            unsafe{*endptr = s.cast_mut()};
+            **end = s.as_ptr().cast_mut();
         }
 
         if let Some(exponent) = exponent {

@@ -1,4 +1,5 @@
 use alloc::{
+    borrow::Cow,
     collections::BTreeMap,
     string::{String, ToString},
     sync::{Arc, Weak},
@@ -18,7 +19,10 @@ use crate::{
     error::Errno,
     header::{
         dl_tls::{__tls_get_addr, dl_tls_index},
-        fcntl, sys_mman,
+        dlfcn::Dl_info_t,
+        fcntl,
+        link::{dl_iterate_phdr_callback, dl_phdr_info},
+        sys_mman,
         unistd::F_OK,
     },
     ld_so::dso::{Dyn, SymbolBinding},
@@ -92,7 +96,10 @@ impl MmapFile {
         let mut stat = crate::header::sys_stat::stat::default();
         Sys::fstat(fd, Out::from_mut(&mut stat))?;
 
-        Self::from_fd(fd, stat.st_size as usize)
+        Self::from_fd(
+            fd,
+            usize::try_from(stat.st_size).expect("st_size should be a positive value"),
+        )
     }
 
     fn from_fd(fd: i32, size: usize) -> core::result::Result<Self, Errno> {
@@ -302,7 +309,7 @@ impl Scope {
     fn debug(&self) {
         match self {
             Self::Global { objs } => {
-                println!(
+                eprintln!(
                     "[@global] {:?}",
                     objs.iter()
                         .map(|x| x.upgrade().unwrap().name.clone())
@@ -312,7 +319,7 @@ impl Scope {
 
             Self::Local { owner, objs } => {
                 let owner = owner.as_ref().unwrap().upgrade().unwrap();
-                println!(
+                eprintln!(
                     "[{}] {:?}",
                     owner.name,
                     objs.iter().map(|x| x.name.clone()).collect::<Vec<_>>()
@@ -412,7 +419,7 @@ impl Linker {
     pub fn load_program(&mut self, path: &str, base_addr: Option<usize>) -> Result<usize> {
         let dso = self.load_object(
             path,
-            &None,
+            None,
             base_addr,
             false,
             if self.config.bind_now {
@@ -468,14 +475,15 @@ impl Linker {
 
                     Ok(obj.clone())
                 } else if !noload {
-                    let parent_runpath = &self
+                    let parent_runpath = self
                         .objects
                         .get(&ROOT_ID)
-                        .and_then(|parent| parent.runpath().cloned());
+                        .and_then(|parent| parent.runpath())
+                        .map(|s| s.to_string());
 
                     Ok(self.load_object(
                         name,
-                        parent_runpath,
+                        parent_runpath.as_deref(),
                         None,
                         true,
                         if self.config.bind_now {
@@ -519,6 +527,62 @@ impl Linker {
                 unsafe { __tls_get_addr(&raw mut tls_index) }
             }
         })
+    }
+
+    pub fn dladdr(&self, addr: *const c_void, info: Option<&mut Dl_info_t>) -> bool {
+        let addr_val = addr as usize;
+
+        let Some(obj) = self.objects.values().find(|obj| obj.is_in_range(addr_val)) else {
+            return false;
+        };
+
+        let Some(info) = info else {
+            return true;
+        };
+
+        info.dli_fname = obj.path_c.as_ptr();
+        info.dli_fbase = obj.base as *mut c_void;
+
+        if let Some((sym_name, sym_addr)) = obj.find_sym(addr_val) {
+            info.dli_sname = sym_name;
+            info.dli_saddr = sym_addr as *mut c_void;
+        } else {
+            info.dli_sname = ptr::null();
+            info.dli_saddr = ptr::null_mut();
+        }
+
+        true
+    }
+
+    pub unsafe fn dl_iterate_phdr(
+        &self,
+        callback: dl_iterate_phdr_callback,
+        data: *mut c_void,
+    ) -> c_int {
+        let Some(cb) = callback else {
+            return 0;
+        };
+        for obj in self.objects.values() {
+            let mut info = dl_phdr_info {
+                dlpi_addr: if obj.pie { obj.base as usize } else { 0 },
+                dlpi_name: obj.path_c.as_ptr(),
+                dlpi_phdr: obj.phdrs,
+                dlpi_phnum: obj.phnum as u16,
+                // TODO
+                dlpi_adds: 0,
+                dlpi_subs: 0,
+                dlpi_tls_modid: 0,
+                dlpi_tls_data: ptr::null_mut(),
+            };
+
+            let res = unsafe { cb(&raw mut info, core::mem::size_of::<dl_phdr_info>(), data) };
+
+            if res != 0 {
+                return res;
+            }
+        }
+
+        0
     }
 
     pub fn unload(&mut self, obj: Arc<DSO>) {
@@ -612,7 +676,7 @@ impl Linker {
     fn load_object(
         &mut self,
         path: &str,
-        runpath: &Option<String>,
+        runpath: Option<&str>,
         base_addr: Option<usize>,
         dlopened: bool,
         resolve: Resolve,
@@ -642,10 +706,6 @@ impl Linker {
             None,
             scope,
         )?;
-
-        for (i, obj) in new_objects.iter().enumerate() {
-            obj.relocate(objects_data[i].as_deref(), resolve).unwrap();
-        }
 
         unsafe {
             if !dlopened {
@@ -759,6 +819,10 @@ impl Linker {
             }
         }
 
+        for (i, obj) in new_objects.iter().enumerate() {
+            obj.relocate(objects_data[i].as_deref(), resolve).unwrap();
+        }
+
         for obj in new_objects.into_iter() {
             // SAFETY: `obj` and its dependencies have been successfuly loaded.
             unsafe {
@@ -796,7 +860,7 @@ impl Linker {
     fn load_objects_recursive(
         &mut self,
         name: &str,
-        parent_runpath: &Option<String>,
+        parent_runpath: Option<&str>,
         base_addr: Option<usize>,
         dlopened: bool,
         new_objects: &mut Vec<Arc<DSO>>,
@@ -810,9 +874,9 @@ impl Linker {
         if let Some(id) = self.name_to_object_id_map.get(name) {
             if let Some(obj) = self.objects.get(id) {
                 if let Some(scope) = dependent_scope {
-                    match scope_kind {
-                        ScopeKind::Local => scope.add(obj),
-                        ScopeKind::Global => GLOBAL_SCOPE.write().add(obj),
+                    scope.add(obj);
+                    if scope_kind == ScopeKind::Global {
+                        GLOBAL_SCOPE.write().add(obj);
                     }
                 } else if scope_kind == ScopeKind::Global {
                     GLOBAL_SCOPE.write().add(obj);
@@ -821,9 +885,9 @@ impl Linker {
             }
         } else if let Some(obj) = new_objects.iter().find(|o| o.name == name) {
             if let Some(scope) = dependent_scope {
-                match scope_kind {
-                    ScopeKind::Local => scope.add(obj),
-                    ScopeKind::Global => GLOBAL_SCOPE.write().add(obj),
+                scope.add(obj);
+                if scope_kind == ScopeKind::Global {
+                    GLOBAL_SCOPE.write().add(obj);
                 }
             } else if scope_kind == ScopeKind::Global {
                 GLOBAL_SCOPE.write().add(obj);
@@ -833,7 +897,7 @@ impl Linker {
 
         let debug = self.config.debug_flags.contains(DebugFlags::LOAD);
 
-        if name == "libc.so.6" || name == "libc.so" {
+        if name == "libc.so.6" || name == "libc.so" || name == "/lib/libc.so.1" {
             let (me, master) = DSO::from_raw(
                 self.me.base,
                 self.me.dyns,
@@ -920,29 +984,24 @@ impl Linker {
             self.next_tls_module_id += 1;
         }
 
-        let runpath = obj.runpath().cloned();
-        let dependencies = obj
-            .dependencies()
-            .iter()
-            .map(|dep| dep.to_string())
-            .collect::<Vec<_>>();
+        let runpath = obj.runpath().map(|s| s.to_string());
 
         let obj = Arc::new(obj);
         let mut scope = Scope::local();
 
         if let Some(dependent_scope) = dependent_scope {
-            match scope_kind {
-                ScopeKind::Local => dependent_scope.add(&obj),
-                ScopeKind::Global => GLOBAL_SCOPE.write().add(&obj),
+            dependent_scope.add(&obj);
+            if scope_kind == ScopeKind::Global {
+                GLOBAL_SCOPE.write().add(&obj);
             }
         } else if let ScopeKind::Global = scope_kind {
             GLOBAL_SCOPE.write().add(&obj);
         }
 
-        for dep_name in dependencies.iter() {
+        for dep_name in obj.dependencies() {
             self.load_objects_recursive(
                 dep_name,
-                &runpath,
+                runpath.as_deref(),
                 None,
                 dlopened,
                 new_objects,
@@ -962,18 +1021,21 @@ impl Linker {
         Ok(obj)
     }
 
-    fn search_object(&self, name: &str, parent_runpath: &Option<String>) -> Result<String> {
+    fn search_object<'a>(
+        &self,
+        name: &'a str,
+        parent_runpath: Option<&str>,
+    ) -> Result<Cow<'a, str>> {
         let debug = self.config.debug_flags.contains(DebugFlags::SEARCH);
         if debug {
             eprintln!("[ld.so]: looking for '{}'", name);
         }
 
-        let mut full_path = name.to_string();
-        if accessible(&full_path, F_OK).is_ok() {
+        if name.contains('/') && accessible(name, F_OK).is_ok() {
             if debug {
-                eprintln!("[ld.so]: found at '{}'!", full_path);
+                eprintln!("[ld.so]: found at '{}'!", name);
             }
-            return Ok(full_path);
+            return Ok(name.into());
         } else {
             let mut search_paths = Vec::new();
             if let Some(runpath) = parent_runpath {
@@ -984,7 +1046,7 @@ impl Linker {
             }
             search_paths.push("/lib");
             for part in search_paths.iter() {
-                full_path = format!("{}/{}", part, name);
+                let full_path = format!("{}/{}", part, name);
                 if debug {
                     eprintln!("[ld.so]: trying path '{}'", full_path);
                 }
@@ -992,7 +1054,7 @@ impl Linker {
                     if debug {
                         eprintln!("[ld.so]: found at '{}'!", full_path);
                     }
-                    return Ok(full_path);
+                    return Ok(full_path.into());
                 }
             }
         }
@@ -1030,7 +1092,7 @@ impl Linker {
     }
 
     fn run_init(&self, obj: &DSO) {
-        use crate::platform::{self, types::*};
+        use crate::platform::{self, types::c_char};
 
         if let Some((symbol, SymbolBinding::Global)) = obj.get_sym("__relibc_init_environ") {
             unsafe {
@@ -1046,12 +1108,12 @@ impl Linker {
 
     fn scope_debug(&self) {
         if self.config.debug_flags.contains(DebugFlags::SCOPES) {
-            println!("[ld.so]: =========== SCOPES ==========");
+            eprintln!("[ld.so]: =========== SCOPES ==========");
             GLOBAL_SCOPE.read().debug();
             for obj in self.objects.values() {
                 obj.scope().debug();
             }
-            println!("[ld.so]: ==============================");
+            eprintln!("[ld.so]: ==============================");
         }
     }
 }

@@ -8,7 +8,7 @@ use crate::{
     header::{
         errno::{EINVAL, ENOMEM, EOVERFLOW, ETIMEDOUT},
         signal::sigevent,
-        stdlib::getenv,
+        stdlib,
         time::posix_tz::PosixTz,
         unistd::readlink,
     },
@@ -53,7 +53,6 @@ pub(crate) const NANOSECONDS: c_long = 1_000_000_000;
 const UTC_STR: &core::ffi::CStr = c"UTC";
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/time.h.html>.
-#[allow(non_camel_case_types)]
 #[repr(C)]
 pub struct tm {
     pub tm_sec: c_int,          // 0 - 60
@@ -309,9 +308,12 @@ pub unsafe extern "C" fn ctime_r(clock: *const time_t, buf: *mut c_char) -> *mut
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/difftime.html>.
+///
+/// Computes the difference between two calendar time values: `time1` - `time0`
+#[expect(clippy::cast_precision_loss, reason = "cannot TryFrom")]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn difftime(time1: time_t, time0: time_t) -> c_double {
-    (time1 - time0) as _
+    (time1 - time0) as c_double
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getdate.html>.
@@ -411,11 +413,11 @@ pub unsafe extern "C" fn mktime(timeptr: *mut tm) -> time_t {
     unsafe { clear_timezone(&mut lock) };
 
     let year = unsafe { (*timeptr).tm_year } + 1900;
-    let month = (unsafe { (*timeptr).tm_mon } + 1) as _;
-    let day = unsafe { (*timeptr).tm_mday } as _;
-    let hour = unsafe { (*timeptr).tm_hour } as _;
-    let minute = unsafe { (*timeptr).tm_min } as _;
-    let second = unsafe { (*timeptr).tm_sec } as _;
+    let month = (unsafe { (*timeptr).tm_mon } + 1).cast_unsigned();
+    let day = unsafe { (*timeptr).tm_mday }.cast_unsigned();
+    let hour = unsafe { (*timeptr).tm_hour }.cast_unsigned();
+    let minute = unsafe { (*timeptr).tm_min }.cast_unsigned();
+    let second = unsafe { (*timeptr).tm_sec }.cast_unsigned();
 
     let Some(naive_local) = NaiveDate::from_ymd_opt(year, month, day)
         .and_then(|date| date.and_hms_opt(hour, minute, second))
@@ -497,7 +499,11 @@ pub unsafe extern "C" fn mktime(timeptr: *mut tm) -> time_t {
 /// not returned.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> c_int {
-    unsafe { Sys::nanosleep(rqtp, rmtp) }
+    // copied() to avoid UB if rmtp == rqtp by reference
+    let Some(rqtp) = (unsafe { rqtp.as_ref().cloned() }) else {
+        return Err(Errno(EINVAL)).or_minus_one_errno();
+    };
+    Sys::nanosleep(&rqtp, unsafe { Out::nullable(rmtp) })
         .map(|()| 0)
         .or_minus_one_errno()
 }
@@ -542,8 +548,8 @@ pub unsafe extern "C" fn timegm(tm: *mut tm) -> time_t {
     };
 
     unsafe {
-        (*tm).tm_wday = dt.weekday().num_days_from_sunday() as _;
-        (*tm).tm_yday = dt.ordinal0() as _; // day of year starting at 0
+        (*tm).tm_wday = c_int::try_from(dt.weekday().num_days_from_sunday()).expect("within range");
+        (*tm).tm_yday = c_int::try_from(dt.ordinal0()).expect("within range"); // day of year starting at 0
         (*tm).tm_isdst = 0; // UTC does not use DST
         (*tm).tm_gmtoff = 0; // UTC offset is zero
         (*tm).tm_zone = UTC_STR.as_ptr().cast::<c_char>();
@@ -569,9 +575,10 @@ pub unsafe extern "C" fn timelocal(tm: *mut tm) -> time_t {
     #[cfg(target_pointer_width = "32")]
     let tm_gmtoff = dt.offset().fix().local_minus_utc();
     unsafe {
-        (*tm).tm_wday = dt.weekday().num_days_from_sunday() as _;
-        (*tm).tm_yday = dt.ordinal0() as _; // day of year starting at 0
-        (*tm).tm_isdst = dt.offset().dst_offset().num_hours() as _;
+        (*tm).tm_wday = c_int::try_from(dt.weekday().num_days_from_sunday()).expect("within range");
+        (*tm).tm_yday = c_int::try_from(dt.ordinal0()).expect("within range"); // day of year starting at 0
+        (*tm).tm_isdst =
+            c_int::try_from(dt.offset().dst_offset().num_hours()).expect("within range");
         (*tm).tm_gmtoff = tm_gmtoff;
         (*tm).tm_zone = tz_name.into_raw().cast();
     }
@@ -715,11 +722,11 @@ fn convert_tm_generic<Tz: TimeZone>(tz: &Tz, tm_val: &tm) -> Option<DateTime<Tz>
 
     match tz.with_ymd_and_hms(
         year,
-        month as u32,
-        day as u32,
-        hour as u32,
-        minute as u32,
-        second as u32,
+        month.cast_unsigned(),
+        day.cast_unsigned(),
+        hour.cast_unsigned(),
+        minute.cast_unsigned(),
+        second.cast_unsigned(),
     ) {
         MappedLocalTime::Single(dt) => Some(dt),
         MappedLocalTime::Ambiguous(dt1, _dt2) => Some(dt1), // choose the earliest value
@@ -774,10 +781,7 @@ fn get_system_time_zone<'a>() -> Option<&'a str> {
 
 fn get_current_time_zone<'a>() -> &'a str {
     // Check the `TZ` environment variable
-    let tz_env = unsafe { getenv(c"TZ".as_ptr().cast()) };
-    if !tz_env.is_null()
-        && let Ok(tz) = unsafe { CStr::from_ptr(tz_env) }.to_str()
-    {
+    if let Some(tz) = stdlib::getenv_str(c"TZ") {
         return tz;
     }
 
@@ -799,7 +803,7 @@ fn time_zone() -> Option<Tz> {
 fn now() -> NaiveDateTime {
     let mut now = timespec::default();
     if Sys::clock_gettime(CLOCK_REALTIME, Out::from_mut(&mut now)).is_ok() {}; // TODO what to do if Err?
-    DateTime::from_timestamp(now.tv_sec, now.tv_nsec as _)
+    DateTime::from_timestamp(now.tv_sec, u32::try_from(now.tv_nsec).unwrap_or(u32::MAX))
         .unwrap_or_default()
         .naive_local()
 }
@@ -831,17 +835,17 @@ fn datetime_to_tm(local_time: &DateTime<Tz>) -> tm {
 
     let mut t = blank_tm();
     // Populate the `tm` structure
-    t.tm_sec = local_time.second() as _;
-    t.tm_min = local_time.minute() as _;
-    t.tm_hour = local_time.hour() as _;
-    t.tm_mday = local_time.day() as _;
-    t.tm_mon = local_time.month0() as _; // 0-based month
+    t.tm_sec = c_int::try_from(local_time.second()).expect("within range");
+    t.tm_min = c_int::try_from(local_time.minute()).expect("within range");
+    t.tm_hour = c_int::try_from(local_time.hour()).expect("within range");
+    t.tm_mday = c_int::try_from(local_time.day()).expect("within range");
+    t.tm_mon = c_int::try_from(local_time.month0()).expect("within range"); // 0-based month
     t.tm_year = (local_time.year() - 1900) as _; // Years since 1900
-    t.tm_wday = local_time.weekday().num_days_from_sunday() as _;
-    t.tm_yday = local_time.ordinal0() as _; // 0-based day of year
+    t.tm_wday = c_int::try_from(local_time.weekday().num_days_from_sunday()).expect("within range");
+    t.tm_yday = c_int::try_from(local_time.ordinal0()).expect("within range"); // 0-based day of year
 
     let offset = local_time.offset();
-    t.tm_isdst = offset.dst_offset().num_hours() as _;
+    t.tm_isdst = c_int::try_from(offset.dst_offset().num_hours()).expect("within range");
     // Get the UTC offset in seconds
     #[cfg(target_pointer_width = "64")]
     let tm_gtoff = offset.fix().local_minus_utc().into();
@@ -852,9 +856,17 @@ fn datetime_to_tm(local_time: &DateTime<Tz>) -> tm {
     let tm_zone = {
         let mut timezone_names = TIMEZONE_NAMES.lock();
         timezone_names.get_or_init(BTreeSet::new);
-        let cstr = CString::new(tz).unwrap();
-        timezone_names.get_mut().unwrap().insert(cstr.clone());
-        timezone_names.get().unwrap().get(&cstr).unwrap().as_ptr()
+        let cstr = CString::new(tz).expect("shouldn't contain null bytes");
+        timezone_names
+            .get_mut()
+            .expect("already initialised")
+            .insert(cstr.clone());
+        timezone_names
+            .get()
+            .expect("already initialised")
+            .get(&cstr)
+            .expect("inserted above")
+            .as_ptr()
     };
 
     t.tm_zone = tm_zone.cast();

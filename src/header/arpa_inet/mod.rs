@@ -64,10 +64,22 @@ pub unsafe extern "C" fn inet_addr(cp: *const c_char) -> in_addr_t {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn inet_aton(cp: *const c_char, inp: *mut in_addr) -> c_int {
     let cp_cstr = unsafe { CStr::from_ptr(cp) };
-    let parts = unsafe { str::from_utf8_unchecked(cp_cstr.to_bytes()).split('.') };
+    let Ok(result) = inet_aton_inner(cp_cstr.to_bytes()) else {
+        return 0;
+    };
+    unsafe { (*inp.cast::<in_addr>()).s_addr = result };
+    1
+}
+
+/// Parses IPv4 address (NUL excluded) to big-endian integer representation
+pub(crate) fn inet_aton_inner(parts: &[u8]) -> Result<u32, ()> {
+    let Ok(parts) = str::from_utf8(parts) else {
+        return Err(());
+    };
+    let parts = parts.split('.');
     let count = parts.clone().count();
     if count > 4 {
-        return 0;
+        return Err(());
     }
     let mut result = 0;
     let mut parts_iter = parts.peekable();
@@ -93,24 +105,23 @@ pub unsafe extern "C" fn inet_aton(cp: *const c_char, inp: *mut in_addr) -> c_in
             if parts_iter.peek().is_some() {
                 // this is not the last part
                 if parsed_value > 0xff {
-                    return 0;
+                    return Err(());
                 }
                 result += parsed_value << (24 - index * 8);
             } else {
                 // this is the last part
                 if index > 0 && parsed_value >= 1 << (32 - index * 8) {
-                    return 0;
+                    return Err(());
                 } else {
                     result += parsed_value;
                 }
             }
         } else {
-            return 0;
+            return Err(());
         }
         index += 1;
     }
-    unsafe { (*inp.cast::<in_addr>()).s_addr = result.to_be() };
-    1
+    Ok(result.to_be())
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/7908799/xns/inet_lnaof.html>.
@@ -217,7 +228,7 @@ pub unsafe extern "C" fn inet_ntoa(r#in: in_addr) -> *mut c_char {
             AF_INET,
             ptr::from_ref::<in_addr>(&r#in).cast::<c_void>(),
             NTOA_ADDR.unsafe_mut().as_mut_ptr(),
-            NTOA_ADDR.unsafe_ref().len() as socklen_t,
+            socklen_t::try_from(NTOA_ADDR.unsafe_ref().len()).expect("len within bounds"),
         );
         // Mutable pointer is required, inet_ntop returns destination as const pointer
         ptr.cast_mut()

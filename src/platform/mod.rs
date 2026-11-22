@@ -55,7 +55,7 @@ pub mod auxv_defs;
 #[cfg(target_os = "redox")]
 pub use redox_rt::auxv_defs;
 
-use self::types::*;
+use self::types::{c_char, c_int};
 pub mod types;
 
 /// The global `errno` variable used internally in relibc.
@@ -63,6 +63,7 @@ pub mod types;
 pub static ERRNO: Cell<c_int> = Cell::new(0);
 
 /// The `argv` argument available to a program's `main` function.
+// TODO: change remaining static mut to RawCell
 pub static mut argv: *mut *mut c_char = ptr::null_mut();
 pub static inner_argv: RawCell<Vec<*mut c_char>> = RawCell::new(Vec::new());
 pub static mut program_invocation_name: *mut c_char = ptr::null_mut();
@@ -152,7 +153,7 @@ impl Read for FileReader {
             .map(|u| u as isize)
             .or_minus_one_errno(); // TODO
         if i >= 0 {
-            Ok(i as usize)
+            Ok(i.cast_unsigned())
         } else {
             Err(io::Error::from_raw_os_error(-i as i32))
         }

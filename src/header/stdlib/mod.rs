@@ -12,7 +12,7 @@ use rand_xorshift::XorShiftRng;
 
 use crate::{
     c_str::CStr,
-    casting::{ByteLiteral, CCharToU8},
+    casting::ByteLiteral,
     error::{Errno, ResultExt},
     fs::File,
     header::{
@@ -53,11 +53,8 @@ pub const EXIT_SUCCESS: c_int = 0;
 pub const RAND_MAX: c_int = 2_147_483_647;
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/stdlib.h.html>.
-//Maximum number of bytes in a multibyte character for the current locale
+/// Maximum number of bytes in a character specified by the current locale.
 pub const MB_CUR_MAX: c_int = 4;
-/// Actually specified for `limits.h`?
-//Maximum number of bytes in a multibyte characters for any locale
-pub const MB_LEN_MAX: c_int = 4;
 
 static ATEXIT_FUNCS: RawCell<[Option<extern "C" fn()>; 32]> = RawCell::new([None; 32]);
 static AT_QUICK_EXIT_FUNCS: RawCell<[Option<extern "C" fn()>; 32]> = RawCell::new([None; 32]);
@@ -188,54 +185,50 @@ pub unsafe extern "C" fn atof(s: *const c_char) -> c_double {
     unsafe { strtod(s, ptr::null_mut()) }
 }
 
-macro_rules! dec_num_from_ascii {
-    ($s:expr, $t:ty) => {{
-        let mut s = $s;
-        // Iterate past whitespace
-        while ctype::isspace(c_int::from(unsafe { *s })) != 0 {
-            s = unsafe { s.offset(1) };
+fn dec_num_from_ascii<T: From<u8> + core::ops::Mul<Output = T> + core::ops::Sub<Output = T>>(
+    mut s: CStr,
+) -> T {
+    s = s.trim_start_whitespace();
+
+    let neg_sign = match s.split_first() {
+        Some((b'-', rest)) => {
+            s = rest;
+            true
         }
-
-        // Find out if there is a - sign
-        let neg_sign = match unsafe { *s } {
-            0x2d => {
-                s = unsafe { s.offset(1) };
-                true
-            }
-            // '+' increment s and continue parsing
-            0x2b => {
-                s = unsafe { s.offset(1) };
-                false
-            }
-            _ => false,
-        };
-
-        let mut n: $t = 0;
-        while ctype::isdigit(c_int::from(unsafe { *s })) != 0 {
-            n = 10 * n - (unsafe { *s } as $t - 0x30);
-            s = unsafe { s.offset(1) };
+        Some((b'+', rest)) => {
+            s = rest;
+            false
         }
+        _ => false,
+    };
 
-        if neg_sign { n } else { -n }
-    }};
+    let mut n = T::from(0_u8);
+    while let Some((digit, rest)) = s.split_first()
+        && ctype::isdigit(digit.into()) != 0
+    {
+        n = T::from(10) * n - T::from(digit - b'0');
+        s = rest;
+    }
+
+    if neg_sign { n } else { T::from(0) - n }
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/atoi.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn atoi(s: *const c_char) -> c_int {
-    dec_num_from_ascii!(s, c_int)
+    dec_num_from_ascii::<c_int>(unsafe { CStr::from_ptr(s) })
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/atol.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn atol(s: *const c_char) -> c_long {
-    dec_num_from_ascii!(s, c_long)
+    dec_num_from_ascii::<c_long>(unsafe { CStr::from_ptr(s) })
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/atol.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn atoll(s: *const c_char) -> c_longlong {
-    dec_num_from_ascii!(s, c_longlong)
+    dec_num_from_ascii::<c_longlong>(unsafe { CStr::from_ptr(s) })
 }
 
 unsafe extern "C" fn void_cmp(a: *const c_void, b: *const c_void) -> c_int {
@@ -461,6 +454,16 @@ pub unsafe extern "C" fn getenv(name: *const c_char) -> *mut c_char {
         .unwrap_or(ptr::null_mut())
 }
 
+/// Wrapper to `getenv` for safe consumption
+pub(crate) fn getenv_str(name: &core::ffi::CStr) -> Option<&str> {
+    unsafe { CStr::from_nullable_ptr(getenv(name.as_ptr())).and_then(|s| s.to_str().ok()) }
+}
+
+/// Wrapper to `getenv` for safe consumption
+pub(crate) fn getenv_cstr(name: &core::ffi::CStr) -> Option<CStr<'_>> {
+    unsafe { CStr::from_nullable_ptr(getenv(name.as_ptr())) }
+}
+
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getsubopt.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getsubopt(
@@ -504,10 +507,12 @@ pub unsafe extern "C" fn getsubopt(
 
             if suffix_char == ByteLiteral::cast_cchar(b'=') {
                 unsafe { *valuep = start.add(token_len + 1) };
-                return i as c_int;
+                return c_int::try_from(i)
+                    .expect("always positive; extremely unlikely to exceed c_int::MAX");
             } else if suffix_char == 0 {
                 unsafe { *valuep = ptr::null_mut() };
-                return i as c_int;
+                return c_int::try_from(i)
+                    .expect("always positive; extremely unlikely to exceed c_int::MAX");
             }
         }
         i += 1;
@@ -579,6 +584,7 @@ pub unsafe extern "C" fn jrand48(xsubi: *mut c_ushort) -> c_long {
 pub unsafe extern "C" fn l64a(value: c_long) -> *mut c_char {
     // POSIX says we should only consider the lower 32 bits of value.
     #[cfg(not(target_arch = "x86"))]
+    #[expect(clippy::cast_possible_truncation, reason = "desired behaviour")]
     let value_as_i32 = value as i32;
     #[cfg(target_arch = "x86")]
     let value_as_i32 = value;
@@ -738,7 +744,7 @@ pub unsafe extern "C" fn mblen(s: *const c_char, n: size_t) -> c_int {
         return -1;
     }
 
-    result as i32
+    c_int::try_from(result).expect("only possible return value at this point should be 0")
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/mbstowcs.html>.
@@ -759,7 +765,7 @@ fn inner_mktemp<T, F>(name: *mut c_char, suffix_len: c_int, mut attempt: F) -> O
 where
     F: FnMut() -> Option<T>,
 {
-    let len = unsafe { strlen(name) as c_int };
+    let len = unsafe { c_int::try_from(strlen(name)).expect("name unlikely to exceed c_int::MAX") };
 
     if len < 6 || suffix_len > len - 6 {
         platform::ERRNO.set(errno::EINVAL);
@@ -1400,61 +1406,57 @@ pub unsafe extern "C" fn srandom(seed: c_uint) {
     unsafe { random_state.seed(seed) };
 }
 
-pub fn is_positive(ch: c_char) -> Option<(bool, isize)> {
-    match ch {
-        0 => None,
-        ch if ch == ByteLiteral::cast_cchar(b'+') => Some((true, 1)),
-        ch if ch == ByteLiteral::cast_cchar(b'-') => Some((false, 1)),
-        _ => Some((true, 0)),
-    }
+pub fn parse_sign(orig: CStr) -> Option<(bool, CStr)> {
+    let (first, advanced) = orig.split_first()?;
+    Some(match first {
+        b'+' => (true, advanced),
+        b'-' => (false, advanced),
+        _ => (true, orig),
+    })
 }
 
-pub unsafe fn detect_base(s: *const c_char) -> Option<(c_int, isize)> {
-    let first = CCharToU8::cast(unsafe { *s });
-    match first {
-        0 => None,
-        b'0' => {
-            let second = CCharToU8::cast(unsafe { *s.add(1) });
-            if second == b'X' || second == b'x' {
-                Some((16, 2))
-            } else if (b'0'..=b'7').contains(&second) {
-                Some((8, 1))
-            } else {
-                // in this case, the prefix (0) is going to be the number
-                Some((8, 0))
-            }
-        }
-        _ => Some((10, 0)),
-    }
+pub fn detect_base(s: CStr) -> Option<(c_int, CStr)> {
+    let (first, adv1) = s.split_first()?;
+
+    Some(match (first, adv1.split_first()) {
+        (b'0', Some((b'x' | b'X', adv2))) => (16, adv2),
+        (b'0', Some((b'0'..=b'7', _))) => (8, adv1),
+        // in this case, the prefix (0) is going to be the number
+        (b'0', None) => (8, s),
+        (_, _) => (10, s),
+    })
 }
 
-pub unsafe fn convert_octal(s: *const c_char) -> Option<(c_ulong, isize, bool)> {
-    if unsafe { *s } != 0 && unsafe { *s } == ByteLiteral::cast_cchar(b'0') {
-        if let Some((val, idx, overflow)) = unsafe { convert_integer(s.add(1), 8) } {
-            Some((val, idx + 1, overflow))
+pub fn convert_octal(s: CStr) -> Option<(c_ulong, CStr, bool)> {
+    let (first, next) = s.split_first()?;
+
+    if first != b'0' {
+        return None;
+    }
+
+    Some(
+        if let Some((val, next, overflow)) = convert_integer(next, 8) {
+            (val, next, overflow)
         } else {
             // in case the prefix is not actually a prefix
-            Some((0, 1, false))
-        }
-    } else {
-        None
-    }
+            (0, next, false)
+        },
+    )
 }
 
-pub unsafe fn convert_hex(s: *const c_char) -> Option<(c_ulong, isize, bool)> {
-    if (unsafe { *s } != 0 && unsafe { *s } == ByteLiteral::cast_cchar(b'0'))
-        && (unsafe { *s.add(1) } != 0
-            && (unsafe { *s.add(1) } == ByteLiteral::cast_cchar(b'x')
-                || unsafe { *s.add(1) } == ByteLiteral::cast_cchar(b'X')))
+pub fn convert_hex(s: CStr) -> Option<(c_ulong, CStr, bool)> {
+    let (first, next) = s.split_first()?;
+
+    if first == b'0'
+        && let Some((b'x' | b'X', next)) = next.split_first()
     {
-        unsafe { convert_integer(s.add(2), 16) }
-            .map(|(val, idx, overflow)| (val, idx + 2, overflow))
+        convert_integer(next, 16)
     } else {
-        unsafe { convert_integer(s, 16) }
+        convert_integer(s, 16)
     }
 }
 
-pub unsafe fn convert_integer(s: *const c_char, base: c_int) -> Option<(c_ulong, isize, bool)> {
+pub fn convert_integer(orig_s: CStr, base: c_int) -> Option<(c_ulong, CStr, bool)> {
     // -1 means the character is invalid
     #[rustfmt::skip]
     const LOOKUP_TABLE: [c_long; 256] = [
@@ -1476,15 +1478,15 @@ pub unsafe fn convert_integer(s: *const c_char, base: c_int) -> Option<(c_ulong,
         -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
     ];
 
+    let mut s = orig_s;
     let mut num: c_ulong = 0;
-    let mut idx = 0;
     let mut overflowed = false;
 
-    loop {
+    while let Some((c, next_s)) = s.split_first() {
         // `-1 as usize` is usize::MAX
         // `-1 as u8 as usize` is u8::MAX
         // It extends by the sign bit unless we cast it to unsigned first.
-        let val = LOOKUP_TABLE[CCharToU8::cast(unsafe { *s.offset(idx) }) as usize];
+        let val = LOOKUP_TABLE[usize::from(c)];
         if val == -1 || val as c_int >= base {
             break;
         } else {
@@ -1499,28 +1501,44 @@ pub unsafe fn convert_integer(s: *const c_char, base: c_int) -> Option<(c_ulong,
                 overflowed = true;
             }
 
-            idx += 1;
+            s = next_s;
         }
     }
 
-    if idx > 0 {
-        Some((num, idx, overflowed))
+    if s.as_ptr() != orig_s.as_ptr() {
+        Some((num, s, overflowed))
     } else {
         None
     }
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/strtod.html>.
-#[expect(clippy::cast_lossless)] // not all users of `strto_float_impl!` are lossless
+///
+/// Converts a string to a `double`.
+#[expect(
+    clippy::cast_lossless,
+    clippy::cast_precision_loss,
+    reason = "not all users of `strto_float_impl!` are lossless"
+)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strtod(s: *const c_char, endptr: *mut *mut c_char) -> c_double {
-    strto_float_impl!(c_double, s, endptr)
+    strto_float_impl!(c_double, unsafe { CStr::from_ptr(s) }, unsafe {
+        endptr.as_mut()
+    })
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/strtod.html>.
+///
+/// Converts a string to a `float`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "not all users of `strto_float_impl!` are lossless"
+)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn strtof(s: *const c_char, endptr: *mut *mut c_char) -> c_float {
-    strto_float_impl!(c_float, s, endptr)
+    strto_float_impl!(c_float, unsafe { CStr::from_ptr(s) }, unsafe {
+        endptr.as_mut()
+    })
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/strtol.html>.
@@ -1536,7 +1554,15 @@ pub unsafe extern "C" fn strtol(
     endptr: *mut *mut c_char,
     base: c_int,
 ) -> c_long {
-    strto_impl!(c_long, true, c_long::MAX, c_long::MIN, nptr, endptr, base)
+    strto_impl!(
+        c_long,
+        true,
+        c_long::MAX,
+        c_long::MIN,
+        unsafe { CStr::from_ptr(nptr) },
+        unsafe { endptr.as_mut() },
+        base
+    )
 }
 
 // TODO: strtold(), when long double is available
@@ -1559,8 +1585,8 @@ pub unsafe extern "C" fn strtoll(
         true,
         c_longlong::MAX,
         c_longlong::MIN,
-        nptr,
-        endptr,
+        unsafe { CStr::from_ptr(nptr) },
+        unsafe { endptr.as_mut() },
         base
     )
 }
@@ -1583,8 +1609,8 @@ pub unsafe extern "C" fn strtoul(
         false,
         c_ulong::MAX,
         c_ulong::MIN,
-        str,
-        endptr,
+        unsafe { CStr::from_ptr(str) },
+        unsafe { endptr.as_mut() },
         base
     )
 }
@@ -1607,8 +1633,8 @@ pub unsafe extern "C" fn strtoull(
         false,
         c_ulonglong::MAX,
         c_ulonglong::MIN,
-        str,
-        endptr,
+        unsafe { CStr::from_ptr(str) },
+        unsafe { endptr.as_mut() },
         base
     )
 }
@@ -1769,5 +1795,5 @@ pub unsafe extern "C" fn wctomb(s: *mut c_char, wc: wchar_t) -> c_int {
         return -1;
     }
 
-    result as c_int
+    c_int::try_from(result).expect("within bounds")
 }

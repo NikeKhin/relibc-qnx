@@ -5,15 +5,18 @@ use crate::{
     c_str::CStr,
     error::{Errno, Result},
     header::{
+        bits_sigset_t::sigset_t,
         dirent::dirent,
         errno::{EINVAL, EIO, ENOSYS},
         fcntl::AT_EMPTY_PATH,
+        poll::pollfd,
         signal::{SIGCHLD, sigevent},
         sys_resource::{rlimit, rusage},
         sys_select::timeval,
         sys_stat::{S_IFIFO, stat},
         sys_statvfs::statvfs,
         sys_time::timezone,
+        sys_uio::iovec,
         sys_utsname::utsname,
         time::{itimerspec, timespec},
         unistd::{SEEK_CUR, SEEK_SET},
@@ -21,7 +24,7 @@ use crate::{
     ld_so::tcb::OsSpecific,
     out::Out,
 };
-use core::{num::NonZeroU64, ptr};
+use core::{mem, num::NonZeroU64, ptr};
 use sc::nr::{CLONE, EXIT};
 
 mod epoll;
@@ -96,8 +99,8 @@ impl Pal for Sys {
                 FCHOWNAT,
                 fildes,
                 path.as_ptr(),
-                owner as u32,
-                group as u32,
+                owner.cast_unsigned(),
+                group.cast_unsigned(),
                 flags
             )
         })
@@ -183,7 +186,7 @@ impl Pal for Sys {
             syscall!(
                 FCHMODAT,
                 dirfd,
-                path.map_or(core::ptr::null(), |p| p.as_ptr()),
+                path.map_or(core::ptr::null(), CStr::as_ptr),
                 mode,
                 flags
             )
@@ -204,7 +207,7 @@ impl Pal for Sys {
             syscall!(
                 NEWFSTATAT,
                 fildes,
-                path.map_or(core::ptr::null(), |s| s.as_ptr()),
+                path.map_or(core::ptr::null(), CStr::as_ptr),
                 buf.as_mut_ptr(),
                 flags
             )
@@ -285,13 +288,22 @@ impl Pal for Sys {
         .map(|n| n as u32)
     }
 
-    unsafe fn utimensat(
+    fn utimensat(
         dirfd: c_int,
         path: CStr,
-        times: *const timespec,
+        times: Option<&[timespec; 2]>,
         flag: c_int,
     ) -> Result<()> {
-        e_raw(unsafe { syscall!(UTIMENSAT, dirfd, path.as_ptr(), times, flag) }).map(|_| ())
+        e_raw(unsafe {
+            syscall!(
+                UTIMENSAT,
+                dirfd,
+                path.as_ptr(),
+                times.map(|s| s.as_ptr()).unwrap_or(ptr::null()),
+                flag
+            )
+        })
+        .map(|_| ())
     }
 
     fn getcwd(mut buf: Out<[u8]>) -> Result<()> {
@@ -315,7 +327,10 @@ impl Pal for Sys {
     // FIXME use offset or remove it
     unsafe fn dent_reclen_offset(this_dent: &[u8], _offset: usize) -> Option<(u16, u64)> {
         let dent = this_dent.as_ptr().cast::<dirent>();
-        Some((unsafe { (*dent).d_reclen }, unsafe { (*dent).d_off } as u64))
+        Some((
+            unsafe { (*dent).d_reclen },
+            unsafe { (*dent).d_off }.cast_unsigned(),
+        ))
     }
 
     fn getegid() -> gid_t {
@@ -518,8 +533,15 @@ impl Pal for Sys {
         e_raw(syscall!(MADVISE, addr, len, flags)).map(|_| ())
     }
 
-    unsafe fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> Result<()> {
-        e_raw(unsafe { syscall!(NANOSLEEP, rqtp, rmtp) }).map(|_| ())
+    fn nanosleep(rqtp: &timespec, rmtp: Option<Out<timespec>>) -> Result<()> {
+        e_raw(unsafe {
+            syscall!(
+                NANOSLEEP,
+                core::ptr::from_ref(rqtp),
+                rmtp.map(|mut x| x.as_mut_ptr()).unwrap_or(ptr::null_mut())
+            )
+        })
+        .map(|_| ())
     }
 
     fn openat(dirfd: c_int, path: CStr, oflag: c_int, mode: mode_t) -> Result<c_int> {
@@ -530,13 +552,49 @@ impl Pal for Sys {
         e_raw(unsafe { syscall!(PIPE2, fildes.as_mut_ptr(), flags) }).map(|_| ())
     }
 
+    fn poll(fds: &mut [pollfd], timeout: c_int) -> Result<c_int> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            e_raw(unsafe { syscall!(POLL, fds.as_mut_ptr(), fds.len(), timeout) })
+                .map(|count| count as c_int)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let ts = (timeout >= 0).then(|| timespec {
+                tv_sec: (timeout / 1000) as time_t,
+                tv_nsec: ((timeout % 1000) * 1_000_000) as c_long,
+            });
+
+            Sys::ppoll(fds, ts.as_ref(), None)
+        }
+    }
+
+    fn ppoll(
+        fds: &mut [pollfd],
+        timeout: Option<&timespec>,
+        sigmask: Option<&sigset_t>,
+    ) -> Result<c_int> {
+        let sigsetsize: size_t = mem::size_of::<sigset_t>();
+        e_raw(unsafe {
+            syscall!(
+                PPOLL,
+                fds.as_mut_ptr(),
+                fds.len(),
+                timeout.map(ptr::from_ref).unwrap_or(ptr::null()),
+                sigmask.map(ptr::from_ref).unwrap_or(ptr::null()),
+                sigsetsize
+            )
+        })
+        .map(|count| count as c_int)
+    }
+
     fn posix_fallocate(fd: c_int, offset: u64, length: NonZeroU64) -> Result<()> {
         let length = length.get();
         e_raw(unsafe { syscall!(FALLOCATE, fd, 0, offset, length) }).map(|_| ())
     }
 
     fn posix_getdents(fildes: c_int, buf: &mut [u8]) -> Result<usize> {
-        let current_offset = Self::lseek(fildes, 0, SEEK_CUR)? as u64;
+        let current_offset = Self::lseek(fildes, 0, SEEK_CUR)?.cast_unsigned();
         let bytes_read = Self::getdents(fildes, buf, current_offset)?;
         if bytes_read == 0 {
             return Ok(0);
@@ -692,6 +750,10 @@ impl Pal for Sys {
         e_raw(unsafe { syscall!(PREAD64, fildes, buf.as_mut_ptr(), buf.len(), off) })
     }
 
+    unsafe fn readv(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        e_raw(unsafe { syscall!(READV, fildes, iov, iovcnt) })
+    }
+
     fn readlinkat(dirfd: c_int, pathname: CStr, out: &mut [u8]) -> Result<usize> {
         e_raw(unsafe {
             syscall!(
@@ -835,6 +897,10 @@ impl Pal for Sys {
     }
     fn pwrite(fildes: c_int, buf: &[u8], off: off_t) -> Result<usize> {
         e_raw(unsafe { syscall!(PWRITE64, fildes, buf.as_ptr(), buf.len(), off) })
+    }
+
+    unsafe fn writev(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        e_raw(unsafe { syscall!(WRITEV, fildes, iov, iovcnt) })
     }
 
     fn verify() -> bool {

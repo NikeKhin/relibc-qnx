@@ -20,8 +20,7 @@ use crate::{
         errno::{self, ENAMETOOLONG},
         fcntl, limits,
         signal::{sigprocmask, sigsuspend},
-        stdlib::getenv,
-        sys_ioctl, sys_resource,
+        stdlib, sys_ioctl, sys_resource,
         sys_select::timeval,
         sys_time, sys_utsname, termios,
         time::timespec,
@@ -392,9 +391,8 @@ pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *mut c_char) -
     } else {
         let mut error = errno::ENOENT;
 
-        let path_env = unsafe { getenv(c"PATH".as_ptr()) };
-        if !path_env.is_null() {
-            let path_env = unsafe { CStr::from_ptr(path_env) };
+        let path_env = stdlib::getenv_cstr(c"PATH");
+        if let Some(path_env) = path_env {
             for program_buf in PathSearchIter::new(file.to_bytes(), &path_env) {
                 // SAFETY: CStr::from_ptr().to_bytes() always stop at null, no need to check again
                 let program_c =
@@ -550,10 +548,7 @@ pub extern "C" fn getdtablesize() -> c_int {
         };
         if r == 0 {
             let cur = unsafe { lim.assume_init() }.rlim_cur;
-            return match cur {
-                c if c < i32::MAX as u64 => c as i32,
-                _ => i32::MAX,
-            };
+            return i32::try_from(cur).unwrap_or(i32::MAX);
         }
     }
     -1
@@ -566,10 +561,24 @@ pub extern "C" fn getegid() -> gid_t {
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/getentropy.html>.
-// #[unsafe(no_mangle)]
-#[expect(unused_variables, reason = "function not yet implemented")]
+#[unsafe(no_mangle)]
 pub extern "C" fn getentropy(buffer: *mut c_void, length: size_t) -> c_int {
-    unimplemented!();
+    if length
+        > usize::try_from(limits::GETENTROPY_MAX.cast_unsigned())
+            .expect("GETENTROPY_MAX is within usize")
+    {
+        // required by posix, also by linux to guarantee assert satisfied
+        return Err(Errno(EINVAL)).or_minus_one_errno();
+    }
+    Sys::getrandom(
+        unsafe { slice::from_raw_parts_mut(buffer.cast::<u8>(), length) },
+        0,
+    )
+    .map(|s| {
+        assert_eq!(s, length);
+        0
+    })
+    .or_minus_one_errno()
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/geteuid.html>.
@@ -821,8 +830,8 @@ pub unsafe extern "C" fn linkat(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lockf(fildes: c_int, function: c_int, size: off_t) -> c_int {
     let mut fl = fcntl::flock {
-        l_type: fcntl::F_WRLCK as c_short,
-        l_whence: SEEK_CUR as c_short,
+        l_type: c_short::try_from(fcntl::F_WRLCK).expect("constant value within bounds"),
+        l_whence: c_short::try_from(SEEK_CUR).expect("constant value within bounds"),
         l_start: 0,
         l_len: size,
         l_pid: -1,
@@ -830,18 +839,20 @@ pub unsafe extern "C" fn lockf(fildes: c_int, function: c_int, size: off_t) -> c
 
     match function {
         F_TEST => {
-            fl.l_type = fcntl::F_RDLCK as c_short;
+            fl.l_type = c_short::try_from(fcntl::F_RDLCK).expect("constant value within bounds");
             if unsafe { fcntl::fcntl(fildes, fcntl::F_GETLK, &raw mut fl as c_ulonglong) } < 0 {
                 return -1;
             }
-            if fl.l_type == fcntl::F_UNLCK as c_short || fl.l_pid == getpid() {
+            if fl.l_type == c_short::try_from(fcntl::F_UNLCK).expect("constant value within bounds")
+                || fl.l_pid == getpid()
+            {
                 return 0;
             }
             platform::ERRNO.set(errno::EACCES);
             -1
         }
         F_ULOCK => {
-            fl.l_type = fcntl::F_UNLCK as c_short;
+            fl.l_type = c_short::try_from(fcntl::F_UNLCK).expect("constant value within bounds");
             unsafe { fcntl::fcntl(fildes, fcntl::F_SETLK, &raw mut fl as c_ulonglong) }
         }
         F_TLOCK => unsafe { fcntl::fcntl(fildes, fcntl::F_SETLK, &raw mut fl as c_ulonglong) },
@@ -1189,8 +1200,8 @@ pub extern "C" fn sleep(seconds: c_uint) -> c_uint {
     // If sleep() returns because the requested time has elapsed, the value returned shall be 0.
     // If sleep() returns due to delivery of a signal, the return value shall be the "unslept" amount
     // (the requested time minus the time actually slept) in seconds.
-    match unsafe { Sys::nanosleep(&raw const rqtp, &raw mut rmtp) } {
-        Err(Errno(_)) => rmtp.tv_sec as c_uint,
+    match Sys::nanosleep(&rqtp, Some(Out::from_mut(&mut rmtp))) {
+        Err(Errno(_)) => c_uint::try_from(rmtp.tv_sec).expect("within bounds"),
         _ => 0,
     }
 }
@@ -1336,14 +1347,21 @@ pub extern "C" fn ttyname_r(fildes: c_int, name: *mut c_char, namesize: size_t) 
 #[unsafe(no_mangle)]
 pub extern "C" fn ualarm(usecs: useconds_t, interval: useconds_t) -> useconds_t {
     // TODO setitimer is unimplemented on Redox and obsolete
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    let (val_usec, int_usec) = (suseconds_t::from(usecs), suseconds_t::from(interval));
+    #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+    let (val_usec, int_usec) = (
+        suseconds_t::try_from(usecs).unwrap_or(suseconds_t::MAX),
+        suseconds_t::try_from(interval).unwrap_or(suseconds_t::MAX),
+    );
     let mut timer = sys_time::itimerval {
         it_value: timeval {
             tv_sec: 0,
-            tv_usec: usecs as suseconds_t,
+            tv_usec: val_usec,
         },
         it_interval: timeval {
             tv_sec: 0,
-            tv_usec: interval as suseconds_t,
+            tv_usec: int_usec,
         },
     };
     let errno_backup = platform::ERRNO.get();
@@ -1353,7 +1371,8 @@ pub extern "C" fn ualarm(usecs: useconds_t, interval: useconds_t) -> useconds_t 
         {
             0
         } else {
-            timer.it_value.tv_sec as useconds_t * 1_000_000 + timer.it_value.tv_usec as useconds_t
+            useconds_t::try_from(timer.it_value.tv_sec).unwrap_or(useconds_t::MAX) * 1_000_000
+                + useconds_t::try_from(timer.it_value.tv_usec).unwrap_or(useconds_t::MAX)
         };
     platform::ERRNO.set(errno_backup);
 
@@ -1392,10 +1411,7 @@ pub extern "C" fn usleep(useconds: useconds_t) -> c_int {
         tv_sec: time_t::from(useconds / 1_000_000),
         tv_nsec,
     };
-    let rmtp = ptr::null_mut();
-    unsafe { Sys::nanosleep(&raw const rqtp, rmtp) }
-        .map(|()| 0)
-        .or_minus_one_errno()
+    Sys::nanosleep(&rqtp, None).map(|()| 0).or_minus_one_errno()
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/009695399/functions/vfork.html>.
@@ -1417,7 +1433,7 @@ unsafe fn with_argv(
     let argc = 1 + unsafe {
         let mut copy = va.clone();
         core::iter::from_fn(|| Some(copy.next_arg::<*const c_char>()))
-            .position(|p| p.is_null())
+            .position(<*const c_char>::is_null)
             .unwrap()
     };
 

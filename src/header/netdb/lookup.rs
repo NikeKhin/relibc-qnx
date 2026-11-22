@@ -2,6 +2,7 @@ use alloc::{string::ToString, vec::Vec};
 
 use crate::{
     error::Errno,
+    header::{sys_select, sys_socket},
     out::Out,
     platform::{Pal, PalSocket, Sys},
 };
@@ -27,6 +28,9 @@ pub fn lookup_host(host: &str) -> Result<LookupHost, Errno> {
         return Ok(vec![in_addr {
             s_addr: host_direct_addr,
         }]);
+    }
+    if host.is_empty() {
+        return Ok(vec![]);
     }
 
     let dns_string = get_dns_server()?;
@@ -62,7 +66,25 @@ pub fn lookup_host(host: &str) -> Result<LookupHost, Errno> {
     };
 
     let sock = Sys::socket(AF_INET, SOCK_DGRAM, i32::from(IPPROTO_UDP))?;
+
+    let timeout = sys_select::timeval {
+        tv_sec: 7, // TODO: hardcoded, make it configurable?
+        tv_usec: 0,
+    };
+
     let _ = Sys::connect(sock, &dest)?;
+    let _ = Sys::setsockopt(
+        sock,
+        sys_socket::constants::SOL_SOCKET,
+        sys_socket::constants::SO_RCVTIMEO,
+        unsafe {
+            core::slice::from_raw_parts(
+                (&raw const timeout).cast::<u8>(),
+                core::mem::size_of::<sys_select::timeval>(),
+            )
+        },
+    );
+
     Sys::sendto(sock, &packet_data, 0, None)?;
 
     let mut buf = vec![0u8; 65536];
@@ -93,7 +115,10 @@ pub fn lookup_host(host: &str) -> Result<LookupHost, Errno> {
     Ok(addrs)
 }
 
-pub fn lookup_addr(addr: in_addr) -> Result<Vec<Vec<u8>>, Errno> {
+pub fn lookup_addr(addr: &in_addr) -> Result<Vec<Vec<u8>>, Errno> {
+    if addr.s_addr == 0 {
+        return Ok(vec![]);
+    }
     let dns_string = get_dns_server()?;
 
     if let Some(dns_addr) = parse_ipv4_string(&dns_string) {
@@ -133,7 +158,24 @@ pub fn lookup_addr(addr: in_addr) -> Result<Vec<Vec<u8>>, Errno> {
         };
 
         let sock = Sys::socket(AF_INET, SOCK_DGRAM, i32::from(IPPROTO_UDP))?;
+
+        let timeout = sys_select::timeval {
+            tv_sec: 7, // TODO: hardcoded, make it configurable?
+            tv_usec: 0,
+        };
+
         let _ = Sys::connect(sock, &dest_addr)?;
+        let _ = Sys::setsockopt(
+            sock,
+            sys_socket::constants::SOL_SOCKET,
+            sys_socket::constants::SO_RCVTIMEO,
+            unsafe {
+                core::slice::from_raw_parts(
+                    (&raw const timeout).cast::<u8>(),
+                    core::mem::size_of::<sys_select::timeval>(),
+                )
+            },
+        );
 
         let _bytes_sent = Sys::sendto(sock, &packet_data, 0, None)?;
 

@@ -598,7 +598,7 @@ pub unsafe extern "C" fn fgets(
     }
 
     let mut out = original;
-    let max = max as usize;
+    let max = usize::try_from(max).expect("max should be positive");
     let mut left = max.saturating_sub(1); // Make space for the terminating NUL-byte
     let mut wrote = false;
 
@@ -804,7 +804,7 @@ pub unsafe extern "C" fn freopen(
                 fcntl::fcntl(
                     *stream.file,
                     fcntl::F_SETFD,
-                    fcntl::FD_CLOEXEC as c_ulonglong,
+                    c_ulonglong::try_from(fcntl::FD_CLOEXEC).expect("FD_CLOEXEC within bounds"),
                 )
             };
         }
@@ -821,7 +821,8 @@ pub unsafe extern "C" fn freopen(
             unsafe { fclose(stream) };
             return ptr::null_mut();
         }
-        let new = unsafe { &mut *new }; // Should be safe, new is not null
+        // SAFETY: Should be safe, new is not null
+        let new = unsafe { &mut *new };
         if *new.file == *stream.file {
             new.file.fd = -1;
         } else if Sys::dup2(*new.file, *stream.file).or_minus_one_errno() == -1
@@ -875,9 +876,8 @@ pub unsafe fn fseek_locked(stream: &mut FILE, mut off: off_t, whence: c_int) -> 
         return -1;
     }
 
-    let err = Sys::lseek(*stream.file, off, whence).or_minus_one_errno();
-    if err < 0 {
-        return err as c_int;
+    if Sys::lseek(*stream.file, off, whence).or_minus_one_errno() < 0 {
+        return -1;
     }
 
     stream.flags &= !(F_EOF | F_ERR);
@@ -1257,14 +1257,15 @@ pub unsafe extern "C" fn puts(s: *const c_char) -> c_int {
 #[deprecated]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn putw(w: c_int, stream: *mut FILE) -> c_int {
-    (unsafe {
+    c_int::try_from(unsafe {
         fwrite(
             ptr::from_ref::<c_int>(&w).cast(),
             mem::size_of_val(&w),
             1,
             stream,
         )
-    }) as i32
+    })
+    .expect("output always fits in c_int")
         - 1
 }
 
@@ -1592,8 +1593,15 @@ pub unsafe extern "C" fn vasprintf(
 ) -> c_int {
     let mut alloc_writer = CVec::new();
     let ret = unsafe { printf::printf(&mut alloc_writer, CStr::from_ptr(format), ap) };
-    alloc_writer.push(0).unwrap();
-    alloc_writer.shrink_to_fit().unwrap();
+    if ret < 0 {
+        return ret;
+    }
+    if let Err(crate::c_vec::AllocError) = alloc_writer.push(0)
+        && let Err(crate::c_vec::AllocError) = alloc_writer.shrink_to_fit()
+    {
+        platform::ERRNO.set(errno::ENOMEM);
+        return -1;
+    }
     unsafe { *strp = alloc_writer.leak().cast::<c_char>() };
     ret
 }

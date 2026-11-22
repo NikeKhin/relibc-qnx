@@ -139,14 +139,14 @@ impl<R: Seek> BufReader<R> {
     pub fn seek_relative(&mut self, offset: i64) -> io::Result<()> {
         let pos = self.pos as u64;
         if offset < 0 {
-            if let Some(new_pos) = pos.checked_sub((-offset) as u64) {
-                self.pos = new_pos as usize;
+            if let Some(new_pos) = pos.checked_sub((-offset).cast_unsigned()) {
+                self.pos = usize::try_from(new_pos).expect("within bounds");
                 return Ok(());
             }
-        } else if let Some(new_pos) = pos.checked_add(offset as u64)
+        } else if let Some(new_pos) = pos.checked_add(offset.cast_unsigned())
             && new_pos <= self.cap as u64
         {
-            self.pos = new_pos as usize;
+            self.pos = usize::try_from(new_pos).expect("within bounds");
             return Ok(());
         }
         self.seek(SeekFrom::Current(offset)).map(|_| ())
@@ -735,7 +735,7 @@ impl<W: Write> Write for LineWriter<W> {
         // some data then we *must* report that we wrote that data, so future
         // errors are ignored. We set our internal `need_flush` flag, though, in
         // case flushing fails and we need to try it first next time.
-        let n = self.inner.write(&buf[..i + 1])?;
+        let n = self.inner.write(&buf[..=i])?;
         self.need_flush = true;
         if self.flush().is_err() || n != i + 1 {
             return Ok(n);

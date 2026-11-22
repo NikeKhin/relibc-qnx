@@ -99,7 +99,7 @@ pub fn fexec_impl(
         let current_addrspace_fd = thread_fd.dup_into_upper(b"addrspace")?;
         current_addrspace_fd.dup_into_upper(b"empty")?
     };
-    grants_fd.fcntl(syscall::F_SETFD, O_CLOEXEC)?;
+    grants_fd.fcntl(redox_protocols::protocol::F_SETFD, O_CLOEXEC)?;
 
     // Never allow more than 1 MiB of program headers.
     const MAX_PH_SIZE: usize = 1024 * 1024;
@@ -491,7 +491,7 @@ pub fn fexec_impl(
         // set the active file table.
         let _siglock = crate::signal::tmp_disable_signals();
         let fds_to_close = {
-            let guard = crate::current_filetable();
+            let guard = crate::current_filetable().inner.lock();
             let mut fds = alloc::vec::Vec::new();
             for (fd, flags) in guard.iter() {
                 if fd == addrspace_selection_fd.as_raw_fd() {
@@ -522,7 +522,7 @@ pub fn fexec_impl(
             );
         }
         {
-            let mut guard = crate::current_filetable();
+            let mut guard = crate::current_filetable().inner.lock();
             for fd in fds_to_close {
                 let _ = guard.remove(fd);
             }
@@ -532,11 +532,7 @@ pub fn fexec_impl(
             deactivate_tcb(thread_fd)?;
         }
 
-        let old_filetable_fd = {
-            let mut guard = crate::current_filetable();
-            guard.take()
-        };
-        drop(old_filetable_fd);
+        drop(crate::current_filetable().take());
 
         // Dropping this FD will cause the address space switch.
         drop(addrspace_selection_fd);
@@ -815,9 +811,13 @@ impl FdGuard<false> {
     pub fn to_upper(self) -> Result<FdGuardUpper> {
         // Move to upper table if necessary
         let fd = if self.fd & syscall::UPPER_FDTBL_TAG == 0 {
-            //TODO: use F_DUPFD_CLOEXEC?
-            let fd = crate::sys::fcntl(self.fd, syscall::F_DUPFD, syscall::UPPER_FDTBL_TAG)?;
-            drop(self);
+            let fd = crate::sys::fdcntl(
+                self.fd,
+                None,
+                syscall::FileTableVerb::Move,
+                syscall::UPPER_FDTBL_TAG,
+            )?;
+            self.take();
             fd
         } else {
             self.take()
@@ -974,6 +974,7 @@ pub enum ForkArgs<'a> {
     Init {
         this_thr_fd: &'a FdGuardUpper,
         auth: &'a FdGuard,
+        name: &'a str,
     },
     Managed,
 }
@@ -1144,17 +1145,27 @@ pub fn fork_inner(initial_rsp: *mut usize, args: &ForkArgs) -> Result<usize> {
             new_env_regs_fd.write(&env_regs)?;
         }
     }
-    {
+    // TODO: This shouldn't be opt-in, make sure in the kernel that userspace can't create cyclic
+    // references to leak fds.
+    let (new_filetable_weak_fd, new_filetable_fd_idx) = {
         // TODO: Use file descriptor forwarding or something similar to avoid copying the file
         // table in the kernel.
         let new_filetable_sel_fd = new_thr_fd.dup_into_upper(b"current-filetable")?;
         new_filetable_sel_fd.write(&usize::to_ne_bytes(new_filetable_fd.as_raw_fd()))?;
-    }
-    new_filetable_fd.call_wo(
-        &new_filetable_fd.as_raw_fd().to_ne_bytes(),
-        syscall::CallFlags::FD | syscall::CallFlags::FD_CLONE,
-        &[new_filetable_fd.as_raw_fd() as u64],
+        // downgrade to a kernel handle with only a Weak reference to the FdTbl
+        let weak = new_filetable_fd.dup_into_upper(b"refresh")?;
+        let new_filetable_fd_idx = new_filetable_fd.as_raw_fd();
+
+        drop(new_filetable_fd);
+        (weak, new_filetable_fd_idx)
+    };
+
+    new_filetable_weak_fd.call_wo(
+        &new_filetable_weak_fd.as_raw_fd().to_ne_bytes(),
+        syscall::CallFlags::FD,
+        &[new_filetable_fd_idx as u64],
     )?;
+
     let start_fd = new_thr_fd.dup_into_upper(b"start")?;
     start_fd.write(&[0])?;
     Ok(new_pid)
@@ -1188,7 +1199,11 @@ pub fn new_child_process(args: &ForkArgs<'_>) -> Result<NewChildProc> {
         ForkArgs::Init { .. } => unreachable!(),
 
         #[cfg(not(feature = "proc"))]
-        ForkArgs::Init { this_thr_fd, auth } => {
+        ForkArgs::Init {
+            this_thr_fd: _,
+            auth,
+            name,
+        } => {
             let thr_fd = auth.dup_into_upper(b"new-context")?;
             let buf = syscall::ProcSchemeAttrs {
                 pid: 0,
@@ -1197,8 +1212,8 @@ pub fn new_child_process(args: &ForkArgs<'_>) -> Result<NewChildProc> {
                 prio: !0, // Value is overwritten later
                 debug_name: {
                     let mut buf = [0; 32];
-                    let src = b"[init]";
-                    buf[..src.len()].copy_from_slice(src);
+                    let len = name.len().min(buf.len());
+                    buf[..len].copy_from_slice(&name.as_bytes()[..len]);
                     buf
                 },
             };

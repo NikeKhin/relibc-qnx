@@ -4,9 +4,8 @@
 
 use crate::{
     header::{
-        ctype::{self, isspace},
         errno::{EINVAL, ERANGE},
-        stdlib::{convert_hex, convert_integer, convert_octal, detect_base, is_positive},
+        stdlib::{convert_hex, convert_integer, convert_octal, detect_base, parse_sign},
     },
     platform::{
         self,
@@ -65,8 +64,8 @@ pub unsafe extern "C" fn strtoimax(
         false,
         intmax_t::MAX,
         intmax_t::MIN,
-        nptr,
-        endptr,
+        unsafe { CStr::from_ptr(nptr) },
+        unsafe { endptr.as_mut() },
         base
     )
 }
@@ -89,8 +88,8 @@ pub unsafe extern "C" fn strtoumax(
         false,
         uintmax_t::MAX,
         uintmax_t::MIN,
-        nptr,
-        endptr,
+        unsafe { CStr::from_ptr(nptr) },
+        unsafe { endptr.as_mut() },
         base
     )
 }
@@ -102,19 +101,18 @@ pub unsafe extern "C" fn strtoumax(
 ///
 /// Upon success, returns the converted value. If no conversion could be
 /// performed, returns `0`.
-#[expect(clippy::cast_lossless)] // not all users of `wcsto_impl!` are lossless
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wcstoimax(
-    mut nptr: *const wchar_t,
+    nptr: *const wchar_t,
     endptr: *mut *mut wchar_t,
     base: c_int,
 ) -> intmax_t {
-    skipws!(nptr);
-    let result = wcsto_impl!(intmax_t, nptr, base);
-    if !endptr.is_null() {
-        unsafe { *endptr = nptr.cast_mut() };
-    }
-    result
+    wcsto_impl!(
+        intmax_t,
+        unsafe { WStr::from_ptr(nptr) },
+        unsafe { endptr.as_mut() },
+        base
+    )
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/wcstoimax.html>.
@@ -126,14 +124,14 @@ pub unsafe extern "C" fn wcstoimax(
 /// performed, returns `0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wcstoumax(
-    mut nptr: *const wchar_t,
+    nptr: *const wchar_t,
     endptr: *mut *mut wchar_t,
     base: c_int,
 ) -> uintmax_t {
-    skipws!(nptr);
-    let result = wcsto_impl!(uintmax_t, nptr, base);
-    if !endptr.is_null() {
-        unsafe { *endptr = nptr.cast_mut() };
-    }
-    result
+    wcsto_impl!(
+        uintmax_t,
+        unsafe { WStr::from_ptr(nptr) },
+        unsafe { endptr.as_mut() },
+        base
+    )
 }

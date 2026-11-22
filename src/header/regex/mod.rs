@@ -64,7 +64,7 @@ pub unsafe extern "C" fn regcomp(out: *mut regex_t, pat: *const c_char, cflags: 
 
     match res {
         Ok(branches) => {
-            let re_nsub = PosixRegex::new(Cow::Borrowed(&branches)).count_groups();
+            let re_nsub = PosixRegex::new(Cow::Borrowed(&branches)).count_groups() - 1;
             unsafe {
                 *out = regex_t {
                     ptr: Box::into_raw(Box::new(branches)).cast::<c_void>(),
@@ -75,9 +75,11 @@ pub unsafe extern "C" fn regcomp(out: *mut regex_t, pat: *const c_char, cflags: 
             };
             0
         }
-        Err(CompileError::EmptyRepetition)
-        | Err(CompileError::IntegerOverflow)
-        | Err(CompileError::IllegalRange) => REG_BADBR,
+        Err(
+            CompileError::EmptyRepetition
+            | CompileError::IntegerOverflow
+            | CompileError::IllegalRange,
+        ) => REG_BADBR,
         Err(CompileError::UnclosedRepetition) => REG_EBRACE,
         Err(CompileError::LeadingRepetition) => REG_BADRPT,
         Err(CompileError::UnknownCollation) => REG_ECOLLATE,

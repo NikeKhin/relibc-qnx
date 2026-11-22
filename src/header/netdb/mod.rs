@@ -6,29 +6,22 @@ mod dns;
 
 use core::{cell::Cell, fmt::Write, mem, net::Ipv4Addr, ptr, str};
 
-use alloc::{boxed::Box, str::SplitWhitespace, string::ToString, vec::Vec};
+use alloc::{boxed::Box, string::ToString};
 
 use crate::{
     c_str::{CStr, OwnedThinCStr},
-    error::{Errno, ResultExt},
+    error::Errno,
     header::{
-        arpa_inet::inet_aton,
-        bits_arpainet::{htons, ntohl},
+        bits_arpainet::htons,
         bits_safamily_t::sa_family_t,
-        errno::*,
-        fcntl::O_RDONLY,
+        errno::{ENOENT, ETIMEDOUT},
         netinet_in::{in_addr, sockaddr_in},
-        stdlib::atoi,
-        strings::strcasecmp,
-        sys_socket::{constants::AF_INET, sockaddr, socklen_t},
-        unistd::SEEK_SET,
+        sys_socket::{
+            constants::{AF_INET, AF_INET6, AF_UNSPEC},
+            sockaddr, socklen_t,
+        },
     },
-    platform::{
-        self, Pal, Sys,
-        rlb::{Line, RawLineBuffer},
-        types::{c_char, c_int, c_void, uint32_t},
-    },
-    raw_cell::RawCell,
+    platform::types::{c_char, c_int, c_void, uint32_t},
 };
 
 #[cfg(any(target_os = "linux", target_os = "nto"))]
@@ -42,8 +35,17 @@ pub mod sys;
 pub use self::host::*;
 pub mod host;
 
+pub use self::net::*;
+pub mod net;
+
 pub use self::lookup::*;
 pub mod lookup;
+
+pub use self::proto::*;
+pub mod proto;
+
+pub use self::serv::*;
+pub mod serv;
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/netdb.h.html>.
 #[repr(C)]
@@ -57,6 +59,7 @@ pub struct hostent {
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/netdb.h.html>.
 #[repr(C)]
+#[derive(Default)]
 pub struct netent {
     n_name: *mut c_char,         /* official name of net */
     n_aliases: *mut *mut c_char, /* alias list */
@@ -114,7 +117,7 @@ impl addrinfo {
             ai_addrlen: wrapped.sockaddr.len().try_into().unwrap(),
             ai_canonname: wrapped
                 .canonname
-                .map_or_else(core::ptr::null_mut, |s| s.into_ptr()),
+                .map_or_else(core::ptr::null_mut, OwnedThinCStr::into_ptr),
             ai_addr: Box::into_raw(wrapped.sockaddr).as_mut_ptr().cast(),
             ai_next: core::ptr::null_mut(),
         }
@@ -142,16 +145,24 @@ impl addrinfo {
     }
 }
 
+/// Socket address is inteded for `bind()`.
 pub const AI_PASSIVE: c_int = 0x0001;
+/// Request for cannonical name.
 pub const AI_CANONNAME: c_int = 0x0002;
+/// Return numeric host address as name.
 pub const AI_NUMERICHOST: c_int = 0x0004;
+/// If no IPv6 addresses are found, query for IPv4 addresses and return them to
+/// the caller as IPv4-mapped IPv6 addresses.
 pub const AI_V4MAPPED: c_int = 0x0008;
+/// Query for both IPv4 and IPv6 addresses.
 pub const AI_ALL: c_int = 0x0010;
+/// Query for IPv4 addresses only when an IPv4 address is configured; query for
+/// IPv6 addresses only when an IPv6 address is configured.
 pub const AI_ADDRCONFIG: c_int = 0x0020;
+/// Inhibit service name resolution.
 pub const AI_NUMERICSERV: c_int = 0x0400;
 
 #[repr(i32)]
-#[allow(non_camel_case_types)]
 enum AddrInfoErr {
     EAI_BADFLAGS = -1,
     EAI_NONAME = -2,
@@ -173,102 +184,96 @@ impl From<Errno> for AddrInfoErr {
     }
 }
 
+/// The flags had an invalid value.
 pub const EAI_BADFLAGS: c_int = -1;
+/// The name does not resolve for the supplied parameters.
+/// `NI_NAMEREQD` is set and the host's name cannot be located, or both
+/// `nodename` and `servname` were null.
 pub const EAI_NONAME: c_int = -2;
+/// The name could not be resolved at this time. Future attempts may succeed.
 pub const EAI_AGAIN: c_int = -3;
+/// A non-recoverable error occurred.
 pub const EAI_FAIL: c_int = -4;
+// TODO should be guarded by _GNU_SOURCE
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getaddrinfo.3.html>.
+/// The specified network host exists but does not have any network addresses
+/// defined.
 pub const EAI_NODATA: c_int = -5;
+/// The address family was not recognized or the address length was invalid for
+/// the specified family.
 pub const EAI_FAMILY: c_int = -6;
+/// The intended socket type was not recognized.
 pub const EAI_SOCKTYPE: c_int = -7;
+/// The service passed was not recognized for the specified socket type.
 pub const EAI_SERVICE: c_int = -8;
+// TODO should be guarded by _GNU_SOURCE
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getaddrinfo.3.html>.
+/// The specified network host does not have any network adresses in the
+/// requested address family.
 pub const EAI_ADDRFAMILY: c_int = -9;
+/// There was a memory allocation failure.
 pub const EAI_MEMORY: c_int = -10;
+/// A system error occurred. The error code can be found in errno.
 pub const EAI_SYSTEM: c_int = -11;
+/// An argument buffer overflowed.
 pub const EAI_OVERFLOW: c_int = -12;
 
+// TODO should be guarded by _GNU_SOURCE
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getnameinfo.3.html>.
 pub const NI_MAXHOST: c_int = 1025;
+// TODO should be guarded by _GNU_SOURCE
+/// Non-POSIX, see <https://www.man7.org/linux/man-pages/man3/getnameinfo.3.html>.
 pub const NI_MAXSERV: c_int = 32;
 
+/// The numeric form of the node's address is returned instead of its name.
 pub const NI_NUMERICHOST: c_int = 0x0001;
+/// The numeric form of the service address is returned instead of its name.
 pub const NI_NUMERICSERV: c_int = 0x0002;
+/// Only the nodename portion of the FQDN is returned for local hosts.
 pub const NI_NOFQDN: c_int = 0x0004;
+/// Return an error if the node's name cannot be located in the database.
 pub const NI_NAMEREQD: c_int = 0x0008;
+/// Indicates that the service is a datagram service (`SOCK_DGRAM`).
 pub const NI_DGRAM: c_int = 0x0010;
-
-static mut NETDB: c_int = 0;
-pub static mut NET_ENTRY: netent = netent {
-    n_name: ptr::null_mut(),
-    n_aliases: ptr::null_mut(),
-    n_addrtype: 0,
-    n_net: 0,
-};
-pub static NET_NAME: RawCell<Option<Vec<u8>>> = RawCell::new(None);
-pub static NET_ALIASES: RawCell<Option<Vec<Vec<u8>>>> = RawCell::new(None);
-pub static mut NET_ADDR: Option<u32> = None;
-static mut N_POS: usize = 0;
-static mut NET_STAYOPEN: c_int = 0;
 
 #[thread_local]
 pub static H_ERRNO: Cell<c_int> = Cell::new(0);
 const H_UNSET: c_int = 0;
+/// Removed in POSIX issue 7.
 pub const HOST_NOT_FOUND: c_int = 1;
+/// Removed in POSIX issue 7.
 pub const NO_DATA: c_int = 2;
+/// Removed in POSIX issue 7.
 pub const NO_RECOVERY: c_int = 3;
+/// Removed in POSIX issue 7.
 pub const TRY_AGAIN: c_int = 4;
 
 // Expected length of addresses
 const SOCKLEN_AF_INET4: socklen_t = 4;
 const SOCKLEN_AF_INET6: socklen_t = 16;
 
-static mut PROTODB: c_int = 0;
-static mut PROTO_ENTRY: protoent = protoent {
-    p_name: ptr::null_mut(),
-    p_aliases: ptr::null_mut(),
-    p_proto: 0 as c_int,
-};
-static PROTO_NAME: RawCell<Option<Vec<u8>>> = RawCell::new(None);
-static PROTO_ALIASES: RawCell<Option<Vec<Vec<u8>>>> = RawCell::new(None);
-static mut PROTO_NUM: Option<c_int> = None;
-static mut P_POS: usize = 0;
-static mut PROTO_STAYOPEN: c_int = 0;
-
-static mut SERVDB: c_int = 0;
-static mut SERV_ENTRY: servent = servent {
-    s_name: ptr::null_mut(),
-    s_aliases: ptr::null_mut(),
-    s_port: 0 as c_int,
-    s_proto: ptr::null_mut(),
-};
-static SERV_NAME: RawCell<Option<Vec<u8>>> = RawCell::new(None);
-static SERV_ALIASES: RawCell<Option<Vec<Vec<u8>>>> = RawCell::new(None);
-static mut SERV_PORT: Option<c_int> = None;
-static SERV_PROTO: RawCell<Option<Vec<u8>>> = RawCell::new(None);
-static mut S_POS: usize = 0;
-static mut SERV_STAYOPEN: c_int = 0;
-
-fn bytes_to_box_str(bytes: &[u8]) -> Box<str> {
-    Box::from(core::str::from_utf8(bytes).unwrap_or(""))
+/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endhostent.html>.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn endhostent() {
+    HOST_STATE.lock().endhostent();
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endnetent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn endnetent() {
-    if let Ok(()) = Sys::close(unsafe { NETDB }) {}; // TODO handle error
-    unsafe { NETDB = 0 };
+    NET_STATE.lock().endnetent();
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endprotoent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn endprotoent() {
-    if let Ok(()) = Sys::close(unsafe { PROTODB }) {}; // TODO handle error
-    unsafe { PROTODB = 0 };
+    PROTO_STATE.lock().endprotoent();
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endservent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn endservent() {
-    if let Ok(()) = Sys::close(unsafe { SERVDB }) {}; // TODO handle error
-    unsafe { SERVDB = 0 };
+    SERV_STATE.lock().endservent();
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/009696799/functions/gethostbyaddr.html>.
@@ -306,79 +311,23 @@ pub unsafe extern "C" fn gethostbyaddr(
     //     H_ERRNO.set(NO_RECOVERY);
     //     return ptr::null_mut();
     // }
-    if length != SOCKLEN_AF_INET4 {
+    if length != SOCKLEN_AF_INET4 || format != AF_INET {
         H_ERRNO.set(NO_RECOVERY);
         return ptr::null_mut();
     }
     let addr: in_addr = unsafe { (*(v as *mut in_addr)).clone() };
 
     // check the hosts file first
-    let mut p: *mut hostent;
-    unsafe { sethostent(HOST_STAYOPEN) };
-    while {
-        p = unsafe { gethostent() };
-        !p.is_null()
-    } {
-        let mut cp = unsafe { (*p).h_addr_list };
-        loop {
-            if cp.is_null() {
-                break;
-            }
-            if (unsafe { *cp }).is_null() {
-                break;
-            }
-            let mut cp_slice: [c_char; 4] = [0; 4];
-            unsafe { (*cp).copy_to(cp_slice.as_mut_ptr(), 4) };
-            #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
-            let cp_s_addr = unsafe { mem::transmute::<[c_char; 4], u32>(cp_slice) };
-            #[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
-            let cp_s_addr = u32::from_ne_bytes(cp_slice);
-            if cp_s_addr == addr.s_addr {
-                unsafe { sethostent(HOST_STAYOPEN) };
-                return p;
-            }
-            cp = unsafe { cp.add(1) };
-        }
+    if let Some(h) = HOST_STATE.lock().gethostbyaddr_local(addr.s_addr) {
+        return h;
     }
 
-    //TODO actually get aliases
-    let mut _host_aliases: Vec<Vec<u8>> = vec![vec![b'\0']];
-    let mut host_aliases: Vec<*mut c_char> = vec![ptr::null_mut()];
-    unsafe { HOST_ALIASES.unsafe_set(Some(_host_aliases)) };
-
-    match lookup_addr(addr.clone()).map(|host_names| host_names.into_iter().next()) {
-        Ok(Some(host_name)) => {
-            unsafe { _HOST_ADDR_LIST = addr.s_addr.to_ne_bytes() };
-            unsafe {
-                HOST_ADDR_LIST = [(&raw mut _HOST_ADDR_LIST).cast::<c_char>(), ptr::null_mut()]
-            };
-            unsafe { HOST_NAME.unsafe_set(Some(host_name)) };
-            unsafe {
-                HOST_ENTRY = hostent {
-                    h_name: HOST_NAME
-                        .unsafe_mut()
-                        .as_mut()
-                        .unwrap()
-                        .as_mut_ptr()
-                        .cast::<c_char>(),
-                    h_aliases: host_aliases.as_mut_slice().as_mut_ptr(),
-                    h_addrtype: format,
-                    h_length: length as i32,
-                    h_addr_list: (&raw mut HOST_ADDR_LIST).cast(),
-                }
-            };
-            &raw mut HOST_ENTRY
-        }
-        // `glibc` sets errno if an address doesn't have a host name
-        // `musl` uses the address as the host name in said case
-        Ok(None) => {
-            H_ERRNO.set(HOST_NOT_FOUND);
-            ptr::null_mut()
-        }
-        Err(_) => {
-            // TODO: Better error separation in lookup_addr
-            H_ERRNO.set(NO_RECOVERY);
-            ptr::null_mut()
+    let r = lookup_addr(&addr);
+    match HOST_STATE.lock().gethostbyaddr_external(r, addr) {
+        Ok(h) => h,
+        Err(e) => {
+            H_ERRNO.set(e);
+            core::ptr::null_mut()
         }
     }
 }
@@ -402,8 +351,28 @@ pub unsafe extern "C" fn gethostbyaddr(
 #[unsafe(no_mangle)]
 #[deprecated]
 pub unsafe extern "C" fn gethostbyname(name: *const c_char) -> *mut hostent {
-    let name_cstr = unsafe {
-        CStr::from_nullable_ptr(name).expect("gethostbyname() called with a NULL pointer")
+    #[expect(deprecated)]
+    unsafe {
+        gethostbyname2(name, AF_INET)
+    }
+}
+
+/// Non-POSIX, see <https://man7.org/linux/man-pages/man3/gethostbyname.3.html>.
+/// Resolve host information by name or IP address using AF_INET or AF_INET6.
+///
+/// # Deprecation
+/// New code should use [`getaddrinfo`] instead.
+#[unsafe(no_mangle)]
+#[deprecated]
+pub unsafe extern "C" fn gethostbyname2(name: *const c_char, af: c_int) -> *mut hostent {
+    if af != AF_INET {
+        // TODO: AF_INET6 support
+        H_ERRNO.set(NO_RECOVERY);
+        return ptr::null_mut();
+    };
+    let Some(name_cstr) = (unsafe { CStr::from_nullable_ptr(name) }) else {
+        H_ERRNO.set(NO_RECOVERY);
+        return ptr::null_mut();
     };
     let Ok(name_str) = str::from_utf8(name_cstr.to_bytes()) else {
         H_ERRNO.set(NO_RECOVERY);
@@ -422,483 +391,160 @@ pub unsafe extern "C" fn gethostbyname(name: *const c_char) -> *mut hostent {
     }
 
     // check the hosts file first
-    let mut p: *mut hostent;
-    unsafe { sethostent(HOST_STAYOPEN) };
-    while {
-        p = unsafe { gethostent() };
-        !p.is_null()
-    } {
-        if unsafe { strcasecmp((*p).h_name, name) } == 0 {
-            unsafe { sethostent(HOST_STAYOPEN) };
-            return p;
-        }
-        let mut cp = unsafe { (*p).h_aliases };
-        loop {
-            if cp.is_null() {
-                break;
-            }
-            if (unsafe { *cp }).is_null() {
-                break;
-            }
-            if unsafe { strcasecmp(*cp, name) } == 0 {
-                unsafe { sethostent(HOST_STAYOPEN) };
-                return p;
-            }
-            cp = unsafe { cp.add(1) };
-        }
+    if let Some(h) = HOST_STATE
+        .lock()
+        .gethostbyname_local(name_cstr.to_bytes_with_nul())
+    {
+        return h;
     }
 
-    let Ok(host) = lookup_host(name_str) else {
-        H_ERRNO.set(NO_RECOVERY);
-        return ptr::null_mut();
-    };
-    let Some(host_addr) = host.into_iter().next() else {
-        H_ERRNO.set(HOST_NOT_FOUND);
-        return ptr::null_mut();
-    };
-
-    let host_name: Vec<u8> = name_cstr.to_bytes().to_vec();
-    unsafe { HOST_NAME.unsafe_set(Some(host_name)) };
-    unsafe { _HOST_ADDR_LIST = host_addr.s_addr.to_ne_bytes() };
-    unsafe { HOST_ADDR_LIST = [(&raw mut _HOST_ADDR_LIST).cast::<c_char>(), ptr::null_mut()] };
-    unsafe { HOST_ADDR = Some(host_addr) };
-
-    //TODO actually get aliases
-    let mut _host_aliases: Vec<Vec<u8>> = vec![vec![b'\0']];
-    let mut host_aliases: Vec<*mut c_char> = vec![ptr::null_mut(); 2];
-    unsafe { HOST_ALIASES.unsafe_set(Some(_host_aliases)) };
-
-    unsafe {
-        HOST_ENTRY = hostent {
-            h_name: HOST_NAME
-                .unsafe_mut()
-                .as_mut()
-                .unwrap()
-                .as_mut_ptr()
-                .cast::<c_char>(),
-            h_aliases: host_aliases.as_mut_slice().as_mut_ptr(),
-            h_addrtype: AF_INET,
-            h_length: 4,
-            h_addr_list: (&raw mut HOST_ADDR_LIST).cast(),
+    let r = lookup_host(name_str);
+    match HOST_STATE
+        .lock()
+        .gethostbyname_external(r, name_cstr.to_bytes_with_nul())
+    {
+        Ok(h) => h,
+        Err(e) => {
+            H_ERRNO.set(e);
+            core::ptr::null_mut()
         }
-    };
-    unsafe { sethostent(HOST_STAYOPEN) };
-    (&raw mut HOST_ENTRY).cast::<hostent>()
+    }
+}
+
+/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endhostent.html>.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gethostent() -> *mut hostent {
+    HOST_STATE
+        .lock()
+        .gethostent()
+        .unwrap_or(core::ptr::null_mut())
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endnetent.html>.
-#[expect(unused_variables, reason = "function not yet implemented")]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn getnetbyaddr(net: u32, net_type: c_int) -> *mut netent {
-    unimplemented!();
+    match NET_STATE.lock().getnetbyaddr(net, net_type) {
+        Some(n) => n,
+        None => {
+            crate::platform::ERRNO.set(ENOENT);
+            core::ptr::null_mut()
+        }
+    }
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endnetent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getnetbyname(name: *const c_char) -> *mut netent {
-    let mut n: *mut netent;
-    unsafe { setnetent(NET_STAYOPEN) };
-    while {
-        n = unsafe { getnetent() };
-        !n.is_null()
-    } {
-        if unsafe { strcasecmp((*n).n_name, name) } == 0 {
-            unsafe { setnetent(NET_STAYOPEN) };
-            return n;
+    let name_bytes = unsafe { CStr::from_ptr(name) }.to_bytes_with_nul();
+    match NET_STATE.lock().getnetbyname(name_bytes) {
+        Some(n) => n,
+        None => {
+            crate::platform::ERRNO.set(ENOENT);
+            core::ptr::null_mut()
         }
     }
-    unsafe { setnetent(NET_STAYOPEN) };
-
-    platform::ERRNO.set(ENOENT);
-    ptr::null_mut::<netent>()
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endnetent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getnetent() -> *mut netent {
-    // TODO: Rustify implementation
-
-    if unsafe { NETDB } == 0 {
-        unsafe { NETDB = Sys::open(c"/etc/networks".into(), O_RDONLY, 0).or_minus_one_errno() };
-    }
-
-    let mut rlb = RawLineBuffer::new(unsafe { NETDB });
-    rlb.seek(unsafe { N_POS });
-
-    let mut r: Box<str> = Box::default();
-    while r.is_empty() || r.split_whitespace().next().is_none() || r.starts_with('#') {
-        r = match rlb.next() {
-            Line::Some(s) => bytes_to_box_str(s),
-            _ => {
-                if unsafe { NET_STAYOPEN } == 0 {
-                    unsafe { endnetent() };
-                }
-                return ptr::null_mut();
-            }
-        };
-    }
-    rlb.next();
-    unsafe { N_POS = rlb.line_pos() };
-
-    let mut iter: SplitWhitespace = r.split_whitespace();
-
-    let net_name = iter.next().unwrap().bytes().chain(Some(b'\0')).collect();
-    unsafe { NET_NAME.unsafe_set(Some(net_name)) };
-
-    let addr_vec: Vec<u8> = iter.next().unwrap().bytes().chain(Some(b'\0')).collect();
-    let addr_cstr = addr_vec.as_slice().as_ptr().cast::<c_char>();
-    let mut addr = mem::MaybeUninit::uninit();
-    unsafe { inet_aton(addr_cstr, addr.as_mut_ptr()) };
-    let addr = unsafe { addr.assume_init() };
-    unsafe { NET_ADDR = Some(ntohl(addr.s_addr)) };
-
-    let mut _net_aliases: Vec<Vec<u8>> = iter
-        .map(|alias| alias.bytes().chain(Some(b'\0')).collect())
-        .collect();
-    let mut net_aliases: Vec<*mut c_char> = _net_aliases
-        .iter_mut()
-        .map(|x| x.as_mut_ptr().cast::<c_char>())
-        .chain(Some(ptr::null_mut()))
-        .collect();
-    unsafe { NET_ALIASES.unsafe_set(Some(_net_aliases)) };
-
-    unsafe {
-        NET_ENTRY = netent {
-            n_name: NET_NAME
-                .unsafe_mut()
-                .as_mut()
-                .unwrap()
-                .as_mut_ptr()
-                .cast::<c_char>(),
-            n_aliases: net_aliases.as_mut_slice().as_mut_ptr(),
-            n_addrtype: AF_INET,
-            n_net: uint32_t::from(NET_ADDR.unwrap()),
-        }
-    };
-    (&raw mut NET_ENTRY).cast::<netent>()
+    NET_STATE.lock().getnetent().unwrap_or(ptr::null_mut())
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endprotoent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getprotobyname(name: *const c_char) -> *mut protoent {
-    let mut p: *mut protoent;
-    unsafe { setprotoent(PROTO_STAYOPEN) };
-    while {
-        p = unsafe { getprotoent() };
-        !p.is_null()
-    } {
-        if unsafe { strcasecmp((*p).p_name, name) } == 0 {
-            unsafe { setprotoent(PROTO_STAYOPEN) };
-            return p;
-        }
-
-        let mut cp = unsafe { (*p).p_aliases };
-        loop {
-            if cp.is_null() {
-                unsafe { setprotoent(PROTO_STAYOPEN) };
-                break;
-            }
-            if (unsafe { *cp }).is_null() {
-                unsafe { setprotoent(PROTO_STAYOPEN) };
-                break;
-            }
-            if unsafe { strcasecmp(*cp, name) } == 0 {
-                unsafe { setprotoent(PROTO_STAYOPEN) };
-                return p;
-            }
-            cp = unsafe { cp.add(1) };
+    let name_bytes = unsafe { CStr::from_ptr(name) }.to_bytes_with_nul();
+    match PROTO_STATE.lock().getprotobyname(name_bytes) {
+        Some(p) => p,
+        None => {
+            crate::platform::ERRNO.set(ENOENT);
+            core::ptr::null_mut()
         }
     }
-    unsafe { setprotoent(PROTO_STAYOPEN) };
-
-    platform::ERRNO.set(ENOENT);
-    ptr::null_mut::<protoent>()
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endprotoent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getprotobynumber(number: c_int) -> *mut protoent {
-    unsafe { setprotoent(PROTO_STAYOPEN) };
-    let mut p: *mut protoent;
-    while {
-        p = unsafe { getprotoent() };
-        !p.is_null()
-    } {
-        if unsafe { (*p).p_proto } == number {
-            unsafe { setprotoent(PROTO_STAYOPEN) };
-            return p;
+    match PROTO_STATE.lock().getprotobynumber(number) {
+        Some(p) => p,
+        None => {
+            crate::platform::ERRNO.set(ENOENT);
+            core::ptr::null_mut()
         }
     }
-    unsafe { setprotoent(PROTO_STAYOPEN) };
-    platform::ERRNO.set(ENOENT);
-    ptr::null_mut::<protoent>()
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endprotoent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getprotoent() -> *mut protoent {
-    if unsafe { PROTODB } == 0 {
-        unsafe { PROTODB = Sys::open(c"/etc/protocols".into(), O_RDONLY, 0).or_minus_one_errno() };
-    }
-
-    let mut rlb = RawLineBuffer::new(unsafe { PROTODB });
-    rlb.seek(unsafe { P_POS });
-
-    let mut r: Box<str> = Box::default();
-    while r.is_empty() || r.split_whitespace().next().is_none() || r.starts_with('#') {
-        r = match rlb.next() {
-            Line::Some(s) => bytes_to_box_str(s),
-            _ => {
-                if unsafe { PROTO_STAYOPEN } == 0 {
-                    unsafe { endprotoent() };
-                }
-                return ptr::null_mut();
-            }
-        };
-    }
-    rlb.next();
-    unsafe { P_POS = rlb.line_pos() };
-
-    let mut iter: SplitWhitespace = r.split_whitespace();
-
-    let mut proto_name: Vec<u8> = iter.next().unwrap().as_bytes().to_vec();
-    proto_name.push(b'\0');
-
-    let mut num = iter.next().unwrap().as_bytes().to_vec();
-    num.push(b'\0');
-    unsafe { PROTO_NUM = Some(atoi(num.as_mut_slice().as_mut_ptr().cast::<c_char>())) };
-
-    let mut _proto_aliases: Vec<Vec<u8>> = iter
-        .map(|alias| alias.bytes().chain(Some(b'\0')).collect())
-        .collect();
-    let mut proto_aliases: Vec<*mut i8> = _proto_aliases
-        .iter_mut()
-        .map(|x| x.as_mut_ptr().cast::<i8>())
-        .chain(Some(ptr::null_mut()))
-        .collect();
-
-    unsafe { PROTO_ALIASES.unsafe_set(Some(_proto_aliases)) };
-    unsafe { PROTO_NAME.unsafe_set(Some(proto_name)) };
-
-    unsafe {
-        PROTO_ENTRY = protoent {
-            p_name: PROTO_NAME
-                .unsafe_mut()
-                .as_mut()
-                .unwrap()
-                .as_mut_slice()
-                .as_mut_ptr()
-                .cast::<c_char>(),
-            p_aliases: proto_aliases
-                .as_mut_slice()
-                .as_mut_ptr()
-                .cast::<*mut c_char>(),
-            p_proto: PROTO_NUM.unwrap(),
-        }
-    };
-    if unsafe { PROTO_STAYOPEN } == 0 {
-        unsafe { endprotoent() };
-    }
-    (&raw mut PROTO_ENTRY).cast::<protoent>()
+    PROTO_STATE
+        .lock()
+        .getprotoent()
+        .unwrap_or(core::ptr::null_mut())
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endservent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getservbyname(name: *const c_char, proto: *const c_char) -> *mut servent {
-    unsafe { setservent(SERV_STAYOPEN) };
-    let mut p: *mut servent;
-    if proto.is_null() {
-        while {
-            p = unsafe { getservent() };
-            !p.is_null()
-        } {
-            if unsafe { strcasecmp((*p).s_name, name) } == 0 {
-                unsafe { setservent(SERV_STAYOPEN) };
-                return p;
-            }
-        }
-    } else {
-        while {
-            p = unsafe { getservent() };
-            !p.is_null()
-        } {
-            if unsafe { strcasecmp((*p).s_name, name) } == 0
-                && unsafe { strcasecmp((*p).s_proto, proto) } == 0
-            {
-                unsafe { setservent(SERV_STAYOPEN) };
-                return p;
-            }
+    let name_bytes = unsafe { CStr::from_ptr(name) }.to_bytes_with_nul();
+    let proto_bytes =
+        (!proto.is_null()).then(|| unsafe { CStr::from_ptr(proto) }.to_bytes_with_nul());
+    match SERV_STATE.lock().getservbyname(name_bytes, proto_bytes) {
+        Some(s) => s,
+        None => {
+            crate::platform::ERRNO.set(ENOENT);
+            core::ptr::null_mut()
         }
     }
-    unsafe { setservent(SERV_STAYOPEN) };
-    platform::ERRNO.set(ENOENT);
-    ptr::null_mut::<servent>()
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endservent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getservbyport(port: c_int, proto: *const c_char) -> *mut servent {
-    unsafe { setservent(SERV_STAYOPEN) };
-    let mut p: *mut servent;
-    if proto.is_null() {
-        while {
-            p = unsafe { getservent() };
-            !p.is_null()
-        } {
-            if unsafe { (*p).s_port } == port {
-                unsafe { setservent(SERV_STAYOPEN) };
-                return p;
-            }
-        }
-    } else {
-        while {
-            p = unsafe { getservent() };
-            !p.is_null()
-        } {
-            if unsafe { (*p).s_port } == port && unsafe { strcasecmp((*p).s_proto, proto) } == 0 {
-                unsafe { setservent(SERV_STAYOPEN) };
-                return p;
-            }
+    let proto_bytes =
+        (!proto.is_null()).then(|| unsafe { CStr::from_ptr(proto) }.to_bytes_with_nul());
+    match SERV_STATE.lock().getservbyport(port, proto_bytes) {
+        Some(s) => s,
+        None => {
+            crate::platform::ERRNO.set(ENOENT);
+            core::ptr::null_mut()
         }
     }
-    unsafe { setservent(SERV_STAYOPEN) };
-    platform::ERRNO.set(ENOENT);
-    ptr::null_mut()
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endservent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn getservent() -> *mut servent {
-    if unsafe { SERVDB } == 0 {
-        // TODO: Rustify
-        unsafe { SERVDB = Sys::open(c"/etc/services".into(), O_RDONLY, 0).or_minus_one_errno() };
-    }
-    let mut rlb = RawLineBuffer::new(unsafe { SERVDB });
-    rlb.seek(unsafe { S_POS });
+    SERV_STATE
+        .lock()
+        .getservent()
+        .unwrap_or(core::ptr::null_mut())
+}
 
-    loop {
-        let r = match rlb.next() {
-            Line::Some(s) => bytes_to_box_str(s),
-            _ => {
-                if unsafe { SERV_STAYOPEN } == 0 {
-                    unsafe { endservent() };
-                }
-                return ptr::null_mut();
-            }
-        };
-
-        let mut iter = r.split_whitespace();
-        let serv_name = match iter.next() {
-            Some(serv_name) => serv_name.bytes().chain(Some(b'\0')).collect(),
-            None => continue,
-        };
-        let Some(port_proto) = iter.next() else {
-            continue;
-        };
-        let mut split = port_proto.split('/');
-        let mut port: Vec<u8> = match split.next() {
-            Some(port) => port.bytes().chain(Some(b'\0')).collect(),
-            None => continue,
-        };
-        unsafe {
-            SERV_PORT = Some(u32::from(htons(
-                u16::try_from(atoi(port.as_mut_slice().as_mut_ptr().cast::<c_char>()))
-                    .expect("port number should not exceed u16::MAX"),
-            )) as i32)
-        };
-        let proto = match split.next() {
-            Some(proto) => proto.bytes().chain(Some(b'\0')).collect(),
-            None => continue,
-        };
-
-        rlb.next();
-        unsafe { S_POS = rlb.line_pos() };
-
-        /*
-         *let mut _serv_aliases: Vec<Vec<u8>> = Vec::new();
-         *loop {
-         *    let mut alias = match iter.next() {
-         *        Some(s) => s.as_bytes().to_vec(),
-         *        _ => break
-         *    };
-         *    alias.push(b'\0');
-         *    _serv_aliases.push(alias);
-         *}
-         *let mut serv_aliases: Vec<*mut i8> = _serv_aliases.iter_mut().map(|x| x.as_mut_ptr() as *mut i8).collect();
-         *serv_aliases.push(ptr::null_mut());
-         *
-         */
-        let mut _serv_aliases: Vec<Vec<u8>> = vec![vec![b'\0']];
-        let mut serv_aliases: Vec<*mut i8> = vec![ptr::null_mut(); 2];
-
-        unsafe { SERV_ALIASES.unsafe_set(Some(_serv_aliases)) };
-        unsafe { SERV_NAME.unsafe_set(Some(serv_name)) };
-        unsafe { SERV_PROTO.unsafe_set(Some(proto)) };
-
-        unsafe {
-            SERV_ENTRY = servent {
-                s_name: SERV_NAME
-                    .unsafe_mut()
-                    .as_mut()
-                    .unwrap()
-                    .as_mut_slice()
-                    .as_mut_ptr()
-                    .cast::<c_char>(),
-                s_aliases: serv_aliases
-                    .as_mut_slice()
-                    .as_mut_ptr()
-                    .cast::<*mut c_char>(),
-                s_port: SERV_PORT.unwrap(),
-                s_proto: SERV_PROTO
-                    .unsafe_mut()
-                    .as_mut()
-                    .unwrap()
-                    .as_mut_slice()
-                    .as_mut_ptr()
-                    .cast::<c_char>(),
-            }
-        };
-
-        if unsafe { SERV_STAYOPEN } == 0 {
-            unsafe { endservent() };
-        }
-        break (&raw mut SERV_ENTRY).cast::<servent>();
-    }
+/// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endhostent.html>.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sethostent(stayopen: c_int) {
+    HOST_STATE.lock().sethostent(stayopen != 0);
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endnetent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setnetent(stayopen: c_int) {
-    unsafe { NET_STAYOPEN = stayopen };
-    if unsafe { NETDB } == 0 {
-        unsafe { NETDB = Sys::open(c"/etc/networks".into(), O_RDONLY, 0).or_minus_one_errno() }
-    } else {
-        if Sys::lseek(unsafe { NETDB }, 0, SEEK_SET).is_ok() {}; // TODO handle errror
-        unsafe { N_POS = 0 };
-    }
+    NET_STATE.lock().setnetent(stayopen != 0);
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endprotoent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setprotoent(stayopen: c_int) {
-    unsafe { PROTO_STAYOPEN = stayopen };
-    if unsafe { PROTODB } == 0 {
-        unsafe { PROTODB = Sys::open(c"/etc/protocols".into(), O_RDONLY, 0).or_minus_one_errno() }
-    } else {
-        if Sys::lseek(unsafe { PROTODB }, 0, SEEK_SET).is_ok() {}; // TODO handle error
-        unsafe { P_POS = 0 };
-    }
+    PROTO_STATE.lock().setprotoent(stayopen != 0);
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/functions/endservent.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn setservent(stayopen: c_int) {
-    unsafe { SERV_STAYOPEN = stayopen };
-    if unsafe { SERVDB } == 0 {
-        unsafe { SERVDB = Sys::open(c"/etc/services".into(), O_RDONLY, 0).or_minus_one_errno() }
-    } else {
-        if Sys::lseek(unsafe { SERVDB }, 0, SEEK_SET).is_ok() {}; // TODO handle error
-        unsafe { S_POS = 0 };
-    }
+    SERV_STATE.lock().setservent(stayopen != 0);
 }
 
 fn getaddrinfo_inner(
@@ -908,9 +554,14 @@ fn getaddrinfo_inner(
 ) -> Result<Box<addrinfo>, AddrInfoErr> {
     //TODO: Use hints
     let mut ai_flags = hints_opt.map_or(0, |hints| hints.ai_flags);
-    let mut ai_family; // = hints_opt.map_or(AF_UNSPEC, |hints| hints.ai_family);
+    let mut ai_family = hints_opt.map_or(AF_UNSPEC, |hints| hints.ai_family);
     let ai_socktype = hints_opt.map_or(0, |hints| hints.ai_socktype);
     let mut ai_protocol; // = hints_opt.map_or(0, |hints| hints.ai_protocol);
+
+    if ai_family == AF_INET6 && ai_flags == AI_ADDRCONFIG {
+        //TODO: support ipv6 lookup
+        return Err(AddrInfoErr::EAI_NONAME);
+    }
 
     let mut port = 0;
     if let Some(service) = service_opt {
@@ -936,7 +587,13 @@ fn getaddrinfo_inner(
 
         vec![in_addr { s_addr }]
     } else {
-        lookup_host(node)?
+        match lookup_host(node) {
+            Ok(hosts) => hosts,
+            Err(Errno(ETIMEDOUT)) => {
+                return Err(AddrInfoErr::EAI_AGAIN);
+            }
+            Err(_) => return Err(AddrInfoErr::EAI_FAIL),
+        }
     };
 
     let mut first_info: Option<Box<addrinfo>> = None;
@@ -949,7 +606,7 @@ fn getaddrinfo_inner(
         let mut sockaddr = vec![0_u8; size_of::<sockaddr_in>()].into_boxed_slice();
 
         *plain::from_mut_bytes(&mut sockaddr).unwrap() = sockaddr_in {
-            sin_family: ai_family as sa_family_t,
+            sin_family: sa_family_t::try_from(ai_family).expect("AF_INET is positive"),
             sin_port: htons(port),
             sin_addr: in_addr,
             sin_zero: [0; 8],
@@ -1004,11 +661,10 @@ pub unsafe extern "C" fn getaddrinfo(
         Some(unsafe { &*hints })
     };
 
-    #[cfg(not(feature = "no_trace"))]
-    log::trace!(
+    trace_log!(
         "getaddrinfo({:?}, {:?}, {:?})",
-        node_opt.map(|c| alloc::string::String::from_utf8_lossy(c.to_bytes())),
-        service_opt.map(|c| alloc::string::String::from_utf8_lossy(c.to_bytes())),
+        node_opt,
+        service_opt,
         hints_opt
     );
 
@@ -1077,7 +733,7 @@ pub unsafe extern "C" fn getnameinfo(
             };
             unsafe { *host.add(ip_bytes.len()) = 0 };
         } else {
-            match lookup_addr(sa.sin_addr.clone()).map(|host_names| host_names.into_iter().next()) {
+            match lookup_addr(&sa.sin_addr).map(|host_names| host_names.into_iter().next()) {
                 Ok(Some(hostname)) => {
                     if (hostlen as usize) <= hostname.len() {
                         return EAI_MEMORY; // Buffer too small
@@ -1199,7 +855,7 @@ pub extern "C" fn herror(prefix: *const c_char) {
         str::from_utf8_unchecked(msg_cstr.to_bytes())
     };
 
-    let mut writer = platform::FileWriter::new(2);
+    let mut writer = crate::platform::FileWriter::new(2);
     // Prefix is optional
     match unsafe { CStr::from_nullable_ptr(prefix) }
         .and_then(|prefix| str::from_utf8(prefix.to_bytes()).ok())

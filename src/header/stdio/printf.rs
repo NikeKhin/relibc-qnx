@@ -14,9 +14,9 @@ use crate::{
     platform::{
         self,
         types::{
-            c_char, c_double, c_int, c_long, c_longdouble, c_longlong, c_short, c_uchar, c_uint,
-            c_ulong, c_ulonglong, c_ushort, c_void, intmax_t, ptrdiff_t, size_t, ssize_t,
-            uintmax_t, wchar_t, wint_t,
+            c_char, c_double, c_int, c_long, c_longdouble, c_longlong, c_short, c_uint, c_ulong,
+            c_ulonglong, c_ushort, c_void, intmax_t, ptrdiff_t, size_t, ssize_t, uintmax_t,
+            wchar_t, wint_t,
         },
     },
 };
@@ -82,10 +82,7 @@ impl Number {
         match arg {
             VaArg::c_char(i) => i as usize,
             VaArg::c_double(i) => i as usize,
-            #[cfg(target_pointer_width = "32")]
-            VaArg::c_longdouble(_) => 0_usize,
-            #[cfg(target_pointer_width = "64")]
-            VaArg::c_longdouble(i) => i as usize,
+            VaArg::c_longdouble(i) => unsafe { relibc_ldtod(&raw const i) as usize },
             VaArg::c_int(i) => i as usize,
             VaArg::c_long(i) => i as usize,
             VaArg::c_longlong(i) => i as usize,
@@ -94,7 +91,7 @@ impl Number {
             VaArg::pointer(i) => i as usize,
             VaArg::ptrdiff_t(i) => i as usize,
             VaArg::ssize_t(i) => i as usize,
-            VaArg::wint_t(i) => i as usize,
+            VaArg::wint_t(i) => usize::try_from(i).expect("always positive and within bounds"),
         }
     }
 }
@@ -125,63 +122,77 @@ impl VaArg {
         match (fmtkind, intkind) {
             (FmtKind::Percent, _) => panic!("Can't call arg_from on %"),
 
-            (FmtKind::Char, IntKind::Long) | (FmtKind::Char, IntKind::LongLong) => {
+            (FmtKind::Char, IntKind::Long | IntKind::LongLong) => {
                 VaArg::wint_t(unsafe { ap.next_arg::<wint_t>() })
             }
 
-            (FmtKind::Char, _)
-            | (FmtKind::Unsigned, IntKind::Byte)
-            | (FmtKind::Signed, IntKind::Byte) => {
+            (FmtKind::Char, _) | (FmtKind::Unsigned | FmtKind::Signed, IntKind::Byte) => {
                 // c_int is passed but truncated to c_char
                 VaArg::c_char(unsafe { ap.next_arg::<c_int>() } as c_char)
             }
-            (FmtKind::Unsigned, IntKind::Short) | (FmtKind::Signed, IntKind::Short) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::Short) => {
                 // c_int is passed but truncated to c_short
                 VaArg::c_short(unsafe { ap.next_arg::<c_int>() } as c_short)
             }
-            (FmtKind::Unsigned, IntKind::Int) | (FmtKind::Signed, IntKind::Int) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::Int) => {
                 VaArg::c_int(unsafe { ap.next_arg::<c_int>() })
             }
-            (FmtKind::Unsigned, IntKind::Long) | (FmtKind::Signed, IntKind::Long) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::Long) => {
                 VaArg::c_long(unsafe { ap.next_arg::<c_long>() })
             }
-            (FmtKind::Unsigned, IntKind::LongLong) | (FmtKind::Signed, IntKind::LongLong) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::LongLong) => {
                 VaArg::c_longlong(unsafe { ap.next_arg::<c_longlong>() })
             }
-            (FmtKind::Unsigned, IntKind::IntMax) | (FmtKind::Signed, IntKind::IntMax) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::IntMax) => {
                 VaArg::intmax_t(unsafe { ap.next_arg::<intmax_t>() })
             }
-            (FmtKind::Unsigned, IntKind::PtrDiff) | (FmtKind::Signed, IntKind::PtrDiff) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::PtrDiff) => {
                 VaArg::ptrdiff_t(unsafe { ap.next_arg::<ptrdiff_t>() })
             }
-            (FmtKind::Unsigned, IntKind::Size) | (FmtKind::Signed, IntKind::Size) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::Size) => {
                 VaArg::ssize_t(unsafe { ap.next_arg::<ssize_t>() })
             }
 
-            (FmtKind::AnyNotation, IntKind::LongLong)
-            | (FmtKind::Decimal, IntKind::LongLong)
-            | (FmtKind::Scientific, IntKind::LongLong) => {
+            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific, IntKind::LongLong) => {
                 VaArg::c_longdouble(unsafe { VaArg::extract_longdouble(ap) })
             }
-            (FmtKind::AnyNotation, _) | (FmtKind::Decimal, _) | (FmtKind::Scientific, _) => {
+            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific, _) => {
                 VaArg::c_double(unsafe { ap.next_arg::<c_double>() })
             }
 
-            (FmtKind::GetWritten, _) | (FmtKind::Pointer, _) | (FmtKind::String, _) => {
+            (FmtKind::GetWritten | FmtKind::Pointer | FmtKind::String, _) => {
                 VaArg::pointer(unsafe { ap.next_arg::<*const c_void>() })
             }
         }
     }
     #[cfg(target_arch = "x86")]
-    unsafe fn extract_longdouble(_ap: &mut core::ffi::VaList) -> c_longdouble {
-        todo_skip!(0, "long double in variadic printf is not supported");
-        [0, 0, 0]
+    unsafe fn extract_longdouble(ap: &mut core::ffi::VaList) -> c_longdouble {
+        // https://refspecs.linuxfoundation.org/elf/abi386-4.pdf
+        // long double is nothing special than regular floating point
+
+        // exactly same as core::ffi::VaListInner which is just an opaque pointer
+        #[repr(C)]
+        struct VaListInner {
+            ptr: *const c_void,
+        }
+
+        let ap_impl = unsafe {
+            let ptr_to_struct = core::ptr::from_mut::<core::ffi::VaList>(ap).cast::<VaListInner>();
+            &mut *ptr_to_struct
+        };
+
+        let ptr = ap_impl.ptr.cast::<c_longdouble>();
+        let val = unsafe { ptr.read() };
+
+        ap_impl.ptr = unsafe { ptr.add(1) }.cast::<core::ffi::c_void>();
+
+        val
     }
     #[cfg(target_arch = "x86_64")]
     unsafe fn extract_longdouble(ap: &mut core::ffi::VaList) -> c_longdouble {
         // https://refspecs.linuxfoundation.org/elf/x86_64-abi-0.95.pdf (long double)
 
-        // exactly same as core::ffi::VaListImpl but all variables exposed
+        // exactly same as core::ffi::VaListInner but all variables exposed
         #[repr(C)]
         struct VaListInner {
             gp_offset: i32,
@@ -206,7 +217,7 @@ impl VaArg {
     unsafe fn extract_longdouble(ap: &mut core::ffi::VaList) -> c_longdouble {
         // https://c9x.me/compile/bib/abi-arm64.pdf (quad precision)
 
-        // exactly same as core::ffi::VaListImpl but all variables exposed
+        // exactly same as core::ffi::VaListInner but all variables exposed
         #[repr(C)]
         struct VaListInner {
             stack: *const c_void,
@@ -278,45 +289,43 @@ impl VaArg {
         match (fmtkind, intkind) {
             (FmtKind::Percent, _) => panic!("Can't call transmute on %"),
 
-            (FmtKind::Char, IntKind::Long) | (FmtKind::Char, IntKind::LongLong) => {
+            (FmtKind::Char, IntKind::Long | IntKind::LongLong) => {
                 VaArg::wint_t(unsafe { untyped.wint_t })
             }
 
-            (FmtKind::Char, _)
-            | (FmtKind::Unsigned, IntKind::Byte)
-            | (FmtKind::Signed, IntKind::Byte) => VaArg::c_char(unsafe { untyped.c_char }),
-            (FmtKind::Unsigned, IntKind::Short) | (FmtKind::Signed, IntKind::Short) => {
+            (FmtKind::Char, _) | (FmtKind::Unsigned | FmtKind::Signed, IntKind::Byte) => {
+                VaArg::c_char(unsafe { untyped.c_char })
+            }
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::Short) => {
                 VaArg::c_short(unsafe { untyped.c_short })
             }
-            (FmtKind::Unsigned, IntKind::Int) | (FmtKind::Signed, IntKind::Int) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::Int) => {
                 VaArg::c_int(unsafe { untyped.c_int })
             }
-            (FmtKind::Unsigned, IntKind::Long) | (FmtKind::Signed, IntKind::Long) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::Long) => {
                 VaArg::c_long(unsafe { untyped.c_long })
             }
-            (FmtKind::Unsigned, IntKind::LongLong) | (FmtKind::Signed, IntKind::LongLong) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::LongLong) => {
                 VaArg::c_longlong(unsafe { untyped.c_longlong })
             }
-            (FmtKind::Unsigned, IntKind::IntMax) | (FmtKind::Signed, IntKind::IntMax) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::IntMax) => {
                 VaArg::intmax_t(unsafe { untyped.intmax_t })
             }
-            (FmtKind::Unsigned, IntKind::PtrDiff) | (FmtKind::Signed, IntKind::PtrDiff) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::PtrDiff) => {
                 VaArg::ptrdiff_t(unsafe { untyped.ptrdiff_t })
             }
-            (FmtKind::Unsigned, IntKind::Size) | (FmtKind::Signed, IntKind::Size) => {
+            (FmtKind::Unsigned | FmtKind::Signed, IntKind::Size) => {
                 VaArg::ssize_t(unsafe { untyped.ssize_t })
             }
 
-            (FmtKind::AnyNotation, IntKind::LongLong)
-            | (FmtKind::Decimal, IntKind::LongLong)
-            | (FmtKind::Scientific, IntKind::LongLong) => {
+            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific, IntKind::LongLong) => {
                 VaArg::c_longdouble(unsafe { untyped.c_longdouble })
             }
-            (FmtKind::AnyNotation, _) | (FmtKind::Decimal, _) | (FmtKind::Scientific, _) => {
+            (FmtKind::AnyNotation | FmtKind::Decimal | FmtKind::Scientific, _) => {
                 VaArg::c_double(unsafe { untyped.c_double })
             }
 
-            (FmtKind::GetWritten, _) | (FmtKind::Pointer, _) | (FmtKind::String, _) => {
+            (FmtKind::GetWritten | FmtKind::Pointer | FmtKind::String, _) => {
                 VaArg::pointer(unsafe { untyped.pointer })
             }
         }
@@ -372,6 +381,7 @@ impl VaListCache {
 // |___|_| |_| |_| .__/|_|\___|_| |_| |_|\___|_| |_|\__\__,_|\__|_|\___/|_| |_(_)
 //               |_|
 
+#[derive(Clone, Copy)]
 enum FmtCase {
     Lower,
     Upper,
@@ -716,7 +726,10 @@ impl<'a, T: c_str::Kind> Iterator for PrintfIter<'a, T> {
                 return Some(Ok(PrintfFmt::Plain(
                     T::chars_from_bytes(
                         errno::STR_ERROR
-                            .get(platform::ERRNO.get() as usize)
+                            .get(
+                                usize::try_from(platform::ERRNO.get())
+                                    .expect("ERRNO values are positive"),
+                            )
                             .map(|e| e.as_bytes())
                             .unwrap_or(b"unknown error"),
                     )
@@ -829,14 +842,14 @@ pub(crate) unsafe fn inner_printf<T: c_str::Kind>(
             .filter(|&n| (n as c_int) >= 0);
         let pad_zero = if zero { min_width } else { 0 };
         let signed_space = match pad_zero {
-            0 => min_width as isize,
+            0 => min_width.cast_signed(),
             _ => 0,
         };
         let pad_space = if signed_space < 0 {
             left = true;
-            -signed_space as usize
+            (-signed_space).cast_unsigned()
         } else {
-            signed_space as usize
+            signed_space.cast_unsigned()
         };
         let intkind = arg.intkind;
         let fmt = arg.fmt;
@@ -916,17 +929,17 @@ pub(crate) unsafe fn inner_printf<T: c_str::Kind>(
                 let string = match unsafe {
                     varargs.get(index, &mut ap, Some((arg.fmtkind, arg.intkind)))
                 } {
-                    VaArg::c_char(i) => fmt_int::<_, T>(fmt, i as c_uchar),
+                    VaArg::c_char(i) => fmt_int::<_, T>(fmt, CCharToU8::cast(i)),
                     VaArg::c_double(_) => panic!("this should not be possible"),
                     VaArg::c_longdouble(_) => panic!("this should not be possible"),
-                    VaArg::c_int(i) => fmt_int::<_, T>(fmt, i as c_uint),
-                    VaArg::c_long(i) => fmt_int::<_, T>(fmt, i as c_ulong),
-                    VaArg::c_longlong(i) => fmt_int::<_, T>(fmt, i as c_ulonglong),
-                    VaArg::c_short(i) => fmt_int::<_, T>(fmt, i as c_ushort),
-                    VaArg::intmax_t(i) => fmt_int::<_, T>(fmt, i as uintmax_t),
+                    VaArg::c_int(i) => fmt_int::<c_uint, T>(fmt, i.cast_unsigned()),
+                    VaArg::c_long(i) => fmt_int::<c_ulong, T>(fmt, i.cast_unsigned()),
+                    VaArg::c_longlong(i) => fmt_int::<c_ulonglong, T>(fmt, i.cast_unsigned()),
+                    VaArg::c_short(i) => fmt_int::<c_ushort, T>(fmt, i.cast_unsigned()),
+                    VaArg::intmax_t(i) => fmt_int::<uintmax_t, T>(fmt, i.cast_unsigned()),
                     VaArg::pointer(i) => fmt_int::<_, T>(fmt, i as usize),
-                    VaArg::ptrdiff_t(i) => fmt_int::<_, T>(fmt, i as size_t),
-                    VaArg::ssize_t(i) => fmt_int::<_, T>(fmt, i as size_t),
+                    VaArg::ptrdiff_t(i) => fmt_int::<size_t, T>(fmt, i.cast_unsigned()),
+                    VaArg::ssize_t(i) => fmt_int::<size_t, T>(fmt, i.cast_unsigned()),
                     VaArg::wint_t(_) => unreachable!("this should not be possible"),
                 };
                 let zero = precision == Some(0) && string == "0";
@@ -1039,7 +1052,7 @@ pub(crate) unsafe fn inner_printf<T: c_str::Kind>(
                         // the unused logarithm, unless the exponent is
                         // negative which in case the integral part must
                         // of course be 0, 1 in length
-                        let len = 1 + cmp::max(0, exp) as usize;
+                        let len = 1 + cmp::max(0, exp).cast_unsigned();
                         let precision = precision.saturating_sub(len);
                         fmt_float_normal(
                             w, !alternate, alternate, precision, float, left, pad_space, pad_zero,
@@ -1069,7 +1082,7 @@ pub(crate) unsafe fn inner_printf<T: c_str::Kind>(
                         let mut string = String::new();
 
                         while unsafe { *ptr } != 0 {
-                            let Some(c) = char::from_u32(unsafe { *ptr } as _) else {
+                            let Some(c) = char::from_u32(unsafe { *ptr }.cast_unsigned()) else {
                                 platform::ERRNO.set(EILSEQ);
                                 return Err(io::last_os_error());
                             };
@@ -1150,23 +1163,37 @@ pub(crate) unsafe fn inner_printf<T: c_str::Kind>(
                 };
 
                 match intkind {
-                    IntKind::Byte => unsafe { *(ptr as *mut c_char) = w.written as c_char },
-                    IntKind::Short => unsafe { *(ptr as *mut c_short) = w.written as c_short },
-                    IntKind::Int => unsafe { *(ptr as *mut c_int) = w.written as c_int },
-                    IntKind::Long => unsafe { *(ptr as *mut c_long) = w.written as c_long },
+                    IntKind::Byte => unsafe {
+                        *(ptr as *mut c_char) = c_char::try_from(w.written).unwrap_or(c_char::MAX)
+                    },
+                    IntKind::Short => unsafe {
+                        *(ptr as *mut c_short) =
+                            c_short::try_from(w.written).unwrap_or(c_short::MAX)
+                    },
+                    IntKind::Int => unsafe {
+                        *(ptr as *mut c_int) = c_int::try_from(w.written).unwrap_or(c_int::MAX)
+                    },
+                    IntKind::Long => unsafe {
+                        *(ptr as *mut c_long) = c_long::try_from(w.written).unwrap_or(c_long::MAX)
+                    },
                     IntKind::LongLong => unsafe {
-                        *(ptr as *mut c_longlong) = w.written as c_longlong
+                        *(ptr as *mut c_longlong) =
+                            c_longlong::try_from(w.written).unwrap_or(c_longlong::MAX)
                     },
-                    IntKind::IntMax => unsafe { *(ptr as *mut intmax_t) = w.written as intmax_t },
+                    IntKind::IntMax => unsafe {
+                        *(ptr as *mut intmax_t) =
+                            intmax_t::try_from(w.written).unwrap_or(intmax_t::MAX)
+                    },
                     IntKind::PtrDiff => unsafe {
-                        *(ptr as *mut ptrdiff_t) = w.written as ptrdiff_t
+                        *(ptr as *mut ptrdiff_t) =
+                            ptrdiff_t::try_from(w.written).unwrap_or(ptrdiff_t::MAX)
                     },
-                    IntKind::Size => unsafe { *(ptr as *mut size_t) = w.written as size_t },
+                    IntKind::Size => unsafe { *(ptr as *mut size_t) = w.written },
                 }
             }
         }
     }
-    Ok(w.written as c_int)
+    Ok(c_int::try_from(w.written).unwrap_or(c_int::MAX))
 }
 
 /// Implementation of `printf` formatting function, generic over a `writer`

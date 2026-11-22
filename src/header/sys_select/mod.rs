@@ -33,12 +33,12 @@ type FdBitSet = BitSet<[u64; FD_SETSIZE / (8 * mem::size_of::<u64>())]>;
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_select.h.html>.
 /// cbindgen:ignore
-#[allow(non_camel_case_types)]
 #[repr(C)]
 pub struct fd_set {
     pub fds_bits: FdBitSet,
 }
 
+//TODO: replace with platform-specific select to avoid clashing file descriptors
 pub unsafe fn select_epoll(
     nfds: c_int,
     readfds: Option<&mut fd_set>,
@@ -66,22 +66,23 @@ pub unsafe fn select_epoll(
     // Keep track of the number of file descriptors that do not support epoll
     let mut not_epoll = 0;
     for fd in 0..nfds {
+        let fd_usize = usize::try_from(fd).expect("already checked for negative values");
         let mut events = 0;
 
         if let Some(ref fd_set) = read_bitset
-            && fd_set.contains(fd as usize)
+            && fd_set.contains(fd_usize)
         {
             events |= EPOLLIN;
         }
 
         if let Some(ref fd_set) = write_bitset
-            && fd_set.contains(fd as usize)
+            && fd_set.contains(fd_usize)
         {
             events |= EPOLLOUT;
         }
 
         if let Some(ref fd_set) = except_bitset
-            && fd_set.contains(fd as usize)
+            && fd_set.contains(fd_usize)
         {
             events |= EPOLLERR;
         }
@@ -96,21 +97,21 @@ pub unsafe fn select_epoll(
                 }
             } else {
                 if let Some(ref mut fd_set) = read_bitset
-                    && fd_set.contains(fd as usize)
+                    && fd_set.contains(fd_usize)
                 {
-                    fd_set.remove(fd as usize);
+                    fd_set.remove(fd_usize);
                 }
 
                 if let Some(ref mut fd_set) = write_bitset
-                    && fd_set.contains(fd as usize)
+                    && fd_set.contains(fd_usize)
                 {
-                    fd_set.remove(fd as usize);
+                    fd_set.remove(fd_usize);
                 }
 
                 if let Some(ref mut fd_set) = except_bitset
-                    && fd_set.contains(fd as usize)
+                    && fd_set.contains(fd_usize)
                 {
-                    fd_set.remove(fd as usize);
+                    fd_set.remove(fd_usize);
                 }
             }
         }
@@ -123,10 +124,16 @@ pub unsafe fn select_epoll(
     } else {
         match timeout {
             Some(timeout) => {
-                let sec_ms = (timeout.tv_sec as c_int).checked_mul(1000);
-                let usec_ms = (timeout.tv_usec as c_int) / 1000;
+                let sec_ms = c_int::try_from(timeout.tv_sec)
+                    .unwrap_or(c_int::MAX)
+                    .checked_mul(1000);
+                #[cfg(target_pointer_width = "64")]
+                let tv_usec = c_int::try_from(timeout.tv_usec).unwrap_or(c_int::MAX);
+                #[cfg(target_pointer_width = "32")]
+                let tv_usec = timeout.tv_usec;
+                let usec_ms = tv_usec / 1000;
                 match sec_ms.and_then(|s| s.checked_add(usec_ms)) {
-                    Some(s) => s as c_int,
+                    Some(s) => s,
                     None => c_int::MAX,
                 }
             }
@@ -138,7 +145,7 @@ pub unsafe fn select_epoll(
         epoll_pwait(
             *ep,
             events.as_mut_ptr(),
-            events.len() as c_int,
+            c_int::try_from(events.len()).expect("capped at 32"),
             epoll_timeout,
             sigmask,
         )
@@ -148,26 +155,30 @@ pub unsafe fn select_epoll(
     }
 
     let mut count = not_epoll;
-    for event in events.iter().take(res as usize) {
+    for event in events
+        .iter()
+        .take(usize::try_from(res).expect("already checked for negative values"))
+    {
         let fd = unsafe { event.data.fd };
         // TODO: Error status when fd does not match?
         if fd >= 0 && fd < c_int::try_from(FD_SETSIZE).expect("constant value within c_int::MAX") {
+            let fd_usize = usize::try_from(fd).expect("already checked for negative values");
             if event.events & EPOLLIN > 0
                 && let Some(ref mut fd_set) = read_bitset
             {
-                fd_set.insert(fd as usize);
+                fd_set.insert(fd_usize);
                 count += 1;
             }
             if event.events & EPOLLOUT > 0
                 && let Some(ref mut fd_set) = write_bitset
             {
-                fd_set.insert(fd as usize);
+                fd_set.insert(fd_usize);
                 count += 1;
             }
             if event.events & EPOLLERR > 0
                 && let Some(ref mut fd_set) = except_bitset
             {
-                fd_set.insert(fd as usize);
+                fd_set.insert(fd_usize);
                 count += 1;
             }
         }

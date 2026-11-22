@@ -11,8 +11,6 @@ FAILING_TESTS += mkfifo
 FAILING_TESTS += sigchld
 # not triggering ERANGE
 FAILING_TESTS += stdlib/ptsname
-# Hang
-FAILING_TESTS += sys_epoll/epollet
 # Kernel hit todo!
 FAILING_TESTS += sys_mman/fmap
 # Hang
@@ -33,8 +31,6 @@ FAILING_TESTS += pthread/customstack
 FAILING_TESTS += sys_resource/getrusage
 # No times.h header
 #FAILING_TESTS += time/times
-# Outdated test
-#FAILING_TESTS += netdb/netdb
 # Incomplete in redox, ENOSYS in linux, EACCESS in glibc
 #FAILING_TESTS += spawn
 
@@ -74,6 +70,7 @@ EXPECT_NAMES=\
 	locale/setlocale \
 	malloc/usable_size \
 	math \
+	poll/pollnval \
 	regex \
 	semaphore/lock \
 	setjmp \
@@ -91,7 +88,7 @@ EXPECT_NAMES=\
 	stdio/fseek \
 	stdio/fwrite \
 	stdio/getc_unget \
-  	stdio/getline \
+	stdio/getline \
 	stdio/mutex \
 	stdio/popen \
 	stdio/printf \
@@ -147,6 +144,7 @@ EXPECT_NAMES=\
 	sys_select/select_timed \
 	sys_select/pselect \
 	sys_shm/shm \
+	sys_socket/getsockopt \
 	sys_socket/recv \
 	sys_socket/recvfrom \
 	sys_socket/unixnonblock \
@@ -159,6 +157,7 @@ EXPECT_NAMES=\
 	sys_stat/umask \
 	sys_stat/utimensat \
 	sys_syslog/syslog \
+	sys_uio/basic \
 	time/asctime \
 	time/constants \
 	time/gmtime \
@@ -190,6 +189,7 @@ EXPECT_NAMES=\
 	unistd/readlinkat \
 	unistd/rmdir \
 	unistd/sleep \
+	unistd/symlinkat \
 	unistd/swab \
 	unistd/write \
 	wchar/fgetwc \
@@ -232,10 +232,10 @@ VARIED_NAMES=\
 	dirent/posix_getdents \
 	includes \
 	kill-waitpid \
+	link/dl-iterate-phdr \
 	limits \
-	net/if \
-	netdb/getaddrinfo \
-	netdb/getaddrinfo_null \
+	limits_cpp \
+	poll/poll \
 	pthread/timedwait \
 	pty/forkpty \
 	psignal \
@@ -284,6 +284,7 @@ VARIED_NAMES=\
 	signals/sigrelse-1 \
 	signals/sigrelse-2 \
 	signals/sigrelse-3 \
+	signals/sigsegv \
 	signals/sigset-1 \
 	signals/sigset-10 \
 	signals/sigset-2 \
@@ -291,6 +292,7 @@ VARIED_NAMES=\
 	signals/sigset-4 \
 	signals/sigset-5 \
 	signals/sigset-9 \
+	signals/stackoverflow \
 	stdio/ctermid \
 	stdio/tempnam \
 	stdio/tmpnam \
@@ -299,7 +301,10 @@ VARIED_NAMES=\
 	stdlib/realpath \
 	sys_epoll/epoll \
 	sys_epoll/epoll_del \
+	sys_epoll/epollet \
+	sys_ioctl/tiocsctty \
 	sys_mman/mmap \
+	sys_mman/posix_madvise \
 	sys_resource/constants \
 	sys_socket/getpeername \
 	sys_socket/msg_nosignal \
@@ -332,6 +337,10 @@ VARIED_NAMES=\
 	grp/getgrgid_r \
 	grp/getgrnam_r \
 	grp/gr_iter \
+	net/if \
+	netdb/getaddrinfo \
+	netdb/getaddrinfo_null \
+	netdb/netdb \
 	waitpid \
 	waitpid_multiple \
 	$(FAILING_TESTS)

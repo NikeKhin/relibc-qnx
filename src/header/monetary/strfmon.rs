@@ -150,7 +150,8 @@ pub unsafe extern "C" fn strfmon(
         return -1; // Buffer overflow
     }
     buffer[pos] = 0; // Null-terminate the buffer
-    pos as ssize_t // Return the number of characters written
+    // Return the number of characters written
+    ssize_t::try_from(pos).expect("very unlikely to exceed isize::MAX")
 }
 
 /// Formats a monetary value into the given `buffer` using locale-specific rules
@@ -165,6 +166,7 @@ pub unsafe extern "C" fn strfmon(
 ///   and grouping sizes
 /// - `flags`: Additional formatting options
 ///
+#[expect(clippy::cast_precision_loss, reason = "cannot TryFrom")]
 fn format_monetary(
     buffer: &mut [u8],
     value: f64,
@@ -179,11 +181,11 @@ fn format_monetary(
     let frac_digits = if flags.international {
         flags
             .right_precision
-            .unwrap_or(monetary.int_frac_digits as usize)
+            .unwrap_or(usize::from(monetary.int_frac_digits))
     } else {
         flags
             .right_precision
-            .unwrap_or(monetary.frac_digits as usize)
+            .unwrap_or(usize::from(monetary.frac_digits))
     };
 
     // 3) split the value into integer and fractional parts

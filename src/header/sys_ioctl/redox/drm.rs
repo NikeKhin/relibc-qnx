@@ -1,10 +1,11 @@
 use core::slice;
 
 use redox_ioctl::{IoctlData, drm::*};
+use syscall::flag::{F_SETFD, O_RDWR};
 
 use crate::{
     error::{Errno, Result},
-    header::errno::EINVAL,
+    header::{errno::EINVAL, fcntl::sys::FD_CLOEXEC},
     platform::types::c_int,
 };
 
@@ -85,6 +86,36 @@ impl Dev {
         )?;
         Ok(res as c_int)
     }
+
+    unsafe fn prime_handle_to_fd(&self, mut buf: IoctlBuffer) -> Result<c_int> {
+        let mut data = unsafe { buf.read::<drm_prime_handle>() }?;
+        let writable = (data.flags & O_RDWR as u32) != 0;
+        let mut metadata = [0u8; 16];
+        metadata[0..8].copy_from_slice(&PRIME_HANDLE_TO_FD.to_ne_bytes());
+        metadata[8..12].copy_from_slice(&data.handle.to_ne_bytes());
+        metadata[12..16].copy_from_slice(&(if writable { 1u32 } else { 0u32 }).to_ne_bytes());
+        let new_fd = redox_rt::sys::dup(self.fd as usize, &metadata)?;
+        if (data.flags & FD_CLOEXEC as u32) != 0 {
+            redox_rt::sys::fcntl(new_fd as usize, F_SETFD, FD_CLOEXEC as usize)?;
+        }
+        data.fd = new_fd as i32;
+        unsafe { buf.write(data) }?;
+        Ok(0)
+    }
+
+    unsafe fn prime_fd_to_handle(&self, mut buf: IoctlBuffer) -> Result<c_int> {
+        let mut data = unsafe { buf.read::<drm_prime_handle>() }?;
+        let metadata = [PRIME_FD_TO_HANDLE];
+        let handle = redox_rt::sys::sys_call_wo(
+            &[self.fd as usize, data.fd as usize][..],
+            &[],
+            syscall::CallFlags::empty(),
+            &metadata,
+        )?;
+        data.handle = handle as u32;
+        unsafe { buf.write(data) }?;
+        Ok(0)
+    }
 }
 
 pub(super) unsafe fn ioctl(fd: c_int, func: u8, buf: IoctlBuffer) -> Result<c_int> {
@@ -95,10 +126,14 @@ pub(super) unsafe fn ioctl(fd: c_int, func: u8, buf: IoctlBuffer) -> Result<c_in
         0x07 => unsafe { dev.read_write_ioctl::<drm_set_version>(buf, SET_VERSION) },
         0x0C => unsafe { dev.read_write_ioctl::<drm_get_cap>(buf, GET_CAP) },
         0x0D => unsafe { dev.write_ioctl::<drm_set_client_cap>(buf, SET_CLIENT_CAP) },
+        0x2D => unsafe { dev.prime_handle_to_fd(buf) },
+        0x2E => unsafe { dev.prime_fd_to_handle(buf) },
         0xA0 => unsafe { dev.read_write_ioctl::<drm_mode_card_res>(buf, MODE_CARD_RES) },
         0xA1 => unsafe { dev.read_write_ioctl::<drm_mode_crtc>(buf, MODE_GET_CRTC) },
         0xA2 => unsafe { dev.read_write_ioctl::<drm_mode_crtc>(buf, MODE_SET_CRTC) },
         0xA3 => unsafe { dev.write_ioctl::<drm_mode_cursor>(buf, MODE_CURSOR) },
+        0xA4 => unsafe { dev.write_ioctl::<drm_mode_crtc_lut>(buf, MODE_GETGAMMA) },
+        0xA5 => unsafe { dev.write_ioctl::<drm_mode_crtc_lut>(buf, MODE_SETGAMMA) },
         0xA6 => unsafe { dev.read_write_ioctl::<drm_mode_get_encoder>(buf, MODE_GET_ENCODER) },
         0xA7 => unsafe { dev.read_write_ioctl::<drm_mode_get_connector>(buf, MODE_GET_CONNECTOR) },
         0xAA => unsafe { dev.read_write_ioctl::<drm_mode_get_property>(buf, MODE_GET_PROPERTY) },
@@ -126,6 +161,7 @@ pub(super) unsafe fn ioctl(fd: c_int, func: u8, buf: IoctlBuffer) -> Result<c_in
         0xBB => unsafe { dev.write_ioctl::<drm_mode_cursor2>(buf, MODE_CURSOR2) },
         0xCE => unsafe { dev.read_write_ioctl::<drm_mode_fb_cmd2>(buf, MODE_GET_FB2) },
         0xD0 => unsafe { dev.read_write_ioctl::<drm_mode_closefb>(buf, MODE_CLOSE_FB) },
+        0xD1 => unsafe { dev.write_ioctl::<drm_set_client_name>(buf, SET_CLIENT_NAME) },
         _ => {
             todo_skip!(
                 0,

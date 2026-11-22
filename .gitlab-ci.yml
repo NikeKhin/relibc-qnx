@@ -10,8 +10,6 @@ stages:
     - build
     - cross-build
     - test
-before_script:
-    cargo install cbindgen
 
 fmt:
     stage: build
@@ -24,6 +22,7 @@ clippy:
     needs: []
     script:
         - ./check.sh --clippy
+        - ./check.sh --clippy --all-features
 
 linux:
     stage: build
@@ -31,6 +30,7 @@ linux:
         - rustup component add clippy
         - ./check.sh --host
         - ./check.sh --host --clippy
+        - ./check.sh --host --clippy --all-features
 
 x86_64:
     stage: build
@@ -39,27 +39,32 @@ x86_64:
 
 i586:
     stage: cross-build
+    image: "registry.redox-os.org/redox-os/redoxer:i586"
     script:
         - ./check.sh --arch=i586
         - ./check.sh --arch=i586 --clippy
+        - ./check.sh --arch=i586 --clippy --all-features
 
 aarch64:
     stage: cross-build
-    image: "redoxos/redoxer:aarch64"
+    image: "registry.redox-os.org/redox-os/redoxer:aarch64"
     script:
         - ./check.sh --arch=aarch64
         - ./check.sh --arch=aarch64 --clippy
+        - ./check.sh --arch=aarch64 --clippy --all-features
 
 riscv64gc:
     stage: cross-build
     script:
         - ./check.sh --arch=riscv64gc
         - ./check.sh --arch=riscv64gc --clippy
+        - ./check.sh --arch=riscv64gc --clippy --all-features
 
 test:linux:
     stage: test
     needs: [linux]
     script:
+        - rustup toolchain install
         - ./check.sh --host --test
 
 test:x86_64:
@@ -71,11 +76,20 @@ test:x86_64:
 test:aarch64:
     stage: test
     needs: [aarch64]
-    image: "redoxos/redoxer:aarch64"
+    image: "registry.redox-os.org/redox-os/redoxer:aarch64"
     # many issues that not exist in x86_64, and lack of interest to fix so far
     allow_failure: true
     when: manual
     script:
         - timeout -s KILL 9m ./check.sh --arch=aarch64 --test
+
+test:i586:
+    stage: test
+    needs: [i586]
+    image: "registry.redox-os.org/redox-os/redoxer:i586"
+    allow_failure: true
+    when: manual
+    script:
+        - timeout -s KILL 9m ./check.sh --arch=i586 --test
 
 #TODO: Enable more arch once dynamic linker working

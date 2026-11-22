@@ -1,19 +1,20 @@
-use alloc::borrow::Cow;
 use core::{
+    cell::Cell,
     convert::TryFrom,
     mem::{self, size_of},
     num::NonZeroU64,
-    ptr, slice, str,
+    ptr, slice,
 };
 use object::bytes_of_slice_mut;
-use redox_path::RedoxStr;
-use redox_protocols::protocol::{WaitFlags, wifstopped};
+use redox_path::{RedoxReference, RedoxStr};
+use redox_protocols::protocol::{Rlimit, WaitFlags, wifstopped};
 use redox_rt::{
     RtTcb,
+    signal::tmp_disable_signals,
     sys::{Resugid, WaitpidTarget},
 };
 use syscall::{
-    self, ESRCH, Error, MODE_PERM, StdFsCallKind, StdFsCallMeta,
+    self, ESRCH, EXDEV, Error, MODE_PERM, StdFsCallKind, StdFsCallMeta,
     data::{Map, TimeSpec as redox_timespec},
     dirent::DirentHeader,
 };
@@ -28,25 +29,28 @@ use crate::{
     error::{Errno, Result},
     fs::File,
     header::{
+        bits_sigset_t::sigset_t,
         errno::{
-            EBADF, EBADFD, EEXIST, EFAULT, EFBIG, EINTR, EINVAL, EIO, EMFILE, ENAMETOOLONG, ENOENT,
-            ENOEXEC, ENOMEM, ENOSYS, EOPNOTSUPP, EPERM,
+            EBADF, EBADFD, EFAULT, EFBIG, EINTR, EINVAL, EIO, EMFILE, ENAMETOOLONG, ENOENT,
+            ENOEXEC, ENOMEM, ENOSYS, EOPNOTSUPP,
         },
         fcntl::{
             self, AT_EACCESS, AT_EMPTY_PATH, AT_FDCWD, AT_REMOVEDIR, AT_SYMLINK_FOLLOW, F_GETLK,
             F_OFD_GETLK, F_OFD_SETLK, F_RDLCK, F_SETLK, F_SETLKW, F_UNLCK, F_WRLCK, flock,
         },
         limits::{self},
+        poll::pollfd,
         signal::{NSIG, SIGEV_NONE, SIGEV_SIGNAL, SIGEV_THREAD, SIGRTMIN, sigevent},
         stdio::RENAME_NOREPLACE,
         sys_file,
         sys_mman::{MAP_ANONYMOUS, PROT_READ, PROT_WRITE},
         sys_random,
-        sys_resource::{PRIO_PROCESS, RLIM_INFINITY, rlimit, rusage, setpriority},
+        sys_resource::{PRIO_PROCESS, RLIMIT_NLIMITS, rlimit, rusage, setpriority},
         sys_select::timeval,
         sys_stat::{S_ISGID, S_ISUID, S_ISVTX, stat},
         sys_statvfs::statvfs,
         sys_time::timezone,
+        sys_uio::{gather, iovec, scatter},
         sys_utsname::{UTSLENGTH, utsname},
         time::{CLOCK_MONOTONIC, CLOCK_REALTIME, TIMER_ABSTIME, itimerspec, timespec},
         unistd::{F_OK, R_OK, SEEK_CUR, SEEK_SET, W_OK, X_OK},
@@ -75,6 +79,7 @@ mod extra;
 mod libcscheme;
 mod libredox;
 pub(crate) mod path;
+mod poll;
 mod ptrace;
 pub mod ring;
 pub(crate) mod signal;
@@ -98,6 +103,10 @@ fn cvt_uid(id: c_int) -> Result<Option<u32>> {
 }
 
 static CLONE_LOCK: RwLock<()> = RwLock::new(());
+
+// TODO: close on thread exit?
+#[thread_local]
+static CACHED_RANDOM_FD: Cell<Option<[usize; 2]>> = Cell::new(None);
 
 /// Redox syscall implementation of [`Pal`].
 pub struct Sys;
@@ -206,7 +215,7 @@ impl Pal for Sys {
             CLOCK_MONOTONIC => "/scheme/time/4/getres",
             _ => return Err(Errno(EINVAL)),
         };
-        let timerfd = FdGuard::open(path, syscall::O_RDONLY)?;
+        let timerfd = FdGuard::open_into_upper(path, syscall::O_RDONLY)?;
         let mut redox_res = syscall::TimeSpec::default();
         let buffer_len = mem::size_of::<syscall::TimeSpec>();
         let buffer =
@@ -236,12 +245,15 @@ impl Pal for Sys {
     }
 
     fn close(fd: c_int) -> Result<()> {
-        redox_rt::sys::close(fd as usize)?;
-        Ok(())
+        let r = redox_rt::sys::close(fd as usize).map(|_| ());
+        trace_log!("close({fd}) = {:?}", r);
+        r.map_err(Errno::from)
     }
 
     fn dup2(fd1: c_int, fd2: c_int) -> Result<c_int> {
-        Ok(redox_rt::sys::dup2(fd1 as usize, fd2 as usize, &[])? as c_int)
+        let r = redox_rt::sys::dup2(fd1 as usize, fd2 as usize);
+        trace_log!("dup2({fd1}, {fd2}) = {:?}", r);
+        Ok(r? as c_int)
     }
 
     fn exit(status: c_int) -> ! {
@@ -261,6 +273,7 @@ impl Pal for Sys {
         argv: *const *mut c_char,
         envp: *const *mut c_char,
     ) -> Result<()> {
+        let _siglock = tmp_disable_signals();
         self::exec::execve(
             Executable::InFd {
                 file: File::new(fildes),
@@ -278,6 +291,7 @@ impl Pal for Sys {
     }
 
     fn fchmodat(dirfd: c_int, path: Option<CStr>, mode: mode_t, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
         const MASK: c_int = !(fcntl::AT_SYMLINK_NOFOLLOW | fcntl::AT_EMPTY_PATH);
         if MASK & flags != 0 {
             return Err(Errno(EINVAL));
@@ -303,6 +317,7 @@ impl Pal for Sys {
     }
 
     fn fchownat(fildes: c_int, path: CStr, owner: uid_t, group: gid_t, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
         const MASK: c_int = !(fcntl::AT_SYMLINK_NOFOLLOW | fcntl::AT_EMPTY_PATH);
         if MASK & flags != 0 {
             return Err(Errno(EINVAL));
@@ -344,22 +359,32 @@ impl Pal for Sys {
                 match i32::from(flock.l_type) {
                     F_UNLCK => {
                         let meta = StdFsCallMeta::new(StdFsCallKind::Unlock, start, len);
-                        syscall::std_fs_call(fd as usize, &mut [], &meta)?;
-                        return Ok(0);
+                        let r = syscall::std_fs_call(fd as usize, &mut [], &meta);
+                        trace_log!(
+                            "fcntl({fd}, {} | F_UNLCK, [{start:x}:{:x}]#{}) = {r:?}",
+                            if is_ofd { "F_OFD_SETLK" } else { "F_SETLK" },
+                            len + start,
+                            flock.l_pid
+                        );
+                        return r.map(|_| 0).map_err(Errno::from);
                     }
 
                     F_RDLCK | F_WRLCK => {
+                        let is_wrclk = i32::from(flock.l_type) == F_WRLCK;
                         let meta = StdFsCallMeta::new(
                             StdFsCallKind::Lock,
                             start,
-                            len | if i32::from(flock.l_type) == F_WRLCK {
-                                1 << 63
-                            } else {
-                                0
-                            },
+                            len | if is_wrclk { 1 << 63 } else { 0 },
                         );
-                        syscall::std_fs_call(fd as usize, &mut [], &meta)?;
-                        return Ok(0);
+                        let r = syscall::std_fs_call(fd as usize, &mut [], &meta);
+                        trace_log!(
+                            "fcntl({fd}, {} | {}, [{start:x}:{:x}]#{}) = {r:?}",
+                            if is_ofd { "F_OFD_SETLK" } else { "F_SETLK" },
+                            if is_wrclk { "F_WRLCK" } else { "F_RDLCK" },
+                            len + start,
+                            flock.l_pid
+                        );
+                        return r.map(|_| 0).map_err(Errno::from);
                     }
 
                     _ => return Err(Errno(EINVAL)),
@@ -454,10 +479,18 @@ impl Pal for Sys {
         // TODO: Find way to avoid lock.
         let _guard = CLONE_LOCK.write();
 
-        Ok(redox_rt::proc::fork_impl(&redox_rt::proc::ForkArgs::Managed)? as pid_t)
+        let r = redox_rt::proc::fork_impl(&redox_rt::proc::ForkArgs::Managed);
+
+        #[cfg(not(feature = "no_trace"))]
+        if !matches!(r, Ok(0)) {
+            trace_log!("fork() = {r:?}");
+        }
+
+        Ok(r? as pid_t)
     }
 
-    fn fstatat(dirfd: c_int, path: Option<CStr>, mut buf: Out<stat>, flags: c_int) -> Result<()> {
+    fn fstatat(dirfd: c_int, path: Option<CStr>, buf: Out<stat>, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
         // `path` should be non-null.
         let mut path = path.ok_or(Errno(EFAULT))?;
 
@@ -466,7 +499,7 @@ impl Pal for Sys {
                 if dirfd == AT_FDCWD {
                     path = c".".into();
                 } else {
-                    return Ok(unsafe { libredox::fstat(dirfd as usize, buf.as_mut_ptr()) }?);
+                    return Ok(libredox::fstat(dirfd as usize, Some(buf))?);
                 }
             } else {
                 // If the path is empty but `AT_EMPTY_PATH` is **not** set, bail out.
@@ -475,20 +508,12 @@ impl Pal for Sys {
         }
 
         let file = openat2(dirfd, path, flags, fcntl::O_PATH)?;
-        // Close the file descriptor after fstat(2) regardless of success or failure.
-        let fstat_res = unsafe { libredox::fstat(*file as usize, buf.as_mut_ptr()) };
-        let close_res = redox_rt::sys::close(*file as usize);
-        if let Err(err) = fstat_res {
-            return Err(err.into());
-        }
-        close_res?;
-        Ok(fstat_res?)
+        libredox::fstat(*file as usize, Some(buf))?;
+        Ok(())
     }
 
-    fn fstatvfs(fildes: c_int, mut buf: Out<statvfs>) -> Result<()> {
-        unsafe {
-            libredox::fstatvfs(fildes as usize, buf.as_mut_ptr())?;
-        }
+    fn fstatvfs(fildes: c_int, buf: Out<statvfs>) -> Result<()> {
+        libredox::fstatvfs(fildes as usize, Some(buf))?;
         Ok(())
     }
 
@@ -513,19 +538,20 @@ impl Pal for Sys {
         Ok(unsafe { redox_rt::sys::sys_futex_wake(addr, num) }?)
     }
 
-    unsafe fn utimensat(
+    fn utimensat(
         dirfd: c_int,
         path: CStr,
-        times: *const timespec,
+        times: Option<&[timespec; 2]>,
         flag: c_int,
     ) -> Result<()> {
+        let _siglock = tmp_disable_signals();
         let mut path = path;
         if path.is_empty() {
             if flag & AT_EMPTY_PATH == AT_EMPTY_PATH {
                 if dirfd == AT_FDCWD {
                     path = c".".into();
                 } else {
-                    return Ok(unsafe { libredox::futimens(dirfd as usize, times) }?);
+                    return Ok(libredox::futimens(dirfd as usize, times)?);
                 }
             } else {
                 // If the path is empty but `AT_EMPTY_PATH` is **not** set, bail out.
@@ -534,7 +560,7 @@ impl Pal for Sys {
         }
 
         let file = openat2(dirfd, path, flag, fcntl::O_PATH | fcntl::O_CLOEXEC)?;
-        Ok(unsafe { libredox::futimens(*file as usize, times) }?)
+        Ok(libredox::futimens(*file as usize, times)?)
     }
 
     fn getcwd(buf: Out<[u8]>) -> Result<()> {
@@ -651,21 +677,42 @@ impl Pal for Sys {
     }
 
     fn getrandom(buf: &mut [u8], flags: c_uint) -> Result<usize> {
-        let path = if flags & sys_random::GRND_RANDOM != 0 {
-            //TODO: /dev/random equivalent
-            "/scheme/rand"
-        } else {
-            "/scheme/rand"
+        let rnd_fd = match CACHED_RANDOM_FD.get() {
+            Some(fd) => fd,
+            None => {
+                let path = if flags & sys_random::GRND_RANDOM != 0 {
+                    //TODO: /dev/random equivalent
+                    "/scheme/rand"
+                } else {
+                    "/scheme/rand"
+                };
+                let open_flags1 = syscall::O_RDONLY | redox_protocols::protocol::O_CLOEXEC;
+                let open_flags2 = open_flags1 | syscall::O_NONBLOCK;
+                let ep = [
+                    redox_rt::sys::open_into_upper(path, open_flags1)?,
+                    redox_rt::sys::open_into_upper(path, open_flags2)?,
+                ];
+                //TODO: different fd to save if /dev/random equivalent is used
+                CACHED_RANDOM_FD.set(Some(ep));
+                ep
+            }
         };
 
-        let mut open_flags = syscall::O_RDONLY | redox_protocols::protocol::O_CLOEXEC;
-        if flags & sys_random::GRND_NONBLOCK != 0 {
-            open_flags |= syscall::O_NONBLOCK;
-        }
+        let rnd_fd = if flags & sys_random::GRND_NONBLOCK != 0 {
+            rnd_fd[1]
+        } else {
+            rnd_fd[0]
+        };
 
-        //TODO: store fd internally
-        let fd = FdGuard::open(path, open_flags)?;
-        Ok(fd.read(buf)?)
+        match syscall::read(rnd_fd, buf) {
+            Ok(b) => Ok(b),
+            Err(err) => {
+                if err.errno == EBADF {
+                    CACHED_RANDOM_FD.set(None);
+                }
+                Err(Errno(err.errno))
+            }
+        }
     }
 
     fn getresgid(
@@ -708,17 +755,38 @@ impl Pal for Sys {
     }
 
     fn getrlimit(resource: c_int, mut rlim: Out<rlimit>) -> Result<()> {
-        todo_skip!(0, "getrlimit({}, {:p}): not implemented", resource, rlim);
+        if !(0..RLIMIT_NLIMITS).contains(&resource) {
+            return Err(Errno(EINVAL));
+        }
+        let mut redox_rlimit = Rlimit::const_default();
+        let out = match redox_rt::sys::posix_getrlimit(resource as usize, &mut redox_rlimit) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        };
         rlim.write(rlimit {
-            rlim_cur: RLIM_INFINITY,
-            rlim_max: RLIM_INFINITY,
+            rlim_cur: redox_rlimit.rlim_cur,
+            rlim_max: redox_rlimit.rlim_max,
         });
-        Ok(())
+        out
     }
 
     unsafe fn setrlimit(resource: c_int, rlim: *const rlimit) -> Result<()> {
-        todo_skip!(0, "setrlimit({}, {:p}): not implemented", resource, rlim);
-        Err(Errno(EPERM))
+        if !(0..RLIMIT_NLIMITS).contains(&resource) {
+            return Err(Errno(EINVAL));
+        }
+
+        let Some(rlim) = (unsafe { rlim.as_ref() }) else {
+            return Err(Errno(EINVAL));
+        };
+        let rlim = &Rlimit {
+            rlim_cur: rlim.rlim_cur,
+            rlim_max: rlim.rlim_max,
+        };
+
+        match redox_rt::sys::posix_setrlimit(resource as usize, rlim) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn getrusage(who: c_int, r_usage: Out<rusage>) -> Result<()> {
@@ -763,12 +831,12 @@ impl Pal for Sys {
     }
 
     fn linkat(fd1: c_int, oldpath: CStr, fd2: c_int, newpath: CStr, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
         // make sure the flags passed are valid.
         // valid states: AT_SYMLINK_FOLLOW, or 0.
         if (flags & !(AT_SYMLINK_FOLLOW)) != 0 {
             return Err(Errno(EINVAL));
         }
-        let newpath = RedoxStr::new_from_c(newpath.to_cstr()).ok_or(Errno(EINVAL))?;
 
         // By default, we don't follow the symlink if there is one.
         // We only follow it if AT_SYMLINK_FOLLOW is passed in flags.
@@ -780,21 +848,36 @@ impl Pal for Sys {
         }
 
         let file = File::openat(fd1, oldpath, oflags)?;
-        let newpath: Cow<'_, str> = openat2_path(fd2, newpath, 0)?.into();
-        syscall::flink(*file as usize, newpath)?;
-        Ok(())
+
+        let new_path = RedoxStr::new_from_c(newpath.to_cstr()).ok_or(Error::new(EINVAL))?;
+        let (new_dfd, new_target) = path::resolve_open_to_dir(fd2, &new_path)?;
+
+        let r = redox_rt::sys::flinkat(
+            *file as usize,
+            new_dfd.as_raw_fd(),
+            new_target.as_ref(),
+            flags as u32,
+        );
+
+        trace_log!(
+            "flinkat({fd1}, {oldpath:?}, {fd2}, {newpath:?}, {flags:x}) = [{:?}] {:?}",
+            new_target.as_ref(),
+            r
+        );
+
+        r.map_err(Into::into)
     }
 
     fn lseek(fd: c_int, offset: off_t, whence: c_int) -> Result<off_t> {
         Ok(syscall::lseek(fd as usize, offset as isize, whence as usize)? as off_t)
     }
 
-    fn mkdirat(dir_fd: c_int, path_name: CStr, _mode: mode_t) -> Result<()> {
+    fn mkdirat(dir_fd: c_int, path_name: CStr, mode: mode_t) -> Result<()> {
         File::createat(
             dir_fd,
             path_name,
             fcntl::O_DIRECTORY | fcntl::O_EXCL | fcntl::O_CLOEXEC,
-            0o777,
+            mode,
         )?;
         Ok(())
     }
@@ -925,23 +1008,18 @@ impl Pal for Sys {
             len,
             flags
         );
-        Err(Errno(ENOSYS))
+        Ok(())
     }
 
-    unsafe fn nanosleep(rqtp: *const timespec, rmtp: *mut timespec) -> Result<()> {
-        let redox_rqtp = unsafe { (&*rqtp).into() };
-        let mut redox_rmtp = redox_timespec::default();
-        if !rmtp.is_null() {
-            redox_rmtp = unsafe { (&*rmtp).into() };
-        }
+    fn nanosleep(rqtp: &timespec, rmtp: Option<Out<timespec>>) -> Result<()> {
+        let redox_rqtp = rqtp.into();
+        let mut redox_rmtp = syscall::TimeSpec::default();
         match redox_rt::sys::posix_nanosleep(&redox_rqtp, &mut redox_rmtp) {
             Ok(()) => Ok(()),
             Err(Error { errno: EINTR }) => {
-                unsafe {
-                    if !rmtp.is_null() {
-                        *rmtp = (&redox_rmtp).into();
-                    }
-                };
+                if let Some(mut rmtp) = rmtp {
+                    rmtp.write((&redox_rmtp).into());
+                }
                 Err(Errno(EINTR))
             }
             Err(Error { errno: e }) => Err(Errno(e)),
@@ -964,8 +1042,38 @@ impl Pal for Sys {
     }
 
     fn pipe2(mut fds: Out<[c_int; 2]>, flags: c_int) -> Result<()> {
-        fds.write(extra::pipe2(flags as usize)?);
+        let _siglock = tmp_disable_signals();
+        let r = extra::pipe2(flags as usize);
+        trace_log!("pipe2({flags:x}) = {:?}", r);
+        fds.write(r?);
         Ok(())
+    }
+
+    fn poll(fds: &mut [pollfd], timeout: c_int) -> Result<c_int> {
+        Self::redox_poll(fds, timeout, None)
+    }
+
+    fn ppoll(
+        fds: &mut [pollfd],
+        tmo_opt: Option<&timespec>,
+        sigmask: Option<&sigset_t>,
+    ) -> Result<c_int> {
+        let timeout = match tmo_opt {
+            Some(tmo) => {
+                if tmo.tv_sec > (c_int::MAX / 1000).into() {
+                    c_int::MAX
+                } else {
+                    #[cfg(target_pointer_width = "64")]
+                    let tv_nsec = c_int::try_from(tmo.tv_nsec).unwrap_or(c_int::MAX);
+                    #[cfg(target_pointer_width = "32")]
+                    let tv_nsec = tmo.tv_nsec;
+                    (c_int::try_from(tmo.tv_sec).expect("within bounds") * 1000)
+                        + (tv_nsec / 1000000)
+                }
+            }
+            None => -1,
+        };
+        Self::redox_poll(fds, timeout, sigmask)
     }
 
     fn posix_fallocate(fd: c_int, offset: u64, length: NonZeroU64) -> Result<()> {
@@ -982,8 +1090,8 @@ impl Pal for Sys {
         let length = length.get();
         let total_offset = offset.checked_add(length).ok_or(Errno(EFBIG))?;
 
-        let mut stat: stat = unsafe { mem::zeroed() };
-        unsafe { libredox::fstat(fd as usize, &raw mut stat)? };
+        let mut stat: stat = stat::default();
+        libredox::fstat(fd as usize, Some(Out::from_mut(&mut stat)))?;
         let st_size = stat.st_size as u64;
         // The difference between total_offset and the file size is the number of bytes to
         // allocate. So, if it's negative then the file is already large enough and we don't
@@ -1064,36 +1172,41 @@ impl Pal for Sys {
         }
     }
 
+    unsafe fn readv(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        let iovs = unsafe {
+            slice::from_raw_parts(iov, usize::try_from(iovcnt).expect("iovcnt is positive"))
+        };
+        let mut vec = unsafe { gather(iovs) };
+
+        let n = Self::read(fildes, &mut vec)?;
+
+        unsafe { scatter(iovs, &vec) };
+
+        Ok(n)
+    }
+
     fn fpath(fildes: c_int, out: &mut [u8]) -> Result<usize> {
         // Since this is used by realpath, it converts from the old format to the new one for
         // compatibility reasons
         let mut buf = [0; limits::PATH_MAX];
-        let count = syscall::fpath(fildes as usize, &mut buf)?;
-
-        let redox_path = str::from_utf8(&buf[..count])
-            .ok()
-            .and_then(redox_path::RedoxPath::from_absolute)
-            .ok_or(Errno(EINVAL))?;
-
-        let (scheme, reference) = redox_path.as_parts().ok_or(Errno(EINVAL))?;
+        let redox_path = path::standard_fpath(fildes as usize, &mut buf)?;
 
         let mut cursor = io::Cursor::new(out);
-        let res = match scheme.as_ref() {
-            "file" => write!(cursor, "/{}", reference.as_ref().trim_start_matches('/')),
-            _ => write!(
-                cursor,
-                "/scheme/{}/{}",
-                scheme.as_ref(),
-                reference.as_ref().trim_start_matches('/')
-            ),
-        };
-        match res {
+        match write!(cursor, "{}", redox_path.as_ref()) {
             Ok(()) => Ok(cursor.position() as usize),
-            Err(_err) => Err(Errno(ENAMETOOLONG)),
+            Err(err) => {
+                log::warn!(
+                    "fpath is too long for buffer: {:?} {:?}",
+                    redox_path.as_ref(),
+                    err
+                );
+                Err(Errno(ENAMETOOLONG))
+            }
         }
     }
 
     fn readlinkat(dirfd: c_int, path: CStr, out: &mut [u8]) -> Result<usize> {
+        let _siglock = tmp_disable_signals();
         let file = openat2(
             dirfd,
             path,
@@ -1110,33 +1223,32 @@ impl Pal for Sys {
         new_path: CStr,
         flags: c_uint,
     ) -> Result<()> {
+        let _siglock = tmp_disable_signals();
         const MASK: c_uint = !RENAME_NOREPLACE;
         if MASK & flags != 0 {
             return Err(Errno(EOPNOTSUPP));
         }
 
-        let new_path = RedoxStr::new_from_c(new_path.to_cstr()).ok_or(Errno(EINVAL))?;
-        // Fail if the target exists with RENAME_NOREPLACE.
-        if flags & RENAME_NOREPLACE != 0
-            && let Ok(_) = libredox::openat(
-                new_dir,
-                new_path.clone(),
-                fcntl::O_PATH | fcntl::O_CLOEXEC,
-                0,
-            )
-            .map(FdGuard::new)
-        {
-            return Err(Errno(EEXIST));
-        }
+        let oldpath = RedoxStr::new_from_c(old_path.to_cstr()).ok_or(Error::new(EINVAL))?;
+        let newpath = RedoxStr::new_from_c(new_path.to_cstr()).ok_or(Error::new(EINVAL))?;
+        let (old_dfd, old_target) = path::resolve_open_to_dir(old_dir, &oldpath)?;
+        let (new_dfd, new_target) = path::resolve_open_to_dir(new_dir, &newpath)?;
 
-        // oflags are the same as Sys::rename above.
-        let source = openat2(old_dir, old_path, 0, fcntl::O_NOFOLLOW | fcntl::O_PATH)?;
+        let r = redox_rt::sys::frenameat(
+            old_dfd.as_raw_fd(),
+            old_target.as_ref(),
+            new_dfd.as_raw_fd(),
+            new_target.as_ref(),
+            flags,
+        );
 
-        let target: Cow<'_, str> = openat2_path(new_dir, new_path, 0)?.into();
-        // I'm avoiding Sys::rename to avoid reallocating a CString from a String.
-        syscall::frename(*source as usize, target)
-            .map(|_| ())
-            .map_err(Into::into)
+        trace_log!(
+            "frenameat({old_dir}, {old_path:?}, {new_dir}, {new_path:?}, {flags:x}) = [{:?}] {:?}",
+            new_target.as_ref(),
+            r
+        );
+
+        r.map_err(Into::into)
     }
 
     fn sched_yield() -> Result<()> {
@@ -1209,7 +1321,7 @@ impl Pal for Sys {
         use crate::header::spawn::Flags;
         let child = redox_rt::proc::new_child_process(&redox_rt::proc::ForkArgs::Managed)?;
         let mut cwd = path::clone_cwd().unwrap_or_default();
-        let mut cwd_fd = FdGuard::open(cwd.as_str(), syscall::O_STAT)?.to_upper()?;
+        let mut cwd_fd = FdGuard::open_into_upper(cwd.as_str(), syscall::O_STAT)?;
         let proc_fd = child.proc_fd.unwrap();
         let _curr_proc_fd = redox_rt::current_proc_fd(); // TODO use this variable?
         let cur_filetable_fd = RtTcb::current().thread_fd().dup_into_upper(b"filetable")?;
@@ -1274,7 +1386,7 @@ impl Pal for Sys {
                         let cwd_str =
                             core::str::from_utf8(path.as_bytes()).map_err(|_| Errno(EINVAL))?;
                         cwd = to_cwd_path(cwd_str)?;
-                        let fd = FdGuard::open(cwd.as_str(), syscall::O_STAT)?.to_upper()?;
+                        let fd = FdGuard::open_into_upper(cwd.as_str(), syscall::O_STAT)?;
                         cwd_fd = fd;
                     }
                     crate::header::spawn::Action::FChdir(fd) => {
@@ -1285,7 +1397,7 @@ impl Pal for Sys {
                             buf.set_len(res);
                         }
                         cwd = buf;
-                        let fd = FdGuard::open(cwd.as_str(), syscall::O_STAT)?.to_upper()?;
+                        let fd = FdGuard::open_into_upper(cwd.as_str(), syscall::O_STAT)?;
                         cwd_fd = fd;
                     }
                     crate::header::spawn::Action::Dup2(old, new) => {
@@ -1337,7 +1449,7 @@ impl Pal for Sys {
 
         {
             let fds_to_close = {
-                let guard = redox_rt::current_filetable();
+                let guard = redox_rt::current_filetable().inner.lock();
                 let mut fds = alloc::vec::Vec::new();
                 for (fd, flags) in guard.iter() {
                     if flags & redox_protocols::protocol::O_CLOEXEC
@@ -1476,12 +1588,12 @@ impl Pal for Sys {
         )? {
             let interp_path =
                 CStr::from_bytes_with_nul(&interp_path).map_err(|_| Errno(ENOEXEC))?;
-
-            let interpreter = File::open(interp_path, fcntl::O_RDONLY | fcntl::O_CLOEXEC)
-                .map_err(|_| Errno(ENOENT))?;
+            let interp_path =
+                RedoxReference::new_from_c(interp_path.to_cstr()).ok_or(Errno(ENOEXEC))?;
+            let interpreter = FdGuard::open_into_upper(interp_path.as_ref(), syscall::O_RDONLY)?;
 
             redox_rt::proc::fexec_impl(
-                FdGuard::new(interpreter.fd as usize).to_upper().unwrap(),
+                interpreter,
                 &child.thr_fd,
                 &proc_fd,
                 program,
@@ -1500,10 +1612,16 @@ impl Pal for Sys {
     }
 
     fn symlinkat(path1: CStr, fd: c_int, path2: CStr) -> Result<()> {
+        let _siglock = tmp_disable_signals();
         let mut file = File::createat(
             fd,
             path2,
-            fcntl::O_WRONLY | fcntl::O_SYMLINK | fcntl::O_CLOEXEC,
+            fcntl::O_WRONLY
+                | fcntl::O_CLOEXEC
+                | fcntl::O_SYMLINK // create a symlink
+                | fcntl::O_NOFOLLOW // do not follow symlink
+                | fcntl::O_EXCL // throw EEXIST if already exist
+                | fcntl::O_PATH, // do not throw ELOOP because of O_NOFOLLOW
             0o777,
         )?;
 
@@ -1541,10 +1659,7 @@ impl Pal for Sys {
             _ => return Err(Errno(EINVAL)),
         };
         let timerfd = FdGuard::open_into_upper(path, syscall::O_RDWR)?;
-        let eventfd = FdGuard::new(Error::demux(unsafe {
-            event::redox_event_queue_create_v1(0)
-        })?)
-        .to_upper()?;
+        let eventfd = FdGuard::new(event::queue_create(0)?).to_upper()?;
 
         Ok(RlctTimer::create(clock_id, evp, timerfd, eventfd))
     }
@@ -1617,14 +1732,12 @@ impl Pal for Sys {
             val
         };
 
-        Error::demux(unsafe {
-            event::redox_event_queue_ctl_v1(
-                timer_st.eventfd.as_raw_fd(),
-                timer_st.timerfd.as_raw_fd(),
-                1,
-                0,
-            )
-        })?;
+        event::queue_ctl(
+            timer_st.eventfd.as_raw_fd(),
+            timer_st.timerfd.as_raw_fd(),
+            1,
+            0,
+        )?;
 
         let buf_to_write = syscall::TimeSpec::from(&timer_st.next_wake_time.it_value);
         let bytes_written = timer_st.timerfd.write(&buf_to_write)?;
@@ -1653,6 +1766,7 @@ impl Pal for Sys {
     }
 
     fn uname(mut utsname: Out<utsname>) -> Result<(), Errno> {
+        let _siglock = tmp_disable_signals();
         fn gethostname(mut name: Out<[u8]>) -> io::Result<()> {
             if name.is_empty() {
                 return Ok(());
@@ -1731,13 +1845,42 @@ impl Pal for Sys {
     }
 
     fn unlinkat(fd: c_int, path: CStr, flags: c_int) -> Result<()> {
+        let _siglock = tmp_disable_signals();
         if (flags & !AT_REMOVEDIR) != 0 {
             return Err(Errno(EINVAL));
         }
-        let path = RedoxStr::new_from_c(path.to_cstr()).ok_or(Errno(EINVAL))?;
-        let path = openat2_path(fd, path, 0)?;
-        let path: Cow<'_, str> = path.into();
-        redox_rt::sys::unlink(path, flags.try_into().map_err(|_| Errno(EINVAL))?)?;
+        let target = RedoxStr::new_from_c(path.to_cstr()).ok_or(Errno(EINVAL))?;
+        let target = openat2_path(fd, target, 0)?.to_standard();
+        let flags = flags.try_into().map_err(|_| Errno(EINVAL))?;
+        let r = redox_rt::sys::unlink(target.as_ref(), flags).map(|_| ());
+
+        if matches!(r, Err(Error { errno: EXDEV })) {
+            // slower path to make this work across scheme
+            let target: RedoxStr<'_> = target.into();
+            let (new_dfd, new_target) = path::resolve_open_to_dir(fd, &target)?;
+            let mut buf = [0; redox_path::PATH_MAX];
+            let target =
+                path::standard_fpath(new_dfd.as_raw_fd(), &mut buf)?.join_checked(new_target);
+            let r = redox_rt::sys::unlink(&target, flags).map(|_| ());
+            trace_log!(
+                "unlinkat ({fd}, {:?}, {:x}): [{}] {:?}",
+                path,
+                flags,
+                &target,
+                r
+            );
+            r?
+        } else {
+            trace_log!(
+                "unlinkat ({fd}, {:?}, {:x}): [{}] {:?}",
+                path,
+                flags,
+                &target,
+                r
+            );
+            r?
+        };
+
         Ok(())
     }
 
@@ -1820,6 +1963,15 @@ impl Pal for Sys {
                 !0,
             )?)
         }
+    }
+
+    unsafe fn writev(fildes: c_int, iov: *const iovec, iovcnt: c_int) -> Result<usize> {
+        let iovs = unsafe {
+            slice::from_raw_parts(iov, usize::try_from(iovcnt).expect("iovcnt is positive"))
+        };
+        let vec = unsafe { gather(iovs) };
+
+        Self::write(fildes, &vec)
     }
 
     fn verify() -> bool {

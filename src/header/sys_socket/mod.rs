@@ -99,17 +99,20 @@ pub struct sockaddr_storage {
 
 // These must match C macros in sys_socket/cbindgen.toml {
 /// cbindgen:ignore
+#[expect(non_snake_case, reason = "name must match C")]
 pub unsafe extern "C" fn __CMSG_LEN(cmsg: *const cmsghdr) -> ssize_t {
     ((unsafe { (*cmsg).cmsg_len as size_t } + mem::size_of::<c_long>() - 1)
         & !(mem::size_of::<c_long>() - 1)) as ssize_t
 }
 
 /// cbindgen:ignore
+#[expect(non_snake_case, reason = "name must match C")]
 pub unsafe extern "C" fn __CMSG_NEXT(cmsg: *const cmsghdr) -> *mut c_uchar {
     unsafe { (cmsg as *mut c_uchar).offset(__CMSG_LEN(cmsg)) }
 }
 
 /// cbindgen:ignore
+#[expect(non_snake_case, reason = "name must match C")]
 pub unsafe extern "C" fn __MHDR_END(mhdr: *const msghdr) -> *mut c_uchar {
     unsafe { ((*mhdr).msg_control.cast::<c_uchar>()).add((*mhdr).msg_controllen) }
 }
@@ -159,14 +162,15 @@ pub unsafe extern "C" fn CMSG_ALIGN(len: size_t) -> size_t {
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_socket.h.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn CMSG_SPACE(len: c_uint) -> c_uint {
-    (unsafe { CMSG_ALIGN(len as size_t) } + unsafe { CMSG_ALIGN(mem::size_of::<cmsghdr>()) })
-        as c_uint
+    (unsafe { CMSG_ALIGN(size_t::try_from(len).expect("len always fits in size_t")) }
+        + unsafe { CMSG_ALIGN(mem::size_of::<cmsghdr>()) }) as c_uint
 }
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/sys_socket.h.html>.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn CMSG_LEN(length: c_uint) -> c_uint {
-    (unsafe { CMSG_ALIGN(mem::size_of::<cmsghdr>()) } + length as usize) as c_uint
+    (unsafe { CMSG_ALIGN(mem::size_of::<cmsghdr>()) }
+        + size_t::try_from(length).expect("length always fits in size_t")) as c_uint
 }
 // } These must match C macros in sys_socket/cbindgen.toml
 
@@ -469,12 +473,11 @@ pub unsafe extern "C" fn setsockopt(
         Sys::setsockopt(socket, level, option_name, option_value)
             .map(|()| 0)
             .or_minus_one_errno(),
-        "setsockopt({}, {}, {}, {:p}, {})",
+        "setsockopt({}, {}, {}, {:?})",
         socket,
         level,
         option_name,
         option_value,
-        option_len
     )
 }
 

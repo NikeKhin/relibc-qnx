@@ -90,7 +90,6 @@ static mut GROUP: group = group {
 static LINE_READER: SyncUnsafeCell<Option<Lines<BufReader<File>>>> = SyncUnsafeCell::new(None);
 
 /// See <https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/grp.h.html>.
-#[allow(non_camel_case_types)]
 #[repr(C)]
 #[derive(Debug)]
 pub struct group {
@@ -107,7 +106,7 @@ pub struct group {
     pub gr_mem: *mut *mut c_char,
 }
 
-#[allow(clippy::upper_case_acronyms)]
+#[expect(clippy::upper_case_acronyms, reason = "prefer EOF")]
 #[derive(Debug)]
 enum Error {
     EOF,
@@ -171,7 +170,7 @@ fn split(buf: &mut [u8]) -> Option<group> {
 }
 
 fn parse_grp(line: String, destbuf: Option<DestBuffer>) -> Result<OwnedGrp, Error> {
-    let buffer = line.clone().into_bytes();
+    let buffer = line.into_bytes();
 
     let mut buffer = buffer
         .into_iter()
@@ -511,6 +510,7 @@ pub unsafe extern "C" fn getgrouplist(
     ngroups: *mut c_int,
 ) -> c_int {
     let grps = unsafe {
+        // FIXME if ngroups points to a negative number then the below slice will be huge
         slice::from_raw_parts_mut(groups.cast::<MaybeUninit<gid_t>>(), ngroups.read() as usize)
     };
 
@@ -541,14 +541,16 @@ pub unsafe extern "C" fn getgrouplist(
             .next()
             .unwrap_or("")
             .split(",")
-            .map(|i| i.trim())
+            .map(str::trim)
             .collect::<Vec<_>>();
 
         if !members.contains(&user) {
             continue;
         }
 
-        if let Some(dst) = grps.get_mut(groups_found as usize) {
+        if let Some(dst) =
+            grps.get_mut(usize::try_from(groups_found).expect("groups_found always positive"))
+        {
             dst.write(group_id);
         }
 
@@ -562,7 +564,7 @@ pub unsafe extern "C" fn getgrouplist(
         ngroups.write(groups_found);
     }
 
-    if groups_found as usize > grps.len() {
+    if usize::try_from(groups_found).expect("groups_found always positive") > grps.len() {
         -1
     } else {
         groups_found
@@ -581,7 +583,12 @@ pub unsafe extern "C" fn initgroups(user: *const c_char, gid: gid_t) -> c_int {
     if unsafe { getgrouplist(user, gid, groups.as_mut_ptr(), &raw mut count) < 0 } {
         return -1;
     }
-    unsafe { setgroups(count as size_t, groups.as_ptr()) }
+    unsafe {
+        setgroups(
+            size_t::try_from(count).expect("always positive"),
+            groups.as_ptr(),
+        )
+    }
 }
 
 // TODO should be guarded by `_DEFAULT_SOURCE`

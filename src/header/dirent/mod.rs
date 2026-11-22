@@ -267,7 +267,7 @@ pub extern "C" fn posix_getdents(
     let slice = unsafe { slice::from_raw_parts_mut(buf.cast::<u8>(), nbyte) };
 
     Sys::posix_getdents(fildes, slice)
-        .map(|s| s as ssize_t)
+        .map(|s| ssize_t::try_from(s).expect("very unlikely to exceed isize::MAX"))
         .or_minus_one_errno()
 }
 
@@ -373,7 +373,7 @@ pub unsafe extern "C" fn scandir(
             )
         };
 
-        len as c_int
+        c_int::try_from(len).expect("len should not exceed isize::MAX")
     }
 }
 

@@ -99,8 +99,9 @@ impl Tcb {
                 pthread: Pthread {
                     waitval: Waitval::new(),
                     flags: Default::default(),
-                    has_enabled_cancelation: AtomicBool::new(false),
+                    has_enabled_cancelation: AtomicBool::new(true),
                     has_queued_cancelation: AtomicBool::new(false),
+                    has_async_cancelation: AtomicBool::new(false),
                     stack_base: core::ptr::null_mut(),
                     stack_size: 0,
                     os_tid: UnsafeCell::new(OsTid::default()),
@@ -331,7 +332,7 @@ impl Tcb {
     /// ```
     ///
     /// For x86_64, the ABI page is not used.
-    #[allow(clippy::type_complexity)]
+    #[expect(clippy::type_complexity)]
     #[cfg(any(target_os = "linux", target_os = "redox", target_os = "nto"))]
     unsafe fn os_new(
         size: usize,
